@@ -87,6 +87,40 @@ class App:
 
         return wrap
 
+    # --- jobs --------------------------------------------------------------
+    def job(
+        self,
+        *,
+        cron: str | None = None,
+        interval_seconds: int | None = None,
+        timeout: float = 300.0,
+    ) -> Callable:
+        if (cron is None) == (interval_seconds is None):
+            raise RegistryError("job needs exactly one of cron= or interval_seconds=")
+        if cron is not None:
+            from apscheduler.triggers.cron import CronTrigger
+
+            try:
+                CronTrigger.from_crontab(cron)
+            except ValueError as e:
+                raise RegistryError(f"invalid cron expression {cron!r}: {e}") from e
+
+        def wrap(fn: Callable[[], Awaitable[None]]) -> Callable:
+            jid = f"{self.name}.{fn.__name__}"
+            if jid in self.jobs:
+                raise RegistryError(f"job {jid!r} already registered")
+            self.jobs[jid] = Job(
+                id=jid,
+                app_name=self.name,
+                fn=fn,
+                cron=cron,
+                interval_seconds=interval_seconds,
+                timeout=timeout,
+            )
+            return fn
+
+        return wrap
+
     # --- runtime capabilities ------------------------------------------------
     async def llm(self, *args: Any, **kwargs: Any) -> Any:
         if self._llm is None:
