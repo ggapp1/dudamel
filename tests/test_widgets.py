@@ -41,3 +41,19 @@ def test_table_list_markdown_payloads():
     assert validate_widget_payload("markdown", "# hi") == "# hi"
     with pytest.raises(ValueError):
         validate_widget_payload("markdown", {"not": "str"})
+
+
+def test_duplicate_widget_id_rejected():
+    app = App("workouts", description="d")
+
+    @app.widget(title="A", renderer="stat")
+    async def w() -> dict:
+        return {"label": "Test", "value": 1, "unit": "kg"}
+
+    # Attempt to register another function with the same __name__
+    async def fn2() -> dict:
+        return {"label": "Test2", "value": 2, "unit": "kg"}
+
+    fn2.__name__ = "w"
+    with pytest.raises(RegistryError, match="already registered"):
+        app.widget(title="B", renderer="stat")(fn2)

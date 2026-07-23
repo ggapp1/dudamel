@@ -70,13 +70,13 @@ class App:
         return fn
 
     # --- widgets -----------------------------------------------------------
-    def widget(self, *, title: str, renderer: str):
+    def widget(self, *, title: str, renderer: str) -> Callable:
         from dudamel.contract.renderers import RENDERERS
 
         if renderer not in RENDERERS:
             raise RegistryError(f"unknown renderer {renderer!r}; choose one of {sorted(RENDERERS)}")
 
-        def wrap(fn: Callable[[], Awaitable[Any]]):
+        def wrap(fn: Callable[[], Awaitable[Any]]) -> Callable:
             wid = fn.__name__
             if wid in self.widgets:
                 raise RegistryError(f"widget {wid!r} already registered on app {self.name!r}")
