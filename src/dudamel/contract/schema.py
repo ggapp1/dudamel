@@ -130,7 +130,8 @@ class ToolSchema:
             m = self.arg_model.model_validate(args)
         except ValidationError as e:
             issues = "; ".join(
-                f"{'.'.join(str(loc) for loc in err['loc'])}: {err['msg']}" for err in e.errors()
+                f"{'.'.join(str(loc) for loc in err['loc'])}: {err['msg'].lower()}"
+                for err in e.errors()
             )
             raise ToolValidationError(f"invalid arguments: {issues}") from e
         return {name: getattr(m, name) for name in self.arg_model.model_fields}
