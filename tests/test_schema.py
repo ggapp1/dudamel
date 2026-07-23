@@ -48,3 +48,35 @@ def test_missing_type_hint_rejected():
 
     with pytest.raises(TypeError, match="needs a type hint"):
         ToolSchema(bad)
+
+
+def _assert_no_refs(node) -> None:
+    """Recursively assert a schema (sub)tree has no $ref/$defs anywhere."""
+    if isinstance(node, dict):
+        assert "$ref" not in node, f"found dangling $ref in {node!r}"
+        assert "$defs" not in node, f"found leftover $defs in {node!r}"
+        for value in node.values():
+            _assert_no_refs(value)
+    elif isinstance(node, list):
+        for item in node:
+            _assert_no_refs(item)
+
+
+def test_container_of_enum_has_no_dangling_refs():
+    async def list_tool(colors: list[Color]) -> str:
+        """List colors."""
+        return ""
+
+    schema = ToolSchema(list_tool).json_schema
+    _assert_no_refs(schema)
+    assert schema["properties"]["colors"]["items"]["enum"] == ["red", "blue"]
+
+
+def test_enum_default_matches_use_enum_values():
+    async def color_tool(color: Color = Color.RED) -> str:
+        """Pick a color."""
+        return ""
+
+    schema = ToolSchema(color_tool)
+    assert schema.validate({}) == {"color": "red"}
+    assert schema.validate({"color": "blue"}) == {"color": "blue"}

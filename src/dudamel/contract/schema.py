@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import inspect
 from typing import Any, get_type_hints
 
@@ -28,33 +29,103 @@ class ToolSchema:
             fields[name] = (hints[name], default)
         self.arg_model = create_model(
             f"{fn.__name__}_args",
-            __config__=ConfigDict(extra="forbid", use_enum_values=True),
+            __config__=ConfigDict(extra="forbid", use_enum_values=True, validate_default=True),
             **fields,
         )
         self.description = inspect.getdoc(fn) or ""
+        # Build (and validate) the flattened schema now, at registration time,
+        # so a parameter type that can't be fully inlined fails loudly here
+        # instead of silently shipping a broken $ref to a provider later at
+        # request time.
+        self._json_schema = self._build_json_schema()
 
     @property
-    def json_schema(self) -> dict:
+    def json_schema(self) -> dict[str, Any]:
+        return copy.deepcopy(self._json_schema)
+
+    def _build_json_schema(self) -> dict[str, Any]:
         schema = self.arg_model.model_json_schema()
         schema.pop("title", None)
         schema["additionalProperties"] = False
         for prop in schema.get("properties", {}).values():
             prop.pop("title", None)
-        # inline enum $defs so providers see a flat schema
+        # Inline $defs (enums, nested models, etc.) so providers see a fully
+        # flat schema. Recurse into the whole tree -- not just top-level
+        # anyOf branches -- so container/nested types (e.g. list[SomeEnum])
+        # don't leave a dangling $ref behind.
         defs = schema.pop("$defs", {})
-        for prop in schema.get("properties", {}).values():
-            self._inline_refs(prop, defs)
+        for name, prop in schema.get("properties", {}).items():
+            self._inline_refs(prop, defs, frozenset(), name)
+        self._assert_no_refs(schema, "schema")
         return schema
 
-    def _inline_refs(self, node: dict, defs: dict) -> None:
-        if "$ref" in node:
-            ref = defs[node.pop("$ref").split("/")[-1]]
-            ref.pop("title", None)
-            node.update(ref)
-        for sub in node.get("anyOf", []):
-            self._inline_refs(sub, defs)
+    def _inline_refs(
+        self, node: Any, defs: dict[str, Any], seen: frozenset[str], field: str
+    ) -> None:
+        """Recursively replace every {"$ref": "#/$defs/X"} with X's definition.
 
-    def validate(self, args: dict) -> dict:
+        Walks dict values and list items uniformly so it covers `items`,
+        `properties`, `additionalProperties`, `prefixItems`, `anyOf`, and any
+        other nesting the JSON Schema draft allows, not just `anyOf`.
+        """
+        if isinstance(node, list):
+            for item in node:
+                self._inline_refs(item, defs, seen, field)
+            return
+        if not isinstance(node, dict):
+            return
+        if "$ref" in node:
+            ref = node.pop("$ref")
+            key = ref.rsplit("/", 1)[-1]
+            if key in seen:
+                raise TypeError(
+                    f"tool parameter {field!r} has a circular/self-referential "
+                    f"type (via {ref!r}); unsupported parameter type"
+                )
+            if key not in defs:
+                raise TypeError(
+                    f"tool parameter {field!r} references unknown schema "
+                    f"{ref!r}; unsupported parameter type"
+                )
+            # Copy so multiple call sites referencing the same $def (e.g. two
+            # parameters of the same enum type) don't end up sharing -- and
+            # cross-mutating -- the same nested dict/list objects.
+            resolved = copy.deepcopy(defs[key])
+            resolved.pop("title", None)
+            # The def's own body may itself contain $refs (nested types) --
+            # keep resolving until none remain, guarded by `seen` for cycles.
+            self._inline_refs(resolved, defs, seen | {key}, field)
+            for k, v in resolved.items():
+                node[k] = v
+            return
+        for value in node.values():
+            self._inline_refs(value, defs, seen, field)
+
+    def _assert_no_refs(self, node: Any, path: str) -> None:
+        """Defensive check: the emitted schema must be fully flat.
+
+        If `_inline_refs` ever misses a case, fail loudly here (at
+        ToolSchema build/registration time) rather than silently sending a
+        broken schema to a provider.
+        """
+        if isinstance(node, dict):
+            if "$ref" in node:
+                raise TypeError(
+                    f"unresolved $ref left in emitted schema at {path!r} "
+                    f"({node['$ref']!r}); unsupported parameter type"
+                )
+            if "$defs" in node:
+                raise TypeError(
+                    f"unresolved $defs left in emitted schema at {path!r}; "
+                    "unsupported parameter type"
+                )
+            for key, value in node.items():
+                self._assert_no_refs(value, f"{path}.{key}")
+        elif isinstance(node, list):
+            for i, item in enumerate(node):
+                self._assert_no_refs(item, f"{path}[{i}]")
+
+    def validate(self, args: dict) -> dict[str, Any]:
         try:
             m = self.arg_model.model_validate(args)
         except ValidationError as e:
