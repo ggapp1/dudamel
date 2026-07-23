@@ -73,3 +73,18 @@ async def test_llm_and_notify_unbound_raise():
         await app.llm("hi")
     with pytest.raises(RuntimeNotBoundError):
         await app.notify("hi")
+
+
+def test_bad_app_names_rejected():
+    with pytest.raises(RegistryError, match="app name"):
+        App("has_underscore", description="d")
+    with pytest.raises(RegistryError, match="app name"):
+        App("Has-Hyphen", description="d")
+    with pytest.raises(RegistryError, match="app name"):
+        App("1starts", description="d")
+
+
+async def test_to_thread_runs_sync_fn():
+    app = make_app()
+    result = await app.to_thread(lambda: 41 + 1)
+    assert result == 42

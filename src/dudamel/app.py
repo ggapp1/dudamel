@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -9,12 +10,14 @@ from dudamel.contract.schema import ToolSchema
 from dudamel.contract.types import TOOL_NAME_RE, Job, Tool, Widget
 from dudamel.exceptions import RegistryError, RuntimeNotBoundError
 
+APP_NAME_RE = re.compile(r"^[a-z][a-z0-9]{0,31}$")
+
 
 class App:
     def __init__(self, name: str, *, description: str) -> None:
-        if not TOOL_NAME_RE.match(name) or "_" in name:
+        if not APP_NAME_RE.match(name):
             raise RegistryError(
-                f"app name {name!r} must be short lowercase alphanumeric (no underscores);"
+                f"app name {name!r} must start with [a-z] and contain only [a-z0-9];"
                 " it prefixes table names"
             )
         self.name = name
@@ -34,11 +37,11 @@ class App:
         read_only: bool = False,
         confirm: bool = False,
         timeout: float = 30.0,
-    ):
+    ) -> Callable:
         if fn is not None:  # bare @app.tool
             return self._register_tool(fn, read_only=read_only, confirm=confirm, timeout=timeout)
 
-        def wrap(f: Callable):
+        def wrap(f: Callable) -> Callable:
             return self._register_tool(f, read_only=read_only, confirm=confirm, timeout=timeout)
 
         return wrap

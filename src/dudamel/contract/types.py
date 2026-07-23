@@ -40,4 +40,4 @@ class Job:
     cron: str | None = None
     interval_seconds: int | None = None
     timeout: float = 300.0
-    extra: dict = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)
