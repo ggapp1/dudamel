@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tomllib
 from pathlib import Path
+from typing import Any
 
 from pydantic_settings import (
     BaseSettings,
@@ -11,7 +12,7 @@ from pydantic_settings import (
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="DUDAMEL_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_prefix="DUDAMEL_", extra="ignore")
 
     database_url: str = "sqlite+aiosqlite:///dudamel.db"
     data_dir: Path = Path(".")
@@ -31,7 +32,7 @@ class Settings(BaseSettings):
     @classmethod
     def load(cls, project_dir: Path) -> Settings:
         toml_path = project_dir / "dudamel.toml"
-        data: dict = {}
+        data: dict[str, Any] = {}
         if toml_path.exists():
             data = tomllib.loads(toml_path.read_text())
-        return cls(**data)
+        return cls(_env_file=project_dir / ".env", **data)
