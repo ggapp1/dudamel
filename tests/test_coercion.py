@@ -1,4 +1,5 @@
 from datetime import date
+from typing import Literal
 
 import pytest
 
@@ -14,6 +15,11 @@ async def log_workout(exercise: str, sets: int, reps: int, weight_kg: float) -> 
 async def search(query: str, since: date | None = None) -> str:
     """Search."""
     return query
+
+
+async def request_tool(method: Literal["GET", "POST"]) -> str:
+    """Make HTTP request."""
+    return method
 
 
 def test_string_numbers_coerced():
@@ -43,3 +49,12 @@ def test_invalid_args_raise_model_readable_error():
 def test_unknown_arg_rejected():
     with pytest.raises(ToolValidationError, match="extra"):
         ToolSchema(search).validate({"query": "x", "hallucinated": True})
+
+
+def test_literal_case_preserved_in_validation_error():
+    """Regression test: validation error must preserve case of permitted Literal values."""
+    with pytest.raises(ToolValidationError) as exc_info:
+        ToolSchema(request_tool).validate({"method": "DELETE"})
+    error_msg = str(exc_info.value)
+    assert "GET" in error_msg
+    assert "POST" in error_msg
