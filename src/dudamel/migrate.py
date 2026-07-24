@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 import shutil
+import sqlite3
 from importlib.resources import files
 from pathlib import Path
 
@@ -13,24 +15,68 @@ from alembic.script import ScriptDirectory
 from alembic.util import rev_id
 from sqlalchemy import MetaData, create_engine
 
-from dudamel.exceptions import DestructiveMigrationError
+from dudamel.exceptions import DestructiveMigrationError, DudamelError
+from dudamel.models_core import CoreBase
 from dudamel.orchestrator import Orchestrator
+
+_MESSAGE_RE = re.compile(r"[^a-z0-9_]+")
 
 
 def sync_url(db_url: str) -> str:
     return db_url.replace("+aiosqlite", "").replace("+asyncpg", "+psycopg")
 
 
+def _sanitize_message(message: str) -> str:
+    """Sanitize an arbitrary migration message for safe use in a filename and
+    in a generated Python triple-quoted docstring: lowercase, collapse every
+    run of characters outside [a-z0-9_] into a single "_", strip leading/
+    trailing "_", and truncate to 40 chars. Without this, a message
+    containing "/" could write outside the versions/ directory and one
+    containing '"' could break out of the generated docstring."""
+    sanitized = _MESSAGE_RE.sub("_", message.lower()).strip("_")
+    return sanitized[:40] or "migration"
+
+
 def _sqlite_path(db_url: str) -> Path | None:
-    if db_url.startswith("sqlite"):
-        return Path(db_url.split("///", 1)[1])
-    return None
+    """Return the on-disk path for a SQLite URL, or None for a non-SQLite URL.
+
+    Raises DudamelError for a SQLite URL with no real file path (`:memory:`
+    or a path-less `sqlite://`) since there is nothing to back up. Strips any
+    query string (e.g. `?check_same_thread=false`) from the path component.
+    """
+    if not db_url.startswith("sqlite"):
+        return None
+    if "///" not in db_url:
+        raise DudamelError(
+            f"sqlite URL {db_url!r} has no file path (in-memory database); cannot back it up"
+        )
+    raw_path = db_url.split("///", 1)[1].split("?", 1)[0]
+    if not raw_path or raw_path == ":memory:":
+        raise DudamelError(
+            f"sqlite URL {db_url!r} has no file path (in-memory database); cannot back it up"
+        )
+    return Path(raw_path)
 
 
 def _backup_sqlite(db_url: str) -> None:
+    """Back up a SQLite file with the sqlite3 online backup API rather than a
+    plain file copy: `Connection.backup()` goes through SQLite itself, so it
+    is safe against a source database that is mid-write or in WAL mode —
+    unlike `shutil.copy2`, which can copy an inconsistent snapshot of the
+    main file while the real data still lives in the `-wal` sidecar."""
     path = _sqlite_path(db_url)
-    if path is not None and path.exists():
-        shutil.copy2(path, path.with_name(path.name + ".bak"))
+    if path is None or not path.exists():
+        return
+    backup_path = path.with_name(path.name + ".bak")
+    src = sqlite3.connect(path)
+    try:
+        dst = sqlite3.connect(backup_path)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
 
 
 def upgrade_core(db_url: str) -> None:
@@ -107,12 +153,21 @@ def generate_app_migration(
     mig_dir = ensure_app_migrations(project_dir)
     prefixes = tuple(f"{name}_" for name in orc.registry.apps)
     metadata = _combined_metadata(orc)
+    core_table_names = frozenset(CoreBase.metadata.tables)
 
     def include_object(obj, name, type_, reflected, compare_to) -> bool:
         if type_ == "table":
+            # Defense in depth, checked BEFORE the prefix allowlist below: core
+            # tables and the alembic version-table namespace are never part of
+            # an app-tier diff, full stop — even if some app's prefix were to
+            # (mis)match a core table name, it must never enter the diff and
+            # risk being dropped. Registry already refuses to register such an
+            # app name, but this check does not rely on that holding true.
+            if name is None or name in core_table_names or name.startswith("alembic_"):
+                return False
             # only tables of currently registered apps take part in the diff;
-            # core tables and unregistered-app tables are invisible -> never dropped
-            return name is not None and name.startswith(prefixes)
+            # unregistered-app tables are invisible -> never dropped
+            return name.startswith(prefixes)
         return True
 
     engine = create_engine(sync_url(db_url))
@@ -127,29 +182,35 @@ def generate_app_migration(
                 },
             )
             migration = produce_migrations(mc, metadata)
+
+            if not migration.upgrade_ops.ops:
+                return None
+
+            destructive = _destructive_ops(migration.upgrade_ops)
+            if destructive and not allow_destructive:
+                raise DestructiveMigrationError(
+                    "migration contains destructive operations: "
+                    + "; ".join(destructive)
+                    + " — re-run with allow_destructive=True after reviewing"
+                )
+
+            # Rendered here, inside the `with engine.connect()` block, while
+            # `mc` (the MigrationContext passed as migration_context) is still
+            # bound to a live connection rather than one already closed by
+            # engine disposal below.
+            upgrade_code = render_python_code(
+                migration.upgrade_ops,
+                render_as_batch=engine.dialect.name == "sqlite",
+                migration_context=mc,
+            )
     finally:
         engine.dispose()
-
-    if not migration.upgrade_ops.ops:
-        return None
-
-    destructive = _destructive_ops(migration.upgrade_ops)
-    if destructive and not allow_destructive:
-        raise DestructiveMigrationError(
-            "migration contains destructive operations: "
-            + "; ".join(destructive)
-            + " — re-run with allow_destructive=True after reviewing"
-        )
 
     script_dir = ScriptDirectory.from_config(_app_config(db_url, project_dir))
     head = script_dir.get_current_head()
     revision = rev_id()
-    upgrade_code = render_python_code(
-        migration.upgrade_ops,
-        render_as_batch=engine.dialect.name == "sqlite",
-        migration_context=mc,
-    )
-    body = f'''"""{message}
+    safe_message = _sanitize_message(message)
+    body = f'''"""{safe_message}
 
 Revision ID: {revision}
 Revises: {head}
@@ -170,7 +231,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     raise NotImplementedError("app migrations are forward-only in dudamel v1")
 '''
-    path = mig_dir / "versions" / f"{revision}_{message.replace(' ', '_')[:40]}.py"
+    path = mig_dir / "versions" / f"{revision}_{safe_message}.py"
     path.write_text(body)
     return path
 
