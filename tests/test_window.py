@@ -27,6 +27,13 @@ def test_truncate_tool_result() -> None:
     assert m.text == "A" * 100  # original untouched
 
 
+def test_truncate_is_idempotent() -> None:
+    m = Message(role="tool", text="A" * 10_000, tool_call_id="t")
+    once = truncate_tool_result(m, 1000)
+    twice = truncate_tool_result(once, 1000)
+    assert twice.text == once.text
+
+
 def test_newest_turn_always_included() -> None:
     msgs = turn(1)
     assert build_window(msgs, token_budget=1) == msgs  # over budget but newest turn stays

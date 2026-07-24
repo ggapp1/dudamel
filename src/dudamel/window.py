@@ -8,6 +8,7 @@ a turn is one user message plus everything the assistant did in response.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import replace
 
 from dudamel.llm.types import Message
@@ -26,6 +27,8 @@ def message_tokens(m: Message) -> int:
 
 def truncate_tool_result(m: Message, cap_chars: int) -> Message:
     if m.role != "tool" or len(m.text) <= cap_chars:
+        return m
+    if re.search(r"…\[truncated \d+ chars\]$", m.text):
         return m
     dropped = len(m.text) - cap_chars
     return replace(m, text=m.text[:cap_chars] + f"…[truncated {dropped} chars]")
