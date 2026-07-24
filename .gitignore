@@ -1,9 +1,19 @@
+# --- docs policy: only README.md ships with the repo ---
+*.md
+!README.md
+/docs/
+/SPEC.md
+/.superpowers/
+
+# --- python ---
 __pycache__/
 *.py[cod]
 .venv/
 .env
 *.db
 *.db.bak
+*.db-wal
+*.db-shm
 dist/
 .ruff_cache/
 .pytest_cache/
