@@ -31,6 +31,8 @@ def _render_messages(messages: list[Message]) -> tuple[str, list[dict[str, Any]]
                 blocks.append({"type": "text", "text": m.text})
             for tc in m.tool_calls:
                 blocks.append({"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.args})
+            if not blocks:
+                blocks.append({"type": "text", "text": "(no content)"})
             wire.append({"role": "assistant", "content": blocks})
         else:  # tool result
             wire.append(
@@ -115,6 +117,10 @@ class AnthropicProvider:
         return self._parse(body)
 
     def _parse(self, data: dict[str, Any]) -> Completion:
+        if not isinstance(data, dict):
+            raise LLMError(
+                f"malformed completion response: expected object, got {type(data).__name__}"
+            )
         try:
             text_parts: list[str] = []
             tool_calls: list[ToolCall] = []
@@ -142,5 +148,5 @@ class AnthropicProvider:
                 ),
                 stop_reason=stop_reason,
             )
-        except (KeyError, IndexError, TypeError) as e:
+        except (KeyError, IndexError, TypeError, AttributeError) as e:
             raise LLMError(f"malformed completion response: {e}") from e

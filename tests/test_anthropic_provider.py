@@ -144,3 +144,37 @@ async def test_api_key_redacted_in_errors() -> None:
         await make_provider(handler, api_key="sk-secret123").complete(model="m", messages=[])
     assert "sk-secret123" not in str(exc.value)
     assert "***" in str(exc.value)
+
+
+async def test_non_dict_json_body_raises_llm_error() -> None:
+    def handler(_r: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[1, 2, 3])
+
+    with pytest.raises(LLMError, match="malformed"):
+        await make_provider(handler).complete(model="m", messages=[])
+
+
+async def test_empty_assistant_message_renders_placeholder_block() -> None:
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "content": [{"type": "text", "text": "response"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+
+    msgs = [
+        Message(role="user", text="hi"),
+        Message(role="assistant"),  # empty assistant message
+    ]
+    await make_provider(handler).complete(model="m", messages=msgs)
+    wire = seen["body"]["messages"]
+    assistant_msg = wire[-1]
+    assert assistant_msg["role"] == "assistant"
+    assert len(assistant_msg["content"]) == 1
+    assert assistant_msg["content"][0] == {"type": "text", "text": "(no content)"}
