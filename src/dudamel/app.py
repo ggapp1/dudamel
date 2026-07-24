@@ -151,3 +151,22 @@ class App:
                 f"app {self.name!r} has no database bound; Orchestrator binds it at run time"
             )
         return self._database.session()
+
+    # --- model sugar ---------------------------------------------------------
+    @property
+    def Model(self) -> type:  # noqa: N802 — class-like property, PEP8 exception intended
+        if not hasattr(self, "_model_base"):
+            from dudamel.modelsugar import make_model_base
+
+            self._model_base = make_model_base(self.name)
+        return self._model_base
+
+    @property
+    def metadata(self) -> Any:
+        return self.Model.metadata
+
+    @staticmethod
+    def now() -> object:
+        from dudamel.modelsugar import NOW
+
+        return NOW
