@@ -272,11 +272,13 @@ class Router:
             return Message(role="tool", text=text, tool_call_id=call.id)
 
         tasks = {
-            call.id: asyncio.create_task(run_one(call)) for call, action in plan if action == "run"
+            idx: asyncio.create_task(run_one(call))
+            for idx, (call, action) in enumerate(plan)
+            if action == "run"
         }
-        for call, action in plan:
+        for idx, (call, action) in enumerate(plan):
             if action == "run":
-                outcome.results.append(await tasks[call.id])
+                outcome.results.append(await tasks[idx])
             elif action == "unknown":
                 available = ", ".join(sorted(self._registry.tools))
                 outcome.results.append(

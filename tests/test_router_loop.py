@@ -147,6 +147,29 @@ async def test_parallel_tool_calls_one_turn(tmp_path) -> None:
     await db.dispose()
 
 
+async def test_duplicate_tool_call_ids_both_execute(tmp_path) -> None:
+    both = Completion(
+        message=Message(
+            role="assistant",
+            tool_calls=[
+                ToolCall(id="dup", name="log_workout", args={"exercise": "a", "reps": 1}),
+                ToolCall(id="dup", name="log_workout", args={"exercise": "b", "reps": 2}),
+            ],
+        ),
+        usage=Usage(1, 1),
+        stop_reason="tool_calls",
+    )
+    router, fp, db = make_router(tmp_path, [both, fake_text("done")])
+    reply = await router.handle(channel="t:1", text="x", user_id="u1")
+    assert reply.text == "done" and sorted(CALLS) == ["log:a:1", "log:b:2"]
+    results = [m for m in fp.calls[1]["messages"] if m.role == "tool"]
+    assert len(results) == 2
+    texts = {r.text for r in results}
+    assert any("a x1" in t for t in texts)
+    assert any("b x2" in t for t in texts)
+    await db.dispose()
+
+
 async def test_iteration_cap(tmp_path) -> None:
     script = [
         fake_tool_call("log_workout", {"exercise": "e", "reps": 1}, id=f"i{n}") for n in range(9)
