@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, DateTime, Float, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -26,6 +26,13 @@ class Conversation(CoreBase):
 
 class Message(CoreBase):
     __tablename__ = "messages"
+    __table_args__ = (
+        # DB-level backstop for append() dedupe (see migration 0003): NULL
+        # client_msg_ids never conflict with each other or anything else in
+        # a SQLite/Postgres unique index, so this only constrains rows that
+        # actually carry a client_msg_id.
+        Index("uq_messages_conv_client_msg", "conversation_id", "client_msg_id", unique=True),
+    )
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     conversation_id: Mapped[int] = mapped_column(ForeignKey("conversations.id"), index=True)
     role: Mapped[str] = mapped_column(String(32))  # user|assistant|tool

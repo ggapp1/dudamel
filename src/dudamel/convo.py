@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from dudamel.db import Database
 from dudamel.llm.types import Message
@@ -19,10 +20,24 @@ class ConversationStore:
             ).scalar_one_or_none()
             if existing is not None:
                 return existing.id
-            row = Conversation(channel=channel)
-            s.add(row)
-            await s.flush()  # assign pk before the context manager commits
-            return row.id
+        try:
+            async with self._db.session() as s:
+                row = Conversation(channel=channel)
+                s.add(row)
+                await s.flush()  # assign pk before the context manager commits
+                return row.id
+        except IntegrityError:
+            # Lost a race with a concurrent first-touch of the same new
+            # channel: the unique constraint on `channel` rejected our
+            # insert. Re-select in a fresh session (the prior one is dead
+            # after rollback) and return the winner's id instead of
+            # propagating a raw IntegrityError to the caller.
+            async with self._db.session() as s:
+                return (
+                    (await s.execute(select(Conversation).where(Conversation.channel == channel)))
+                    .scalar_one()
+                    .id
+                )
 
     async def append(
         self,
@@ -31,26 +46,34 @@ class ConversationStore:
         *,
         client_msg_id: str | None = None,
     ) -> bool:
-        async with self._db.session() as s:
-            if client_msg_id is not None:
-                dup = (
-                    await s.execute(
-                        select(MessageRow.id).where(
-                            MessageRow.conversation_id == conversation_id,
-                            MessageRow.client_msg_id == client_msg_id,
+        try:
+            async with self._db.session() as s:
+                if client_msg_id is not None:
+                    dup = (
+                        await s.execute(
+                            select(MessageRow.id).where(
+                                MessageRow.conversation_id == conversation_id,
+                                MessageRow.client_msg_id == client_msg_id,
+                            )
                         )
+                    ).first()
+                    if dup is not None:
+                        return False
+                s.add(
+                    MessageRow(
+                        conversation_id=conversation_id,
+                        role=message.role,
+                        content=message.to_dict(),
+                        client_msg_id=client_msg_id,
                     )
-                ).first()
-                if dup is not None:
-                    return False
-            s.add(
-                MessageRow(
-                    conversation_id=conversation_id,
-                    role=message.role,
-                    content=message.to_dict(),
-                    client_msg_id=client_msg_id,
                 )
-            )
+        except IntegrityError:
+            # Lost a race with a concurrent append carrying the same
+            # (conversation_id, client_msg_id): the DB-level unique index
+            # (see migration 0003) rejected our insert on commit. The
+            # pre-check above is a fast path, not a guarantee -- this is
+            # the backstop that makes dedupe airtight under races.
+            return False
         return True
 
     async def recent(self, conversation_id: int, limit: int = 200) -> list[Message]:
