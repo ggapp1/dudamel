@@ -98,13 +98,12 @@ async def test_concurrent_get_or_create_same_new_channel(store: ConversationStor
     assert rows[0].id == ids[0]
 
 
-async def test_append_duplicate_race_backstopped(store: ConversationStore) -> None:
+async def test_message_client_msg_id_unique_constraint(store: ConversationStore) -> None:
     """Bypasses append()'s in-app pre-check by inserting two MessageRow rows
     with the same (conversation_id, client_msg_id) via raw sessions. The
     second raw insert must raise IntegrityError, proving migration 0003's
     unique index is a real DB-level constraint and not just the app-level
-    check. Then confirms append() itself surfaces that as `False` rather
-    than letting the exception escape."""
+    check."""
     cid = await store.get_or_create("t:race-append")
     dup_msg = Message(role="user", text="dup").to_dict()
 
@@ -117,7 +116,61 @@ async def test_append_duplicate_race_backstopped(store: ConversationStore) -> No
                 MessageRow(conversation_id=cid, role="user", content=dup_msg, client_msg_id="dup1")
             )
 
-    assert not await store.append(cid, Message(role="user", text="dup"), client_msg_id="dup1")
+
+async def test_append_concurrent_race_backstopped(store: ConversationStore) -> None:
+    """Reproduces a genuine append() race: two concurrent store.append()
+    calls carrying the same client_msg_id are gated -- via a shared
+    asyncio.Event, mirroring test_concurrent_get_or_create_same_new_channel
+    -- so that BOTH complete the dedupe pre-check SELECT (each seeing no
+    existing row) and stage their INSERT before EITHER racer's session is
+    allowed to commit. Structural argument that makes this airtight: since
+    both passed the pre-check, the False in the result can ONLY have come
+    from append()'s `except IntegrityError: return False` branch -- the
+    pre-check was, by construction, blind to the race."""
+    cid = await store.get_or_create("t:race-append-concurrent")
+    real_session = store._db.session
+    both_ready = asyncio.Event()
+    done_count = 0
+
+    def make_racer() -> ConversationStore:
+        @asynccontextmanager
+        async def gated_session():
+            nonlocal done_count
+            async with real_session() as s:
+                yield s
+                # append()'s body (dedupe SELECT + staged INSERT) has just
+                # run; hold the commit until both racers get this far so
+                # neither's SELECT can see the other's not-yet-committed row.
+                done_count += 1
+                if done_count < 2:
+                    await both_ready.wait()
+                else:
+                    both_ready.set()
+
+        fake_db = type("_GatedDB", (), {"session": staticmethod(gated_session)})()
+        return ConversationStore(fake_db)
+
+    a, b = make_racer(), make_racer()
+    results = await asyncio.gather(
+        a.append(cid, Message(role="user", text="race"), client_msg_id="race1"),
+        b.append(cid, Message(role="user", text="race"), client_msg_id="race1"),
+    )
+    assert sorted(results) == [False, True]
+
+    async with store._db.session() as s:
+        rows = (
+            (
+                await s.execute(
+                    select(MessageRow).where(
+                        MessageRow.conversation_id == cid,
+                        MessageRow.client_msg_id == "race1",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
 
 
 async def test_dedupe_is_per_conversation(store: ConversationStore) -> None:
