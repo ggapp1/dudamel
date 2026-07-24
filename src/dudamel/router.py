@@ -1,0 +1,338 @@
+"""The command plane's tool-calling loop. Defensive by design: small local
+models misbehave, so every malformed thing they emit is fed back to them as
+an error tool-result instead of crashing the turn."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import uuid
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+
+from dudamel.activity import json_safe, log_activity
+from dudamel.config import RouterConfig
+from dudamel.contract.types import Tool
+from dudamel.convo import ConversationStore
+from dudamel.db import Database
+from dudamel.exceptions import (
+    BudgetExceededError,
+    LLMError,
+    RegistryError,
+    ToolValidationError,
+)
+from dudamel.llm.client import LLMClient
+from dudamel.llm.provider import ToolSpec
+from dudamel.llm.types import Message, ToolCall
+from dudamel.models_core import PendingConfirmation
+from dudamel.registry import Registry
+from dudamel.window import build_window
+
+logger = logging.getLogger("dudamel.router")
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
+@dataclass
+class ChatReply:
+    text: str
+    pending_confirmation_id: str | None = None
+
+
+@dataclass
+class _BatchOutcome:
+    results: list[Message] = field(default_factory=list)  # completed + skipped
+    pending_call: ToolCall | None = None  # first confirm-gated call, if any
+    executed_any: bool = False
+    saw_mcp_result: bool = False
+
+
+class Router:
+    def __init__(
+        self,
+        *,
+        llm: LLMClient,
+        registry: Registry,
+        convo: ConversationStore,
+        db: Database,
+        config: RouterConfig,
+    ) -> None:
+        if len(registry.tools) > config.max_tools:
+            raise RegistryError(
+                f"{len(registry.tools)} tools registered but router max_tools is "
+                f"{config.max_tools} — small models' tool selection collapses beyond "
+                "this; raise [router].max_tools deliberately or split apps"
+            )
+        self._llm = llm
+        self._registry = registry
+        self._convo = convo
+        self._db = db
+        self._config = config
+        self._specs = [ToolSpec.from_tool(t) for t in registry.tools.values()]
+        self._locks: dict[int, asyncio.Lock] = {}
+        self._locks_guard = asyncio.Lock()
+
+    # -- public ---------------------------------------------------------------
+    async def handle(
+        self,
+        *,
+        channel: str,
+        text: str,
+        user_id: str,
+        client_msg_id: str | None = None,
+        tier: str = "standard",
+    ) -> ChatReply:
+        conv_id = await self._convo.get_or_create(channel)
+        async with await self._lock_for(conv_id):
+            appended = await self._convo.append(
+                conv_id, Message(role="user", text=text), client_msg_id=client_msg_id
+            )
+            if not appended:
+                return ChatReply(text="")  # duplicate delivery; interfaces drop empties
+            return await self._loop(
+                conv_id,
+                tier=tier,
+                user_id=user_id,
+                start_iteration=0,
+                executed_any=False,
+            )
+
+    # -- internals ------------------------------------------------------------
+    async def _lock_for(self, conv_id: int) -> asyncio.Lock:
+        async with self._locks_guard:
+            if conv_id not in self._locks:
+                self._locks[conv_id] = asyncio.Lock()
+            return self._locks[conv_id]
+
+    def _system_message(self) -> Message:
+        apps = "\n".join(f"- {a.name}: {a.description}" for a in self._registry.apps.values())
+        return Message(
+            role="system",
+            text=(
+                "You are dudamel, a personal assistant orchestrator.\n"
+                f"Installed apps:\n{apps}\n"
+                "Use the available tools to act or fetch data; otherwise answer "
+                "directly and concisely."
+            ),
+        )
+
+    async def _loop(
+        self,
+        conv_id: int,
+        *,
+        tier: str,
+        user_id: str,
+        start_iteration: int,
+        executed_any: bool,
+    ) -> ChatReply:
+        turn_tainted = False
+        for iteration in range(start_iteration, self._config.iteration_cap):
+            history = await self._convo.recent(conv_id)
+            window = [self._system_message()] + build_window(
+                history,
+                token_budget=self._config.window_tokens,
+                tool_result_cap=self._config.tool_result_cap,
+            )
+            dropped = len(history) - (len(window) - 1)
+            if dropped > 0:
+                # spec: truncation is surfaced, never silent
+                logger.info(
+                    "conversation %s: context window dropped %d older messages",
+                    conv_id,
+                    dropped,
+                )
+            if self._config.taint_mode == "window":
+                turn_tainted = turn_tainted or self._window_tainted(window)
+            try:
+                completion = await self._llm.complete(
+                    window, tier=tier, tools=self._specs, conversation_id=conv_id
+                )
+            except BudgetExceededError as e:
+                return ChatReply(text=str(e))
+            except LLMError as e:
+                if executed_any:
+                    return ChatReply(
+                        text=f"I completed the action(s), but couldn't produce a "
+                        f"summary — the model failed afterwards ({e})."
+                    )
+                return ChatReply(text=f"The model is unavailable: {e}")
+            msg = completion.message
+            if not msg.tool_calls:
+                await self._convo.append(conv_id, msg)
+                return ChatReply(text=msg.text or "(no reply)")
+            outcome = await self._execute_batch(conv_id, msg.tool_calls, turn_tainted=turn_tainted)
+            executed_any = executed_any or outcome.executed_any
+            turn_tainted = turn_tainted or outcome.saw_mcp_result
+            if outcome.pending_call is not None:
+                return await self._suspend(
+                    conv_id,
+                    assistant=msg,
+                    outcome=outcome,
+                    iteration=iteration,
+                    tier=tier,
+                    user_id=user_id,
+                )
+            await self._convo.append(conv_id, msg)
+            for r in outcome.results:
+                await self._convo.append(conv_id, r)
+        return ChatReply(
+            text="I couldn't finish within the step limit — the request may be "
+            "too complex; try narrowing it."
+        )
+
+    def _window_tainted(self, window: list[Message]) -> bool:
+        for m in window:
+            for tc in m.tool_calls:
+                tool = self._registry.tools.get(tc.name)
+                if tool is not None and tool.origin == "mcp":
+                    return True
+        return False
+
+    def _needs_confirm(self, tool: Tool, *, turn_tainted: bool, batch_has_mcp: bool) -> bool:
+        if tool.confirm:
+            return True
+        if self._config.taint_mode == "off":
+            return False
+        return tool.origin == "native" and not tool.read_only and (turn_tainted or batch_has_mcp)
+
+    async def _execute_batch(
+        self, conv_id: int, calls: list[ToolCall], *, turn_tainted: bool
+    ) -> _BatchOutcome:
+        outcome = _BatchOutcome()
+        batch_has_mcp = any(
+            (t := self._registry.tools.get(c.name)) is not None and t.origin == "mcp" for c in calls
+        )
+        plan: list[tuple[ToolCall, str]] = []  # (call, action: run|pending|skip|...)
+        for call in calls:
+            tool = self._registry.tools.get(call.name)
+            if tool is None:
+                plan.append((call, "unknown"))
+            elif self._needs_confirm(tool, turn_tainted=turn_tainted, batch_has_mcp=batch_has_mcp):
+                if outcome.pending_call is None:
+                    outcome.pending_call = call
+                    plan.append((call, "pending"))
+                else:
+                    plan.append((call, "skip"))
+            else:
+                plan.append((call, "run"))
+
+        async def run_one(call: ToolCall) -> Message:
+            tool = self._registry.tools[call.name]
+            try:
+                kwargs = tool.schema.validate(call.args)
+            except ToolValidationError as e:
+                await log_activity(
+                    self._db,
+                    tool=call.name,
+                    args=call.args,
+                    status="error",
+                    result_preview=str(e),
+                    conversation_id=conv_id,
+                )
+                return Message(role="tool", text=str(e), tool_call_id=call.id, is_error=True)
+            try:
+                result = await asyncio.wait_for(tool.fn(**kwargs), tool.timeout)
+            except TimeoutError:
+                detail = f"tool {call.name} timed out after {tool.timeout}s"
+                await log_activity(
+                    self._db,
+                    tool=call.name,
+                    args=call.args,
+                    status="error",
+                    result_preview=detail,
+                    conversation_id=conv_id,
+                )
+                return Message(role="tool", text=detail, tool_call_id=call.id, is_error=True)
+            except Exception as e:  # tool bugs must not kill the conversation
+                detail = f"tool {call.name} raised {type(e).__name__}: {e}"
+                await log_activity(
+                    self._db,
+                    tool=call.name,
+                    args=call.args,
+                    status="error",
+                    result_preview=detail,
+                    conversation_id=conv_id,
+                )
+                return Message(role="tool", text=detail, tool_call_id=call.id, is_error=True)
+            text = result if isinstance(result, str) else json.dumps(json_safe(result))
+            await log_activity(
+                self._db,
+                tool=call.name,
+                args=call.args,
+                status="ok",
+                result_preview=text,
+                conversation_id=conv_id,
+            )
+            outcome.executed_any = True
+            if self._registry.tools[call.name].origin == "mcp":
+                outcome.saw_mcp_result = True
+            return Message(role="tool", text=text, tool_call_id=call.id)
+
+        tasks = {
+            call.id: asyncio.create_task(run_one(call)) for call, action in plan if action == "run"
+        }
+        for call, action in plan:
+            if action == "run":
+                outcome.results.append(await tasks[call.id])
+            elif action == "unknown":
+                available = ", ".join(sorted(self._registry.tools))
+                outcome.results.append(
+                    Message(
+                        role="tool",
+                        text=f"unknown tool {call.name!r}; available tools: {available}",
+                        tool_call_id=call.id,
+                        is_error=True,
+                    )
+                )
+            elif action == "skip":
+                outcome.results.append(
+                    Message(
+                        role="tool",
+                        text="not executed: another call in this batch awaits confirmation",
+                        tool_call_id=call.id,
+                        is_error=True,
+                    )
+                )
+            # "pending" gets its result at resolution time (Task 12)
+        return outcome
+
+    async def _suspend(
+        self,
+        conv_id: int,
+        *,
+        assistant: Message,
+        outcome: _BatchOutcome,
+        iteration: int,
+        tier: str,
+        user_id: str,
+    ) -> ChatReply:
+        call = outcome.pending_call
+        assert call is not None
+        confirmation_id = uuid.uuid4().hex[:32]
+        async with self._db.session() as s:
+            s.add(
+                PendingConfirmation(
+                    id=confirmation_id,
+                    conversation_id=conv_id,
+                    user_id=user_id,
+                    tool=call.name,
+                    args=json_safe(call.args),
+                    loop_state={
+                        "assistant": assistant.to_dict(),
+                        "results": [m.to_dict() for m in outcome.results],
+                        "pending_call_id": call.id,
+                        "iteration": iteration,
+                        "tier": tier,
+                    },
+                    status="pending",
+                    expires_at=_utcnow() + timedelta(seconds=self._config.confirm_ttl_seconds),
+                )
+            )
+        summary = ", ".join(f"{k}={v!r}" for k, v in call.args.items())
+        return ChatReply(
+            text=f"Confirm: run {call.name}({summary})? This action requires approval.",
+            pending_confirmation_id=confirmation_id,
+        )
