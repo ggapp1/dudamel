@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from dudamel.config import Settings
@@ -33,7 +34,6 @@ class Runtime:
         *,
         providers: dict[str, Provider] | None = None,
     ) -> None:
-        self._orchestrator = orchestrator
         self._settings = settings
         self._db = Database(settings.database_url)
         tiers = self._build_tiers(providers or {})
@@ -84,7 +84,7 @@ class Runtime:
                 )
         return tiers
 
-    def _make_app_llm(self):
+    def _make_app_llm(self) -> Callable[..., Awaitable[str | dict[str, Any]]]:
         async def app_llm(
             prompt: str | list[Message],
             *,
