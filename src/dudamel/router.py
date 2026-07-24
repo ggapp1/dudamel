@@ -11,6 +11,8 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
+from sqlalchemy import select
+
 from dudamel.activity import json_safe, log_activity
 from dudamel.config import RouterConfig
 from dudamel.contract.types import Tool
@@ -87,6 +89,7 @@ class Router:
     ) -> ChatReply:
         conv_id = await self._convo.get_or_create(channel)
         async with await self._lock_for(conv_id):
+            await self._auto_decline_pending(conv_id)
             appended = await self._convo.append(
                 conv_id, Message(role="user", text=text), client_msg_id=client_msg_id
             )
@@ -127,8 +130,11 @@ class Router:
         user_id: str,
         start_iteration: int,
         executed_any: bool,
+        initial_taint: bool = False,
     ) -> ChatReply:
-        turn_tainted = False
+        # DEVIATION (Task 11 review): resumes seed taint from the suspended
+        # turn's stored flag so MCP taint survives the suspension gap.
+        turn_tainted = initial_taint
         for iteration in range(start_iteration, self._config.iteration_cap):
             history = await self._convo.recent(conv_id)
             window = [self._system_message()] + build_window(
@@ -174,6 +180,8 @@ class Router:
                     iteration=iteration,
                     tier=tier,
                     user_id=user_id,
+                    executed_any=executed_any,
+                    turn_tainted=turn_tainted,
                 )
             await self._convo.append(conv_id, msg)
             for r in outcome.results:
@@ -310,6 +318,8 @@ class Router:
         iteration: int,
         tier: str,
         user_id: str,
+        executed_any: bool,
+        turn_tainted: bool,
     ) -> ChatReply:
         call = outcome.pending_call
         assert call is not None
@@ -328,6 +338,11 @@ class Router:
                         "pending_call_id": call.id,
                         "iteration": iteration,
                         "tier": tier,
+                        # DEVIATION (Task 11 review): persist the loop's
+                        # executed_any and taint at suspension so resume can
+                        # report honestly and keep MCP taint across the gap.
+                        "executed_any": executed_any,
+                        "turn_tainted": turn_tainted,
                     },
                     status="pending",
                     expires_at=_utcnow() + timedelta(seconds=self._config.confirm_ttl_seconds),
@@ -338,3 +353,174 @@ class Router:
             text=f"Confirm: run {call.name}({summary})? This action requires approval.",
             pending_confirmation_id=confirmation_id,
         )
+
+    # -- confirmation resolution ----------------------------------------------
+    async def _auto_decline_pending(self, conv_id: int) -> None:
+        """An intervening user message (or lazy expiry) declines the pending
+        action and closes its turn WITHOUT a model call — a dangling
+        tool_calls message must never persist."""
+        async with self._db.session() as s:
+            rows = (
+                (
+                    await s.execute(
+                        select(PendingConfirmation).where(
+                            PendingConfirmation.conversation_id == conv_id,
+                            PendingConfirmation.status == "pending",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for row in rows:
+                row.status = "expired" if row.expires_at < _utcnow() else "declined"
+        for row in rows:
+            await self._close_suspended_turn(row, note="declined (superseded)")
+            await log_activity(
+                self._db,
+                tool=row.tool,
+                args=row.args,
+                status="declined",
+                result_preview="auto-declined",
+                conversation_id=conv_id,
+            )
+
+    async def _close_suspended_turn(self, row: PendingConfirmation, *, note: str) -> None:
+        """Append the suspended assistant turn, its already-run results, and a
+        final error result for the un-run pending call — in that order — so the
+        persisted history never carries an assistant tool_call without a
+        matching tool result. Appends commit per-message (see self-review notes
+        on the crash window); the ordering guarantees a valid pairing on the
+        success path."""
+        state = row.loop_state
+        await self._convo.append(row.conversation_id, Message.from_dict(state["assistant"]))
+        for d in state["results"]:
+            await self._convo.append(row.conversation_id, Message.from_dict(d))
+        await self._convo.append(
+            row.conversation_id,
+            Message(
+                role="tool",
+                text=note,
+                tool_call_id=state["pending_call_id"],
+                is_error=True,
+            ),
+        )
+
+    async def resolve_confirmation(
+        self, confirmation_id: str, *, approved: bool, user_id: str
+    ) -> ChatReply:
+        # Fast unauthenticated existence check outside the lock; the read under
+        # the lock below is the authoritative one that gates the transition.
+        async with self._db.session() as s:
+            row = (
+                await s.execute(
+                    select(PendingConfirmation).where(PendingConfirmation.id == confirmation_id)
+                )
+            ).scalar_one_or_none()
+        if row is None:
+            return ChatReply(text="Unknown confirmation — it may already be resolved.")
+        async with await self._lock_for(row.conversation_id):
+            async with self._db.session() as s:
+                row = (
+                    await s.execute(
+                        select(PendingConfirmation).where(PendingConfirmation.id == confirmation_id)
+                    )
+                ).scalar_one()
+                if row.status != "pending":
+                    return ChatReply(text=f"Unknown confirmation — already {row.status}.")
+                if row.user_id != user_id:
+                    return ChatReply(text="Only the requester can resolve this confirmation.")
+                if row.expires_at < _utcnow():
+                    row.status = "expired"
+                    expired = True
+                else:
+                    row.status = "confirmed" if approved else "declined"
+                    expired = False
+            state = row.loop_state
+            # DEVIATION (Task 11 review): honest resume state — the stored
+            # executed_any (pre-suspension side effects) OR any successful
+            # result in the suspended batch; taint carried across the gap.
+            stored_executed_any = state.get("executed_any", False)
+            results_have_success = any(not d.get("is_error", False) for d in state["results"])
+            initial_taint = state.get("turn_tainted", False)
+            if expired:
+                await self._close_suspended_turn(row, note="declined (expired)")
+                await log_activity(
+                    self._db,
+                    tool=row.tool,
+                    args=row.args,
+                    status="declined",
+                    result_preview="expired",
+                    conversation_id=row.conversation_id,
+                )
+                return ChatReply(text="That confirmation expired; nothing was done.")
+            if not approved:
+                await self._close_suspended_turn(row, note="declined by user")
+                await log_activity(
+                    self._db,
+                    tool=row.tool,
+                    args=row.args,
+                    status="declined",
+                    conversation_id=row.conversation_id,
+                )
+                return await self._loop(
+                    row.conversation_id,
+                    tier=state["tier"],
+                    user_id=user_id,
+                    start_iteration=state["iteration"] + 1,
+                    executed_any=stored_executed_any or results_have_success,
+                    initial_taint=initial_taint,
+                )
+            # approved: execute now, then resume. Order matters — the tool
+            # result is produced before the assistant turn + prior results +
+            # final result are appended, so no dangling tool_call persists.
+            call = ToolCall(id=state["pending_call_id"], name=row.tool, args=dict(row.args))
+            result = await self._execute_confirmed(row.conversation_id, call)
+            await self._convo.append(row.conversation_id, Message.from_dict(state["assistant"]))
+            for d in state["results"]:
+                await self._convo.append(row.conversation_id, Message.from_dict(d))
+            await self._convo.append(row.conversation_id, result)
+            return await self._loop(
+                row.conversation_id,
+                tier=state["tier"],
+                user_id=user_id,
+                start_iteration=state["iteration"] + 1,
+                executed_any=True,
+                initial_taint=initial_taint,
+            )
+
+    async def _execute_confirmed(self, conv_id: int, call: ToolCall) -> Message:
+        tool = self._registry.tools.get(call.name)
+        if tool is None:
+            return Message(
+                role="tool",
+                text=f"tool {call.name!r} no longer exists",
+                tool_call_id=call.id,
+                is_error=True,
+            )
+        try:
+            # Revalidate through the schema: loop_state round-trips args through
+            # JSON, so enum values must be re-coerced back to members here.
+            kwargs = tool.schema.validate(call.args)
+            result = await asyncio.wait_for(tool.fn(**kwargs), tool.timeout)
+        except Exception as e:  # noqa: BLE001 — surfaced to the model, never fatal
+            detail = f"confirmed tool {call.name} failed: {type(e).__name__}: {e}"
+            await log_activity(
+                self._db,
+                tool=call.name,
+                args=call.args,
+                status="error",
+                result_preview=detail,
+                conversation_id=conv_id,
+            )
+            return Message(role="tool", text=detail, tool_call_id=call.id, is_error=True)
+        text = result if isinstance(result, str) else json.dumps(json_safe(result))
+        await log_activity(
+            self._db,
+            tool=call.name,
+            args=call.args,
+            status="confirmed",
+            result_preview=text,
+            conversation_id=conv_id,
+        )
+        return Message(role="tool", text=text, tool_call_id=call.id)
