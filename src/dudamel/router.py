@@ -30,7 +30,7 @@ from dudamel.llm.types import Message, ToolCall
 from dudamel.models_core import Message as MessageRow
 from dudamel.models_core import PendingConfirmation
 from dudamel.registry import Registry
-from dudamel.window import build_window
+from dudamel.window import build_window, truncate_tool_result
 
 logger = logging.getLogger("dudamel.router")
 
@@ -247,6 +247,12 @@ class Router:
 
         async def run_one(call: ToolCall) -> Message:
             tool = self._registry.tools[call.name]
+            if tool.origin == "mcp":
+                # I3: taint on EVERY mcp-origin outcome — validation error,
+                # timeout, exception, or success — not just success. A
+                # raising/timing-out MCP tool still feeds attacker-influenceable
+                # error text to the model and must not escape the taint gate.
+                outcome.saw_mcp_result = True
             try:
                 kwargs = tool.schema.validate(call.args)
             except ToolValidationError as e:
@@ -258,7 +264,10 @@ class Router:
                     result_preview=str(e),
                     conversation_id=conv_id,
                 )
-                return Message(role="tool", text=str(e), tool_call_id=call.id, is_error=True)
+                return truncate_tool_result(
+                    Message(role="tool", text=str(e), tool_call_id=call.id, is_error=True),
+                    self._config.tool_result_cap,
+                )
             try:
                 result = await asyncio.wait_for(tool.fn(**kwargs), tool.timeout)
             except TimeoutError:
@@ -271,7 +280,10 @@ class Router:
                     result_preview=detail,
                     conversation_id=conv_id,
                 )
-                return Message(role="tool", text=detail, tool_call_id=call.id, is_error=True)
+                return truncate_tool_result(
+                    Message(role="tool", text=detail, tool_call_id=call.id, is_error=True),
+                    self._config.tool_result_cap,
+                )
             except Exception as e:  # tool bugs must not kill the conversation
                 detail = f"tool {call.name} raised {type(e).__name__}: {e}"
                 await log_activity(
@@ -282,7 +294,10 @@ class Router:
                     result_preview=detail,
                     conversation_id=conv_id,
                 )
-                return Message(role="tool", text=detail, tool_call_id=call.id, is_error=True)
+                return truncate_tool_result(
+                    Message(role="tool", text=detail, tool_call_id=call.id, is_error=True),
+                    self._config.tool_result_cap,
+                )
             text = result if isinstance(result, str) else json.dumps(json_safe(result))
             await log_activity(
                 self._db,
@@ -293,9 +308,9 @@ class Router:
                 conversation_id=conv_id,
             )
             outcome.executed_any = True
-            if self._registry.tools[call.name].origin == "mcp":
-                outcome.saw_mcp_result = True
-            return Message(role="tool", text=text, tool_call_id=call.id)
+            return truncate_tool_result(
+                Message(role="tool", text=text, tool_call_id=call.id), self._config.tool_result_cap
+            )
 
         tasks = {
             idx: asyncio.create_task(run_one(call))
@@ -540,7 +555,10 @@ class Router:
                 result_preview=detail,
                 conversation_id=conv_id,
             )
-            return Message(role="tool", text=detail, tool_call_id=call.id, is_error=True)
+            return truncate_tool_result(
+                Message(role="tool", text=detail, tool_call_id=call.id, is_error=True),
+                self._config.tool_result_cap,
+            )
         text = result if isinstance(result, str) else json.dumps(json_safe(result))
         await log_activity(
             self._db,
@@ -550,4 +568,6 @@ class Router:
             result_preview=text,
             conversation_id=conv_id,
         )
-        return Message(role="tool", text=text, tool_call_id=call.id)
+        return truncate_tool_result(
+            Message(role="tool", text=text, tool_call_id=call.id), self._config.tool_result_cap
+        )

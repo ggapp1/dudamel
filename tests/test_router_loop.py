@@ -224,6 +224,45 @@ async def test_per_conversation_serialization(tmp_path) -> None:
     await db.dispose()
 
 
+async def test_tool_results_capped_at_rest(tmp_path) -> None:
+    """I4: tool results are capped not just in the window sent to the model,
+    but at rest in the conversation store."""
+    app = App("gym", description="d")
+
+    @app.tool
+    async def huge_result() -> str:
+        """Return a huge result."""
+        return "B" * 50_000
+
+    url = f"sqlite+aiosqlite:///{tmp_path}/cap.db"
+    upgrade_core(url)
+    db = Database(url)
+    script = [fake_tool_call("huge_result", {}), fake_text("done")]
+    fp = FakeProvider(script)
+    llm = LLMClient(
+        tiers={"standard": Tier(name="standard", provider=fp, model="f", max_tokens=64)},
+        db=db,
+        budget=BudgetConfig(),
+    )
+    registry = Registry([app])
+    convo = ConversationStore(db)
+    router = Router(
+        llm=llm,
+        registry=registry,
+        convo=convo,
+        db=db,
+        config=RouterConfig(tool_result_cap=1000),
+    )
+    reply = await router.handle(channel="t:1", text="go", user_id="u1")
+    assert reply.text == "done"
+    cid = await convo.get_or_create("t:1")
+    history = await convo.recent(cid)
+    tool_msg = [m for m in history if m.role == "tool"][0]
+    assert len(tool_msg.text) < 1100
+    assert "truncated" in tool_msg.text
+    await db.dispose()
+
+
 async def test_tool_ceiling_enforced_at_construction(tmp_path) -> None:
     url = f"sqlite+aiosqlite:///{tmp_path}/c.db"
     upgrade_core(url)
