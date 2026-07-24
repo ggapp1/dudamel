@@ -129,3 +129,50 @@ async def test_http_errors_map_to_llm_error(status: int, retryable: bool) -> Non
     with pytest.raises(LLMError) as exc:
         await make_provider(handler).complete(model="m", messages=[])
     assert exc.value.retryable is retryable
+
+
+async def test_malformed_tool_call_entry_raises_llm_error() -> None:
+    def handler(_r: httpx.Request) -> httpx.Response:
+        return ok(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": None,
+                            "tool_calls": [{"id": "z", "type": "function"}],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+            }
+        )
+
+    with pytest.raises(LLMError, match="malformed"):
+        await make_provider(handler).complete(model="m", messages=[])
+
+
+async def test_non_json_body_raises_llm_error() -> None:
+    def handler(_r: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content="<html>oops</html>", headers={"content-type": "text/html"}
+        )
+
+    with pytest.raises(LLMError, match="non-JSON"):
+        await make_provider(handler).complete(model="m", messages=[])
+
+
+async def test_api_key_redacted_in_errors() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401,
+            content=f"Unauthorized: {request.headers['Authorization']}",
+        )
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(transport=transport)
+    provider = OpenAICompatProvider(base_url="http://x/v1", api_key="sk-secret123", client=client)
+
+    with pytest.raises(LLMError) as exc:
+        await provider.complete(model="m", messages=[])
+    assert "sk-secret123" not in str(exc.value)
+    assert "***" in str(exc.value)

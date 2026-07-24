@@ -56,6 +56,12 @@ class OpenAICompatProvider:
         self._base = base_url.rstrip("/")
         self._client = client or httpx.AsyncClient(timeout=120.0)
         self._headers = {"Authorization": f"Bearer {api_key}"}
+        self._api_key = api_key
+
+    def _redact(self, text: str) -> str:
+        if self._api_key and self._api_key != "unused" and len(self._api_key) > 6:
+            text = text.replace(self._api_key, "***")
+        return text
 
     async def complete(
         self,
@@ -96,35 +102,43 @@ class OpenAICompatProvider:
             raise LLMError(f"LLM endpoint unreachable: {e}", retryable=True) from e
         if resp.status_code >= 400:
             raise LLMError(
-                f"LLM endpoint returned HTTP {resp.status_code}: {resp.text[:300]}",
+                f"LLM endpoint returned HTTP {resp.status_code}: {self._redact(resp.text[:300])}",
                 retryable=resp.status_code in _RETRYABLE,
             )
-        return self._parse(resp.json())
+        try:
+            body = resp.json()
+        except json.JSONDecodeError as e:
+            raise LLMError(
+                f"provider returned non-JSON response body: {self._redact(resp.text[:300])}"
+            ) from e
+        return self._parse(body)
 
     def _parse(self, data: dict[str, Any]) -> Completion:
         try:
             choice = data["choices"][0]
             wire_msg = choice["message"]
-        except (KeyError, IndexError) as e:
-            raise LLMError(f"malformed completion response: {e}") from e
-        tool_calls = [
-            ToolCall(
-                id=tc.get("id", f"call_{i}"),
-                name=tc["function"]["name"],
-                args=_parse_args(tc["function"].get("arguments", "{}")),
+            tool_calls = [
+                ToolCall(
+                    id=tc.get("id", f"call_{i}"),
+                    name=tc["function"]["name"],
+                    args=_parse_args(tc["function"].get("arguments", "{}")),
+                )
+                for i, tc in enumerate(wire_msg.get("tool_calls") or [])
+            ]
+            finish = choice.get("finish_reason", "stop")
+            stop_reason = (
+                "tool_calls" if tool_calls else "max_tokens" if finish == "length" else "end"
             )
-            for i, tc in enumerate(wire_msg.get("tool_calls") or [])
-        ]
-        finish = choice.get("finish_reason", "stop")
-        stop_reason = "tool_calls" if tool_calls else "max_tokens" if finish == "length" else "end"
-        usage = data.get("usage") or {}
-        return Completion(
-            message=Message(
-                role="assistant", text=wire_msg.get("content") or "", tool_calls=tool_calls
-            ),
-            usage=Usage(
-                tokens_in=usage.get("prompt_tokens", 0),
-                tokens_out=usage.get("completion_tokens", 0),
-            ),
-            stop_reason=stop_reason,
-        )
+            usage = data.get("usage") or {}
+            return Completion(
+                message=Message(
+                    role="assistant", text=wire_msg.get("content") or "", tool_calls=tool_calls
+                ),
+                usage=Usage(
+                    tokens_in=usage.get("prompt_tokens", 0),
+                    tokens_out=usage.get("completion_tokens", 0),
+                ),
+                stop_reason=stop_reason,
+            )
+        except (KeyError, IndexError, TypeError) as e:
+            raise LLMError(f"malformed completion response: {e}") from e
