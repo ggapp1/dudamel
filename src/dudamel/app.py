@@ -134,3 +134,14 @@ class App:
 
     async def to_thread(self, fn: Callable, *args: Any, **kwargs: Any) -> Any:
         return await asyncio.to_thread(fn, *args, **kwargs)
+
+    # --- database ------------------------------------------------------------
+    def bind_database(self, database: Any) -> None:
+        self._database = database
+
+    def db(self):
+        if self._database is None:
+            raise RuntimeNotBoundError(
+                f"app {self.name!r} has no database bound; Orchestrator binds it at run time"
+            )
+        return self._database.session()
