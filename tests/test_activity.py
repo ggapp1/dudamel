@@ -15,6 +15,10 @@ class Color(Enum):
     RED = "red"
 
 
+class Holiday(Enum):
+    XMAS = date(2026, 12, 25)
+
+
 def test_json_safe_handles_the_validate_output_types() -> None:
     out = json_safe(
         {
@@ -56,3 +60,9 @@ async def test_log_activity_writes_row_with_enum_args(db: Database) -> None:
         row = (await s.execute(select(Activity))).scalar_one()
     assert row.args == {"color": "red"}
     assert row.status == "ok" and len(row.result_preview) == 500
+
+
+def test_enum_with_nonprimitive_value_recurses() -> None:
+    out = json_safe({"h": Holiday.XMAS})
+    json.dumps(out)  # must not raise
+    assert out["h"] == "2026-12-25"

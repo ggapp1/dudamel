@@ -14,7 +14,7 @@ def json_safe(obj: Any) -> Any:
     """Coerced tool args contain Enum members and dates (by contract) —
     this is the one serialization boundary before any JSON column."""
     if isinstance(obj, Enum):
-        return obj.value
+        return json_safe(obj.value)
     if isinstance(obj, (datetime, date)):
         return obj.isoformat()
     if isinstance(obj, dict):
