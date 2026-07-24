@@ -140,5 +140,5 @@ class OpenAICompatProvider:
                 ),
                 stop_reason=stop_reason,
             )
-        except (KeyError, IndexError, TypeError) as e:
+        except (KeyError, IndexError, TypeError, AttributeError) as e:
             raise LLMError(f"malformed completion response: {e}") from e

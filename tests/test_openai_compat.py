@@ -151,6 +151,27 @@ async def test_malformed_tool_call_entry_raises_llm_error() -> None:
         await make_provider(handler).complete(model="m", messages=[])
 
 
+async def test_message_as_string_raises_llm_error() -> None:
+    def handler(_r: httpx.Request) -> httpx.Response:
+        return ok({"choices": [{"message": "hi"}]})
+
+    with pytest.raises(LLMError, match="malformed"):
+        await make_provider(handler).complete(model="m", messages=[])
+
+
+async def test_usage_as_list_raises_llm_error() -> None:
+    def handler(_r: httpx.Request) -> httpx.Response:
+        return ok(
+            {
+                "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
+                "usage": [1],
+            }
+        )
+
+    with pytest.raises(LLMError, match="malformed"):
+        await make_provider(handler).complete(model="m", messages=[])
+
+
 async def test_non_json_body_raises_llm_error() -> None:
     def handler(_r: httpx.Request) -> httpx.Response:
         return httpx.Response(
