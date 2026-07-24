@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
+from typing import Any
 
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -16,7 +18,7 @@ class Database:
         if url.startswith("sqlite"):
 
             @event.listens_for(self.engine.sync_engine, "connect")
-            def _sqlite_pragmas(dbapi_conn, _record) -> None:
+            def _sqlite_pragmas(dbapi_conn: Any, _record: Any) -> None:
                 cursor = dbapi_conn.cursor()
                 cursor.execute("PRAGMA journal_mode=WAL")
                 cursor.execute("PRAGMA busy_timeout=5000")
@@ -25,7 +27,7 @@ class Database:
         self._factory = async_sessionmaker(self.engine, expire_on_commit=False)
 
     @asynccontextmanager
-    async def session(self):
+    async def session(self) -> AsyncIterator[AsyncSession]:
         token = IN_DB_SCOPE.set(True)
         try:
             async with self._factory() as s:
@@ -37,8 +39,3 @@ class Database:
                     raise
         finally:
             IN_DB_SCOPE.reset(token)
-
-
-async def get_session(db: Database) -> AsyncSession:  # convenience for FastAPI deps (Plan 3)
-    async with db.session() as s:
-        return s

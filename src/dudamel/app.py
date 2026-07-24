@@ -4,11 +4,17 @@ import asyncio
 import inspect
 import re
 from collections.abc import Awaitable, Callable
-from typing import Any
+from contextlib import AbstractAsyncContextManager
+from typing import TYPE_CHECKING, Any
 
 from dudamel.contract.schema import ToolSchema
 from dudamel.contract.types import TOOL_NAME_RE, Job, Tool, Widget
 from dudamel.exceptions import RegistryError, RuntimeNotBoundError
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from dudamel.db import Database
 
 APP_NAME_RE = re.compile(r"^[a-z][a-z0-9]{0,31}$")
 
@@ -136,10 +142,10 @@ class App:
         return await asyncio.to_thread(fn, *args, **kwargs)
 
     # --- database ------------------------------------------------------------
-    def bind_database(self, database: Any) -> None:
+    def bind_database(self, database: Database) -> None:
         self._database = database
 
-    def db(self):
+    def db(self) -> AbstractAsyncContextManager[AsyncSession]:
         if self._database is None:
             raise RuntimeNotBoundError(
                 f"app {self.name!r} has no database bound; Orchestrator binds it at run time"
