@@ -14,6 +14,16 @@ from dudamel.llm.types import Completion, Message, ToolCall, Usage
 
 
 def fake_text(text: str, *, tokens_in: int = 10, tokens_out: int = 5) -> Completion:
+    """Create a fake completion with text response.
+
+    Args:
+        text: The assistant's text response.
+        tokens_in: Tokens in the input (default 10).
+        tokens_out: Tokens in the output (default 5).
+
+    Returns:
+        A Completion with the given text and stop_reason="end".
+    """
     return Completion(
         message=Message(role="assistant", text=text),
         usage=Usage(tokens_in=tokens_in, tokens_out=tokens_out),
@@ -29,6 +39,18 @@ def fake_tool_call(
     tokens_in: int = 10,
     tokens_out: int = 5,
 ) -> Completion:
+    """Create a fake completion with a tool call.
+
+    Args:
+        name: The tool name.
+        args: The tool arguments.
+        id: The tool call ID (default "tc1").
+        tokens_in: Tokens in the input (default 10).
+        tokens_out: Tokens in the output (default 5).
+
+    Returns:
+        A Completion with a ToolCall and stop_reason="tool_calls".
+    """
     return Completion(
         message=Message(
             role="assistant",
@@ -40,6 +62,17 @@ def fake_tool_call(
 
 
 class FakeProvider:
+    """Mock LLM provider for deterministic testing.
+
+    Records all calls in .calls, a list of dicts with keys:
+    model, messages, tools, max_tokens, json_schema.
+    Element objects are aliased (shallow copies); lists are copied.
+    Replays a scripted sequence of Completions or raises them.
+
+    Raises:
+        LLMError: When the script is exhausted.
+    """
+
     name = "fake"
 
     def __init__(self, script: list[Completion | Exception]) -> None:
@@ -55,11 +88,19 @@ class FakeProvider:
         max_tokens: int = 1024,
         json_schema: dict[str, Any] | None = None,
     ) -> Completion:
+        """Call the LLM and record the request.
+
+        Records a shallow copy of the call (element objects aliased,
+        lists copied). Returns the next item from the script.
+
+        Raises:
+            LLMError: If the script is exhausted.
+        """
         self.calls.append(
             {
                 "model": model,
                 "messages": list(messages),
-                "tools": list(tools) if tools else None,
+                "tools": list(tools) if tools is not None else None,
                 "max_tokens": max_tokens,
                 "json_schema": json_schema,
             }

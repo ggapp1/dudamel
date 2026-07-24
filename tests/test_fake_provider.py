@@ -57,3 +57,9 @@ async def test_fake_provider_exhausted_script() -> None:
 def test_llm_error_retryable_flag() -> None:
     assert LLMError("x").retryable is False
     assert LLMError("x", retryable=True).retryable is True
+
+
+async def test_empty_tools_list_recorded_faithfully() -> None:
+    fp = FakeProvider([fake_text("response")])
+    await fp.complete(model="m", messages=[], tools=[])
+    assert fp.calls[0]["tools"] == []
