@@ -24,6 +24,23 @@ must be rewritten into `Mapped[...]` + `mapped_column(...)` *before*
 `super().__init_subclass__()` runs, because that call is what triggers
 SQLAlchemy's declarative class-mapping machinery. Rewrite too late and
 SQLAlchemy raises about annotations that aren't `Mapped[...]`.
+
+Abstract mixins (`__abstract__ = True`) are supported: their bare
+annotations/defaults are never rewritten on the mixin itself (SQLAlchemy
+skips mapping abstract classes), so they stay put in `__dict__` until a
+concrete subclass is defined. `_rewrite_annotations` then walks the MRO from
+the most-basic abstract ancestor down to the concrete class — skipping the
+framework's own `Model`/`Base` (marked with `_dudamel_root = True`) — merging
+annotations and defaults so subclass declarations override mixin ones.
+
+v1 only supports single-level concrete models: subclassing an already-mapped
+(non-abstract) `Model` raises `RegistryError` — use an `__abstract__ = True`
+mixin instead.
+
+A bare `id: int` / `id: str` annotation is honored as a user-declared primary
+key (autoincrement only for `int`); declaring a default on `id` raises
+`RegistryError` since the primary key's value is not a "default" in the
+ordinary column sense.
 """
 
 from __future__ import annotations
@@ -73,12 +90,16 @@ def make_model_base(app_name: str) -> type:
     """
 
     class Base(DeclarativeBase):
-        pass
+        _dudamel_root = True
 
     class Model(Base):
         __abstract__ = True
+        _dudamel_root = True
 
         def __init_subclass__(cls, table: str | None = None, **kwargs: Any) -> None:
+            # Reject subclassing an already-mapped model *before* doing
+            # anything else — v1 only supports single-level concrete models.
+            _reject_concrete_base(cls)
             # Rewrite bare annotations into Mapped[...] + mapped_column BEFORE
             # calling super() — that call is what SQLAlchemy's declarative
             # machinery uses to map the class from cls.__annotations__.
@@ -89,12 +110,72 @@ def make_model_base(app_name: str) -> type:
     return Model
 
 
+def _reject_concrete_base(cls: type) -> None:
+    """Raise if `cls` subclasses an already-mapped (non-abstract) Model.
+
+    A concrete model always ends up with `__tablename__` set directly on it
+    by `_rewrite_annotations`; the framework's own `Model`/`Base` and any
+    `__abstract__ = True` mixin never do. So any ancestor bearing
+    `__tablename__` is unambiguously a concrete model being subclassed.
+    """
+    for base in cls.__mro__[1:]:
+        if hasattr(base, "__tablename__"):
+            raise RegistryError(
+                f"{cls.__name__}: subclassing a concrete model is not supported; "
+                "use an __abstract__ = True mixin instead"
+            )
+
+
+def _mro_ancestors(cls: type) -> list[type]:
+    """Classes between the framework root and `cls`, most-basic-first.
+
+    Walks `cls.__mro__` (most-derived first) in reverse, dropping everything
+    up to and including the framework's own `Model`/`Base` classes (marked
+    directly in their own `__dict__` with `_dudamel_root = True`). What's left
+    is the chain of `__abstract__ = True` mixins the app author wrote, ending
+    with `cls` itself — merging annotations/defaults in this order lets a
+    subclass's own declarations override a mixin's.
+    """
+    ordered = list(reversed(cls.__mro__))
+    ancestors: list[type] = []
+    past_root = False
+    for candidate in ordered:
+        if "_dudamel_root" in candidate.__dict__:
+            past_root = True
+            continue
+        if past_root:
+            ancestors.append(candidate)
+    return ancestors
+
+
+def _mro_default(cls: type, name: str) -> object:
+    """MRO-aware default lookup for `name`.
+
+    Checks every class between the framework root and `cls` (most-basic
+    mixin first) for a directly-declared value named `name`; the
+    most-specific class that declares one wins, so a subclass's own default
+    overrides a mixin's.
+    """
+    value: object = _MISSING
+    for ancestor in _mro_ancestors(cls):
+        if name in ancestor.__dict__:
+            value = ancestor.__dict__[name]
+    return value
+
+
 def _rewrite_annotations(cls: type, app_name: str, table: str | None) -> None:
     cls.__tablename__ = f"{app_name}_{table or _snake(cls.__name__)}"  # type: ignore[attr-defined]
 
-    # Only the annotations declared directly on this class (not inherited
-    # ones already processed on a parent) are candidates for rewriting.
-    bare = dict(cls.__dict__.get("__annotations__", {}))
+    # Bare annotations come from every `__abstract__ = True` mixin between the
+    # framework root and `cls`, merged most-basic-first so `cls`'s own
+    # declarations (and any subclass override of a mixin field) win. Without
+    # this walk, a mixin's fields (e.g. `created_at` on a `Timestamped`
+    # abstract base) would silently never become columns on the concrete
+    # subclass — only `cls.__dict__["__annotations__"]` was ever checked.
+    bare: dict[str, object] = {}
+    for ancestor in _mro_ancestors(cls):
+        bare.update(ancestor.__dict__.get("__annotations__", {}))
+
     new_annotations: dict[str, object] = {}
     has_pk = "id" in bare
 
@@ -116,8 +197,19 @@ def _rewrite_annotations(cls: type, app_name: str, table: str | None) -> None:
         # inner type, so SQLAlchemy's annotation-based nullability inference
         # can no longer see the original `X | None`. Skipping it on the
         # defaulted branches would silently make `x: int | None = 5` NOT NULL.
-        default = cls.__dict__.get(name, _MISSING)
-        if default is NOW:
+        #
+        # Defaults are looked up the same MRO-aware way as the annotations
+        # themselves, so a mixin's `app.now()`/plain default is inherited
+        # unless the concrete class (or a more-specific mixin) overrides it.
+        default = _mro_default(cls, name)
+
+        if name == "id":
+            if default is not _MISSING:
+                raise RegistryError(
+                    f"{cls.__name__}.id: id is the primary key; defaults are not supported"
+                )
+            column = mapped_column(sa_type, primary_key=True, autoincrement=py_type is int)
+        elif default is NOW:
             column = mapped_column(sa_type, nullable=nullable, default=_now_naive_utc)
         elif default is not _MISSING:
             column = mapped_column(sa_type, nullable=nullable, default=default)

@@ -12,6 +12,7 @@ from dudamel.contract.types import TOOL_NAME_RE, Job, Tool, Widget
 from dudamel.exceptions import RegistryError, RuntimeNotBoundError
 
 if TYPE_CHECKING:
+    from sqlalchemy import MetaData
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from dudamel.db import Database
@@ -34,6 +35,7 @@ class App:
         self._llm: Callable[..., Awaitable[Any]] | None = None  # bound in Plan 2
         self._notify: Callable[..., Awaitable[None]] | None = None  # bound in Plan 3
         self._database: Any | None = None  # bound in Task 9 tests / run phase
+        self._model_base: type | None = None
 
     # --- tools -------------------------------------------------------------
     def tool(
@@ -155,14 +157,14 @@ class App:
     # --- model sugar ---------------------------------------------------------
     @property
     def Model(self) -> type:  # noqa: N802 — class-like property, PEP8 exception intended
-        if not hasattr(self, "_model_base"):
+        if self._model_base is None:
             from dudamel.modelsugar import make_model_base
 
             self._model_base = make_model_base(self.name)
         return self._model_base
 
     @property
-    def metadata(self) -> Any:
+    def metadata(self) -> MetaData:
         return self.Model.metadata
 
     @staticmethod
