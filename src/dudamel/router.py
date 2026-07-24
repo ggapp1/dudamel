@@ -27,6 +27,7 @@ from dudamel.exceptions import (
 from dudamel.llm.client import LLMClient
 from dudamel.llm.provider import ToolSpec
 from dudamel.llm.types import Message, ToolCall
+from dudamel.models_core import Message as MessageRow
 from dudamel.models_core import PendingConfirmation
 from dudamel.registry import Registry
 from dudamel.window import build_window
@@ -89,6 +90,23 @@ class Router:
     ) -> ChatReply:
         conv_id = await self._convo.get_or_create(channel)
         async with await self._lock_for(conv_id):
+            if client_msg_id is not None:
+                # Read-only duplicate check BEFORE auto-decline: an interface
+                # retry of the very message that created a pending confirmation
+                # must not auto-decline its own confirmation just to be deduped
+                # a moment later. The append-dedupe below remains the backstop
+                # for racing concurrent writes of the same client_msg_id.
+                async with self._db.session() as s:
+                    dup = (
+                        await s.execute(
+                            select(MessageRow.id).where(
+                                MessageRow.conversation_id == conv_id,
+                                MessageRow.client_msg_id == client_msg_id,
+                            )
+                        )
+                    ).first()
+                if dup is not None:
+                    return ChatReply(text="")
             await self._auto_decline_pending(conv_id)
             appended = await self._convo.append(
                 conv_id, Message(role="user", text=text), client_msg_id=client_msg_id

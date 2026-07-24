@@ -14,7 +14,7 @@ from dudamel.llm.types import Completion, Message, ToolCall, Usage
 from dudamel.migrate import upgrade_core
 from dudamel.models_core import PendingConfirmation
 from dudamel.registry import Registry
-from dudamel.router import Router, _utcnow
+from dudamel.router import ChatReply, Router, _utcnow
 
 DELETED: list[str] = []
 MUTATED: list[str] = []
@@ -155,6 +155,28 @@ async def test_resolution_survives_router_restart(tmp_path) -> None:
     router2 = Router(llm=llm2, registry=registry, convo=convo, db=db, config=RouterConfig())
     r2 = await router2.resolve_confirmation(r1.pending_confirmation_id, approved=True, user_id="u1")
     assert r2.text == "done after restart" and DELETED == ["persist"]
+    await db.dispose()
+
+
+async def test_duplicate_of_confirming_message_does_not_decline_pending(tmp_path) -> None:
+    """I2: an interface retry (same client_msg_id) of the very message that
+    created a pending confirmation must not auto-decline that confirmation
+    on its way to being deduped."""
+    script = [fake_tool_call("wipe_log", {"reason": "x"}), fake_text("All wiped!")]
+    router, fp, db, convo, _ = build(tmp_path, script)
+    r1 = await router.handle(channel="t:1", text="wipe it", user_id="u1", client_msg_id="m1")
+    assert r1.pending_confirmation_id and "Confirm" in r1.text
+
+    r2 = await router.handle(channel="t:1", text="wipe it", user_id="u1", client_msg_id="m1")
+    assert r2 == ChatReply(text="")
+
+    async with db.session() as s:
+        row = (await s.execute(select(PendingConfirmation))).scalar_one()
+    assert row.status == "pending"  # NOT auto-declined by the retry
+    assert len(fp.calls) == 1  # no second model call from the retry
+
+    r3 = await router.resolve_confirmation(r1.pending_confirmation_id, approved=True, user_id="u1")
+    assert r3.text == "All wiped!" and DELETED == ["x"]
     await db.dispose()
 
 
