@@ -188,3 +188,28 @@ def test_id_with_default_rejected():
 
         class Bad(app.Model):
             id: int = 5
+
+
+def test_table_override_validated():
+    app = make_app()
+    with pytest.raises(RegistryError, match="table override"):
+
+        class Bad(app.Model, table="Bad-Name!"):
+            x: str
+
+
+def test_table_override_allows_snake_case_with_digits():
+    app = make_app()
+
+    class Ok(app.Model, table="v2_items"):
+        x: str
+
+    assert Ok.__tablename__ == "workouts_v2_items"
+
+
+def test_tablename_length_enforced():
+    app = App("a" * 32, description="d")  # max-length app name (32 chars)
+    with pytest.raises(RegistryError, match="63"):
+
+        class Thing(app.Model, table="x" * 40):
+            name: str

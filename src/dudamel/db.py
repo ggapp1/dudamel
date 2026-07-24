@@ -26,6 +26,10 @@ class Database:
 
         self._factory = async_sessionmaker(self.engine, expire_on_commit=False)
 
+    async def dispose(self) -> None:
+        """Dispose the underlying engine's connection pool."""
+        await self.engine.dispose()
+
     @asynccontextmanager
     async def session(self) -> AsyncIterator[AsyncSession]:
         token = IN_DB_SCOPE.set(True)

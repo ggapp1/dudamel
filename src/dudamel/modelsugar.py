@@ -58,6 +58,9 @@ from dudamel.exceptions import RegistryError
 NOW = object()  # sentinel returned by app.now(); recognized as a default marker
 _MISSING = object()
 
+_TABLE_OVERRIDE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+_MAX_TABLENAME_LENGTH = 63  # PostgreSQL identifier limit; SQLite has none but we hold to the min
+
 _COLUMN_TYPES: dict[type, Any] = {
     str: String,
     int: Integer,
@@ -100,6 +103,11 @@ def make_model_base(app_name: str) -> type:
             # Reject subclassing an already-mapped model *before* doing
             # anything else — v1 only supports single-level concrete models.
             _reject_concrete_base(cls)
+            if table is not None and not _TABLE_OVERRIDE_RE.match(table):
+                raise RegistryError(
+                    f"{cls.__name__}: table override {table!r} must match "
+                    f"{_TABLE_OVERRIDE_RE.pattern}"
+                )
             # Rewrite bare annotations into Mapped[...] + mapped_column BEFORE
             # calling super() — that call is what SQLAlchemy's declarative
             # machinery uses to map the class from cls.__annotations__.
@@ -164,7 +172,14 @@ def _mro_default(cls: type, name: str) -> object:
 
 
 def _rewrite_annotations(cls: type, app_name: str, table: str | None) -> None:
-    cls.__tablename__ = f"{app_name}_{table or _snake(cls.__name__)}"  # type: ignore[attr-defined]
+    tablename = f"{app_name}_{table or _snake(cls.__name__)}"
+    if len(tablename) > _MAX_TABLENAME_LENGTH:
+        raise RegistryError(
+            f"{cls.__name__}: table name {tablename!r} is {len(tablename)} chars, "
+            f"over the {_MAX_TABLENAME_LENGTH}-char SQL identifier limit; "
+            "pass a shorter table= override"
+        )
+    cls.__tablename__ = tablename  # type: ignore[attr-defined]
 
     # Bare annotations come from every `__abstract__ = True` mixin between the
     # framework root and `cls`, merged most-basic-first so `cls`'s own

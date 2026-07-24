@@ -53,6 +53,33 @@ async def test_app_db_unbound_raises():
             pass
 
 
+async def test_dispose_delegates_to_engine(tmp_path, monkeypatch):
+    """Database.dispose() is sugar over engine.dispose()."""
+    d = Database(f"sqlite+aiosqlite:///{tmp_path}/dispose.db")
+    calls = []
+    original_dispose = type(d.engine).dispose
+
+    async def spy_dispose(self, *args, **kwargs):
+        calls.append((args, kwargs))
+        return await original_dispose(self, *args, **kwargs)
+
+    # AsyncEngine uses __slots__ (only "sync_engine") -- an instance attribute
+    # named "dispose" can't be set, so the spy is patched at the class level.
+    monkeypatch.setattr(type(d.engine), "dispose", spy_dispose)
+    await d.dispose()
+    assert len(calls) == 1
+
+    # the pool reopens connections lazily -- the engine stays usable afterward.
+    async with d.engine.begin() as conn:
+        await conn.execute(text("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)"))
+    async with d.session() as s:
+        await s.execute(text("INSERT INTO items (name) VALUES ('after-dispose')"))
+    async with d.session() as s:
+        count = (await s.execute(text("SELECT COUNT(*) FROM items"))).scalar()
+    assert count == 1
+    await d.dispose()
+
+
 async def test_app_db_bound_delegates(db: Database):
     app = App("workouts", description="d")
     app.bind_database(db)
