@@ -41,6 +41,17 @@ def test_reserved_app_name_rejected():
         Registry([App("core", description="d")])
 
 
+@pytest.mark.parametrize("name", ["job", "alembic", "pending"])
+def test_core_namespace_collision_rejected(name):
+    """App("job") would prefix its tables "job_" -> collides with the core
+    table "job_runs"; App("pending") collides with "pending_confirmations";
+    App("alembic") collides with the alembic version-table namespace itself.
+    All three must be rejected at Registry construction, before any table
+    ever gets a chance to be reflected/diffed by migrate.py."""
+    with pytest.raises(RegistryError, match="core namespace"):
+        Registry([App(name, description="d")])
+
+
 def test_orchestrator_is_pure():
     a = app_with_tool("alpha", "do_a")
     orc = Orchestrator(apps=[a], mcp=["uvx mcp-server-fetch"])

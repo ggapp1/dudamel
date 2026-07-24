@@ -7,8 +7,32 @@ from sqlalchemy import MetaData
 from dudamel.app import App
 from dudamel.contract.types import Job, Tool, Widget
 from dudamel.exceptions import RegistryError
+from dudamel.models_core import CoreBase
 
 RESERVED_APP_NAMES = {"dudamel", "core"}
+
+# Every string an app's table prefix must never be a prefix of: the framework's
+# own core tables (conversations, messages, ...) plus the alembic version-table
+# namespace. Derived from CoreBase.metadata rather than hardcoded so a future
+# core table automatically extends the forbidden-prefix set.
+_CORE_NAMESPACE_CANDIDATES = frozenset(CoreBase.metadata.tables) | {"alembic_"}
+
+
+def _core_namespace_collision(app_name: str) -> str | None:
+    """Return the core identifier an app's table prefix would shadow, if any.
+
+    An app named "job" produces prefix "job_", which is a prefix of the core
+    table "job_runs" — tables reflected under that name would silently be
+    treated as belonging to the "job" app by migrate.py's prefix allowlist.
+    Checking prefix-of (not equality) also catches "alembic" against the
+    "alembic_version_core"/"alembic_version_apps" version tables via the
+    "alembic_" sentinel.
+    """
+    prefix = f"{app_name}_"
+    for candidate in _CORE_NAMESPACE_CANDIDATES:
+        if candidate.startswith(prefix):
+            return candidate
+    return None
 
 
 class Registry:
@@ -22,6 +46,13 @@ class Registry:
         for app in apps:
             if app.name in RESERVED_APP_NAMES:
                 raise RegistryError(f"app name {app.name!r} is reserved")
+            collision = _core_namespace_collision(app.name)
+            if collision is not None:
+                raise RegistryError(
+                    f"app name {app.name!r} produces table prefix {app.name}_ "
+                    f"which collides with the core namespace (shadows {collision!r}); "
+                    "choose a different app name"
+                )
             if app.name in self.apps:
                 raise RegistryError(f"duplicate app name {app.name!r}")
             self.apps[app.name] = app
