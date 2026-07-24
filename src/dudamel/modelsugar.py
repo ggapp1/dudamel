@@ -31,7 +31,7 @@ from __future__ import annotations
 import re
 from datetime import UTC, date, datetime
 from types import UnionType
-from typing import Any, ClassVar, Union, get_args, get_origin
+from typing import Any, Union, get_args, get_origin
 
 from sqlalchemy import JSON, Boolean, Date, DateTime, Float, Integer, String
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -103,11 +103,6 @@ def _rewrite_annotations(cls: type, app_name: str, table: str | None) -> None:
         cls.id = mapped_column(Integer, primary_key=True, autoincrement=True)
 
     for name, ann in bare.items():
-        # ClassVar / non-column annotations pass through untouched.
-        if get_origin(ann) is ClassVar:
-            new_annotations[name] = ann
-            continue
-
         py_type, nullable = _unwrap_optional(ann)
         sa_type = _COLUMN_TYPES.get(py_type)
         if sa_type is None:
@@ -116,6 +111,11 @@ def _rewrite_annotations(cls: type, app_name: str, table: str | None) -> None:
                 f"supported: {sorted(t.__name__ for t in _COLUMN_TYPES)}"
             )
 
+        # `nullable` is passed explicitly in every branch below (not just the
+        # no-default case): `Mapped[py_type]` always carries the *unwrapped*
+        # inner type, so SQLAlchemy's annotation-based nullability inference
+        # can no longer see the original `X | None`. Skipping it on the
+        # defaulted branches would silently make `x: int | None = 5` NOT NULL.
         default = cls.__dict__.get(name, _MISSING)
         if default is NOW:
             column = mapped_column(sa_type, nullable=nullable, default=_now_naive_utc)
