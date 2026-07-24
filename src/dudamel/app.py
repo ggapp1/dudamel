@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from typing import TYPE_CHECKING, Any
 
+from dudamel.contract.renderers import RENDERERS
 from dudamel.contract.schema import ToolSchema
 from dudamel.contract.types import TOOL_NAME_RE, Job, Tool, Widget
 from dudamel.exceptions import RegistryError, RuntimeNotBoundError
@@ -58,6 +59,8 @@ class App:
         self, fn: Callable, *, read_only: bool, confirm: bool, timeout: float
     ) -> Callable:
         name = fn.__name__
+        if not inspect.iscoroutinefunction(fn):
+            raise RegistryError(f"tool {name!r} must be async (define it with `async def`)")
         if not TOOL_NAME_RE.match(name):
             raise RegistryError(f"tool name {name!r} must match {TOOL_NAME_RE.pattern}")
         doc = (inspect.getdoc(fn) or "").strip()
@@ -65,12 +68,20 @@ class App:
             raise RegistryError(f"tool {name!r} needs a docstring — it is the LLM's description")
         if name in self.tools:
             raise RegistryError(f"tool {name!r} already registered on app {self.name!r}")
+        try:
+            schema = ToolSchema(fn)
+        except TypeError as e:
+            # ToolSchema signature problems (missing type hint, *args/**kwargs,
+            # unsupported parameter type, ...) are registration failures like
+            # any other here — fold them into the same RegistryError taxonomy
+            # instead of leaking a bare TypeError through the decorator.
+            raise RegistryError(str(e)) from e
         self.tools[name] = Tool(
             name=name,
             app_name=self.name,
             description=doc,
             fn=fn,
-            schema=ToolSchema(fn),
+            schema=schema,
             read_only=read_only,
             confirm=confirm,
             timeout=timeout,
@@ -79,13 +90,23 @@ class App:
 
     # --- widgets -----------------------------------------------------------
     def widget(self, *, title: str, renderer: str) -> Callable:
-        from dudamel.contract.renderers import RENDERERS
-
         if renderer not in RENDERERS:
             raise RegistryError(f"unknown renderer {renderer!r}; choose one of {sorted(RENDERERS)}")
 
         def wrap(fn: Callable[[], Awaitable[Any]]) -> Callable:
             wid = fn.__name__
+            if not inspect.iscoroutinefunction(fn):
+                raise RegistryError(f"widget {wid!r} must be async (define it with `async def`)")
+            required = [
+                p.name
+                for p in inspect.signature(fn).parameters.values()
+                if p.default is inspect.Parameter.empty
+                and p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+            ]
+            if required:
+                raise RegistryError(
+                    f"widget {wid!r} must take no arguments; found required parameter(s) {required}"
+                )
             if wid in self.widgets:
                 raise RegistryError(f"widget {wid!r} already registered on app {self.name!r}")
             self.widgets[wid] = Widget(
@@ -115,6 +136,8 @@ class App:
 
         def wrap(fn: Callable[[], Awaitable[None]]) -> Callable:
             jid = f"{self.name}.{fn.__name__}"
+            if not inspect.iscoroutinefunction(fn):
+                raise RegistryError(f"job {jid!r} must be async (define it with `async def`)")
             if jid in self.jobs:
                 raise RegistryError(f"job {jid!r} already registered")
             self.jobs[jid] = Job(

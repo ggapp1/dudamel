@@ -43,6 +43,37 @@ def test_table_list_markdown_payloads():
         validate_widget_payload("markdown", {"not": "str"})
 
 
+def test_sync_widget_rejected():
+    app = App("workouts", description="d")
+    with pytest.raises(RegistryError, match="must be async"):
+
+        @app.widget(title="X", renderer="stat")
+        def sync_widget() -> dict:
+            return {"label": "x", "value": 1}
+
+
+def test_widget_with_required_arg_rejected():
+    app = App("workouts", description="d")
+    with pytest.raises(RegistryError, match="must take no arguments"):
+
+        @app.widget(title="X", renderer="stat")
+        async def needs_arg(period: str) -> dict:
+            return {"label": period, "value": 1}
+
+
+def test_widget_with_defaulted_arg_allowed():
+    """A parameter with a default is not "required" -- widgets just never
+    receive one in practice, but the registration check should only reject
+    parameters the caller would actually have to supply."""
+    app = App("workouts", description="d")
+
+    @app.widget(title="X", renderer="stat")
+    async def has_default(period: str = "week") -> dict:
+        return {"label": period, "value": 1}
+
+    assert "has_default" in app.widgets
+
+
 def test_duplicate_widget_id_rejected():
     app = App("workouts", description="d")
 

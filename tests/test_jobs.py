@@ -34,6 +34,15 @@ def test_invalid_cron_fails_at_registration():
             pass
 
 
+def test_sync_job_rejected():
+    app = App("workouts", description="d")
+    with pytest.raises(RegistryError, match="must be async"):
+
+        @app.job(interval_seconds=60)
+        def sync_job() -> None:
+            pass
+
+
 def test_exactly_one_trigger_required():
     app = App("workouts", description="d")
     with pytest.raises(RegistryError, match="exactly one"):

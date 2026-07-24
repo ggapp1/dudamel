@@ -55,6 +55,29 @@ def test_duplicate_tool_rejected():
         app._register_tool(dup, read_only=False, confirm=False, timeout=30.0)
 
 
+def test_sync_tool_rejected():
+    app = make_app()
+    with pytest.raises(RegistryError, match="must be async"):
+
+        @app.tool
+        def sync_fn(x: int) -> int:
+            """Doc."""
+            return x
+
+
+def test_tool_var_args_wrapped_as_registry_error():
+    """ToolSchema raises TypeError for *args/**kwargs (tests/test_schema.py
+    tests that directly); the decorator path must fold it into RegistryError
+    so registration failures are one taxonomy end to end."""
+    app = make_app()
+    with pytest.raises(RegistryError, match=r"\*args/\*\*kwargs not supported"):
+
+        @app.tool
+        async def var_args(*args: int) -> int:
+            """Doc."""
+            return sum(args)
+
+
 def test_bad_tool_name_rejected():
     app = make_app()
 
