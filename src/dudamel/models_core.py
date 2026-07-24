@@ -71,3 +71,17 @@ class PendingConfirmation(CoreBase):
     status: Mapped[str] = mapped_column(String(32), default="pending")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     expires_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class LlmCall(CoreBase):
+    __tablename__ = "llm_calls"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tier: Mapped[str] = mapped_column(String(64))
+    provider: Mapped[str] = mapped_column(String(64))
+    model: Mapped[str] = mapped_column(String(128))
+    tokens_in: Mapped[int] = mapped_column(Integer)
+    tokens_out: Mapped[int] = mapped_column(Integer)
+    conversation_id: Mapped[int | None] = mapped_column(
+        ForeignKey("conversations.id"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
