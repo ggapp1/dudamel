@@ -184,6 +184,52 @@ async def test_post_approve_llm_error_reports_action_completed(tmp_path) -> None
     await db.dispose()
 
 
+async def test_approve_with_failing_tool_reports_failure_honestly(tmp_path) -> None:
+    """Fix round 1: the confirmed tool RAISES and there is no prior success, so
+    a post-resume LLMError must report the model as unavailable — NOT falsely
+    claim "I completed the action(s)"."""
+
+    app = App("gym", description="d")
+
+    @app.tool(confirm=True)
+    async def wipe_log(reason: str) -> str:
+        """Delete the whole workout log."""
+        raise RuntimeError("disk full")
+
+    script = [
+        fake_tool_call("wipe_log", {"reason": "x"}),
+        LLMError("provider down", retryable=True),
+    ]
+    url = f"sqlite+aiosqlite:///{tmp_path}/cf.db"
+    upgrade_core(url)
+    db = Database(url)
+    fp = FakeProvider(script)
+    llm = LLMClient(
+        tiers={"standard": Tier(name="standard", provider=fp, model="f", max_tokens=64)},
+        db=db,
+        budget=BudgetConfig(),
+    )
+    registry = Registry([app])
+    convo = ConversationStore(db)
+    router = Router(llm=llm, registry=registry, convo=convo, db=db, config=RouterConfig())
+
+    r1 = await router.handle(channel="t:1", text="wipe it", user_id="u1")
+    assert r1.pending_confirmation_id and "Confirm" in r1.text
+    r2 = await router.resolve_confirmation(r1.pending_confirmation_id, approved=True, user_id="u1")
+
+    assert "unavailable" in r2.text
+    assert "completed the action" not in r2.text
+    assert DELETED == []
+
+    cid = await convo.get_or_create("t:1")
+    history = await convo.recent(cid)
+    assert [m.role for m in history] == ["user", "assistant", "tool"]
+    tool_msg = history[-1]
+    assert tool_msg.is_error
+    assert "disk full" in tool_msg.text
+    await db.dispose()
+
+
 async def test_taint_survives_suspension_gap(tmp_path) -> None:
     """DEVIATION: loop_state carries turn_tainted across the suspension gap.
     An MCP result in the suspended batch taints the turn; after approving the

@@ -363,10 +363,12 @@ class Router:
             rows = (
                 (
                     await s.execute(
-                        select(PendingConfirmation).where(
+                        select(PendingConfirmation)
+                        .where(
                             PendingConfirmation.conversation_id == conv_id,
                             PendingConfirmation.status == "pending",
                         )
+                        .order_by(PendingConfirmation.created_at)
                     )
                 )
                 .scalars()
@@ -380,7 +382,7 @@ class Router:
                 self._db,
                 tool=row.tool,
                 args=row.args,
-                status="declined",
+                status=row.status,
                 result_preview="auto-declined",
                 conversation_id=conv_id,
             )
@@ -480,12 +482,19 @@ class Router:
             for d in state["results"]:
                 await self._convo.append(row.conversation_id, Message.from_dict(d))
             await self._convo.append(row.conversation_id, result)
+            # DEVIATION (Fix round 1 review): mirror the deny path's honesty —
+            # executed_any must reflect whether ANY tool actually succeeded
+            # (pre-suspension successes, suspended-batch successes, or this
+            # just-run confirmed call), not unconditionally True. A confirmed
+            # tool that raised must not make a post-resume LLMError claim
+            # "I completed the action(s)" when nothing actually succeeded.
+            executed_any = stored_executed_any or results_have_success or (not result.is_error)
             return await self._loop(
                 row.conversation_id,
                 tier=state["tier"],
                 user_id=user_id,
                 start_iteration=state["iteration"] + 1,
-                executed_any=True,
+                executed_any=executed_any,
                 initial_taint=initial_taint,
             )
 
