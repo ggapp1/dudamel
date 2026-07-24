@@ -14,6 +14,9 @@ class ToolSchema:
 
     The model is both the JSON schema sent to the LLM and the coercion layer
     that turns the model's string-ish output back into typed Python.
+    Enum-typed params reach the tool as Enum members (e.g. `Color.RED`, not
+    the string `"red"`) — only the *emitted JSON schema* flattens an enum
+    down to its list of values, for providers that don't understand Enums.
     """
 
     def __init__(self, fn: Any) -> None:
@@ -23,13 +26,15 @@ class ToolSchema:
         for name, param in sig.parameters.items():
             if name in ("self", "cls"):
                 continue
+            if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                raise TypeError("*args/**kwargs not supported in tool signatures")
             if name not in hints:
                 raise TypeError(f"tool parameter {name!r} needs a type hint")
             default = ... if param.default is inspect.Parameter.empty else param.default
             fields[name] = (hints[name], default)
         self.arg_model = create_model(
             f"{fn.__name__}_args",
-            __config__=ConfigDict(extra="forbid", use_enum_values=True, validate_default=True),
+            __config__=ConfigDict(extra="forbid", validate_default=True),
             **fields,
         )
         self.description = inspect.getdoc(fn) or ""

@@ -72,11 +72,35 @@ def test_container_of_enum_has_no_dangling_refs():
     assert schema["properties"]["colors"]["items"]["enum"] == ["red", "blue"]
 
 
-def test_enum_default_matches_use_enum_values():
+def test_enum_default_and_coerced_value_return_members():
+    """validate() coerces enum-typed args back into real Enum members (not
+    their raw string value) -- both when the default applies and when the
+    LLM supplies the (string) value explicitly. Only the emitted JSON schema
+    (see test_json_schema_golden) flattens an enum to its list of values."""
+
     async def color_tool(color: Color = Color.RED) -> str:
         """Pick a color."""
         return ""
 
     schema = ToolSchema(color_tool)
-    assert schema.validate({}) == {"color": "red"}
-    assert schema.validate({"color": "blue"}) == {"color": "blue"}
+    assert schema.validate({}) == {"color": Color.RED}
+    assert schema.validate({"color": "blue"}) == {"color": Color.BLUE}
+    assert isinstance(schema.validate({"color": "blue"})["color"], Color)
+
+
+def test_var_positional_rejected():
+    async def bad(*args: int) -> int:
+        """Doc."""
+        return sum(args)
+
+    with pytest.raises(TypeError, match=r"\*args/\*\*kwargs not supported"):
+        ToolSchema(bad)
+
+
+def test_var_keyword_rejected():
+    async def bad(**kwargs: int) -> int:
+        """Doc."""
+        return sum(kwargs.values())
+
+    with pytest.raises(TypeError, match=r"\*args/\*\*kwargs not supported"):
+        ToolSchema(bad)
