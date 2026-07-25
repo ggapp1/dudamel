@@ -41,6 +41,12 @@ class WebConfig(BaseModel):
     allowed_hosts: list[str] = ["localhost", "127.0.0.1"]
 
 
+class TelegramConfig(BaseModel):
+    token_env: str = "DUDAMEL_TELEGRAM_TOKEN"
+    allowed_user_ids: list[int] = []
+    allow_groups: bool = False
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="DUDAMEL_", extra="ignore")
 
@@ -50,6 +56,7 @@ class Settings(BaseSettings):
     llm_budget: BudgetConfig = BudgetConfig()
     router: RouterConfig = RouterConfig()
     web: WebConfig = WebConfig()
+    telegram: TelegramConfig = TelegramConfig()
 
     @classmethod
     def settings_customise_sources(
