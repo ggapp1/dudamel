@@ -204,6 +204,34 @@ async def test_render_widgets_runs_concurrently(tmp_path) -> None:
     await rt.stop()
 
 
+# --- Plan 3 Task 2: scheduler wiring ----------------------------------------
+
+
+async def test_runtime_has_scheduler_created_but_not_started(tmp_path) -> None:
+    from dudamel.scheduler import JobScheduler
+
+    orc = make_orc()
+    rt = Runtime(orc, make_settings(tmp_path), providers={"standard": FakeProvider([])})
+    assert isinstance(rt.scheduler, JobScheduler)
+    assert rt.scheduler._scheduler.running is False
+    await rt.start()
+    assert rt.scheduler._scheduler.running is False  # rt.start() must not start it
+    await rt.stop()
+
+
+async def test_runtime_scheduler_registers_apps_jobs(tmp_path) -> None:
+    app = App("stats", description="d")
+
+    @app.job(interval_seconds=60)
+    async def poll() -> None:
+        pass
+
+    orc = Orchestrator(apps=[app])
+    rt = Runtime(orc, make_settings(tmp_path), providers={"standard": FakeProvider([])})
+    assert "stats.poll" in rt.scheduler._aps_jobs
+    await rt.stop()
+
+
 async def test_render_widgets_reports_widget_errors(tmp_path) -> None:
     app = App("stats", description="d")
 

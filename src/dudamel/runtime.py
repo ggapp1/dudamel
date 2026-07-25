@@ -25,6 +25,7 @@ from dudamel.migrate import upgrade_apps, upgrade_core
 from dudamel.models_core import Conversation, PendingConfirmation
 from dudamel.orchestrator import Orchestrator
 from dudamel.router import ChatReply, Router
+from dudamel.scheduler import JobScheduler
 from dudamel.widgets import run_widget
 
 logger = logging.getLogger("dudamel.runtime")
@@ -51,6 +52,11 @@ class Runtime:
             db=self._db,
             config=settings.router,
         )
+        # Created here so Runtime construction (safe to do in tests / at
+        # import-adjacent time) fully wires the process, but NOT started:
+        # only the assembly (Plan 3 Task 6) calls scheduler.start(), once
+        # everything else (db migrations, interfaces) is up.
+        self.scheduler = JobScheduler(self._registry, self._db)
         for app in orchestrator.registry.apps.values():
             app.bind_database(self._db)
             app._llm = self._make_app_llm()
