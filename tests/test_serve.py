@@ -16,6 +16,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+import uvicorn
 from sqlalchemy import select
 
 from dudamel import App, Orchestrator, Runtime
@@ -23,7 +24,7 @@ from dudamel.config import Settings, TierConfig, WebConfig
 from dudamel.db import Database
 from dudamel.llm.testing import FakeProvider
 from dudamel.models_core import JobRun
-from dudamel.serve import _InstanceLock, serve
+from dudamel.serve import _InstanceLock, _prepare_uvicorn, serve
 
 TOKEN = "s3cr3t-serve-token"  # noqa: S105 — test fixture, not a real credential
 
@@ -213,6 +214,91 @@ async def test_sigterm_shuts_down_cleanly(tmp_path: Path) -> None:
             await c.get("/health", timeout=1.0)
 
 
+# --- clean shutdown: double SIGTERM (regression) --------------------------------
+
+_DOUBLE_SIGTERM_CHILD_SCRIPT = """
+import asyncio
+import sys
+from pathlib import Path
+
+from dudamel import App, Orchestrator
+from dudamel.config import Settings, TierConfig, WebConfig
+from dudamel.llm.testing import FakeProvider
+from dudamel.serve import serve
+
+
+def make_orc():
+    app = App("stats", description="d")
+
+    @app.widget(title="Streak", renderer="markdown")
+    async def streak():
+        return "3 days"
+
+    return Orchestrator(apps=[app])
+
+
+async def main() -> None:
+    data_dir = Path(sys.argv[1])
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{data_dir}/serve.db",
+        data_dir=data_dir,
+        llm_tiers={"standard": TierConfig(provider="fake", model="f")},
+        web=WebConfig(host="127.0.0.1", port=0),
+    )
+    task = asyncio.create_task(
+        serve(make_orc(), settings, providers={"standard": FakeProvider([])})
+    )
+    while settings.web.port == 0:
+        await asyncio.sleep(0.01)
+    print("ready", flush=True)
+    await task
+
+
+asyncio.run(main())
+"""
+
+
+def test_double_sigterm_50ms_apart_does_not_hard_kill_mid_shutdown(tmp_path: Path) -> None:
+    """Regression test (CRITICAL finding): signal handlers used to be torn
+    down -- restoring default SIGTERM/SIGINT disposition -- BEFORE the
+    ordered shutdown sequence ran, in the outer `finally`. A second SIGTERM
+    landing in that window then fell through to the OS default action for
+    SIGTERM: an immediate, un-catchable process kill, leaving the lockfile
+    behind and skipping the rest of shutdown (including `Runtime.stop()`'s
+    DB dispose). This has to run `serve()` in a real subprocess (mirroring
+    the existing subprocess pattern used elsewhere in this file) -- the bug
+    is about actual OS signal disposition, which no in-process `os.kill`
+    test can observe, since a single interpreter shares one
+    signal-handling thread no matter how many handlers are "installed" on
+    top of it.
+    """
+    script = tmp_path / "_double_sigterm_child.py"
+    script.write_text(_DOUBLE_SIGTERM_CHILD_SCRIPT)
+    lockfile = tmp_path / ".dudamel.lock"
+
+    proc = subprocess.Popen(
+        [sys.executable, str(script), str(tmp_path)],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        ready = proc.stdout.readline()
+        assert ready.strip() == "ready"
+        assert lockfile.exists()
+
+        proc.send_signal(signal.SIGTERM)
+        time.sleep(0.05)
+        proc.send_signal(signal.SIGTERM)
+
+        exit_code = proc.wait(timeout=5.0)
+        assert exit_code == 0
+        assert not lockfile.exists()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5.0)
+
+
 # --- optional Telegram wiring --------------------------------------------------
 
 
@@ -298,22 +384,101 @@ def test_instance_lock_acquire_release_roundtrip(tmp_path: Path) -> None:
     assert not lockfile.exists()
 
 
-def test_instance_lock_refuses_while_pid_is_alive(tmp_path: Path) -> None:
+def test_instance_lock_exclusive_until_released(tmp_path: Path) -> None:
+    """flock exclusivity (IMPORTANT finding): a second acquire() must fail
+    while the first is genuinely held, and succeed again once it's
+    released -- no TOCTOU window between "check" and "take" the way the old
+    pid-heuristic reclaim had."""
     lockfile = tmp_path / ".dudamel.lock"
-    lockfile.write_text(str(os.getpid()))  # our own pid: definitely alive
-    with pytest.raises(RuntimeError, match="already running"):
-        _InstanceLock(lockfile).acquire()
+    first = _InstanceLock(lockfile)
+    first.acquire()
+    try:
+        with pytest.raises(RuntimeError, match="already running"):
+            _InstanceLock(lockfile).acquire()
+    finally:
+        first.release()
 
-
-def test_instance_lock_reclaims_a_stale_dead_pid(tmp_path: Path) -> None:
-    dead = subprocess.Popen([sys.executable, "-c", "pass"])
-    dead.wait()  # exited -- its pid is now guaranteed dead
-    lockfile = tmp_path / ".dudamel.lock"
-    lockfile.write_text(str(dead.pid))
-
-    lock = _InstanceLock(lockfile)
-    lock.acquire()  # must NOT raise -- the recorded pid is dead
+    # Released -> a fresh acquire succeeds again.
+    second = _InstanceLock(lockfile)
+    second.acquire()
     try:
         assert lockfile.read_text().strip() == str(os.getpid())
     finally:
-        lock.release()
+        second.release()
+
+
+def test_instance_lock_available_once_a_real_holder_dies(tmp_path: Path) -> None:
+    """The old pid-heuristic "stale lockfile" reclaim is gone entirely
+    (IMPORTANT finding): `flock` is owned by the kernel, which drops it
+    unconditionally when the holding process exits, clean shutdown or
+    crash alike. This spawns a real subprocess that acquires the lock,
+    kills it without giving it any chance to clean up (a crash, not a
+    graceful exit), and confirms a fresh acquire() in this process just
+    succeeds -- no stale-pid detection step involved at all."""
+    lockfile = tmp_path / ".dudamel.lock"
+    script = (
+        "import fcntl, os, sys, time\n"
+        "fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o644)\n"
+        "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+        "os.write(fd, str(os.getpid()).encode())\n"
+        "os.fsync(fd)\n"
+        "sys.stdout.write('locked\\n')\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(30)\n"
+    )
+    holder = subprocess.Popen(
+        [sys.executable, "-c", script, str(lockfile)],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        line = holder.stdout.readline()
+        assert line.strip() == "locked"
+        assert lockfile.read_text().strip() == str(holder.pid)
+
+        holder.kill()  # SIGKILL -- no chance to unlock or clean up
+        holder.wait(timeout=5.0)
+
+        lock = _InstanceLock(lockfile)
+        lock.acquire()  # must NOT raise -- the kernel already dropped the lock
+        try:
+            assert lockfile.read_text().strip() == str(os.getpid())
+        finally:
+            lock.release()
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=5.0)
+
+
+# --- uvicorn internals characterization (drift alarm) --------------------------
+
+
+def test_uvicorn_internals_serve_relies_on_still_exist() -> None:
+    """`serve()` deliberately bypasses `uvicorn.Server.serve()` and instead
+    drives `Config`/`Server` through lower-level internals directly (see
+    the module docstring in `dudamel/serve.py`) -- none of which are public
+    API. pyproject.toml pins `uvicorn>=0.51,<0.52` to guard against a point
+    release renaming or removing any of them; this is the cheap runtime
+    tripwire for that pin -- a `hasattr` check on each internal `serve()`
+    actually touches, so a future upgrade attempt fails loud and fast here
+    instead of surfacing as a mysterious `AttributeError` deep inside
+    `serve()` at runtime.
+    """
+    # Methods -- present on the class regardless of instance state.
+    assert hasattr(uvicorn.Config, "load")
+    assert hasattr(uvicorn.Server, "startup")
+    assert hasattr(uvicorn.Server, "main_loop")
+    assert hasattr(uvicorn.Server, "shutdown")
+
+    # Instance attributes -- only exist once `__init__`/`load`/prepare ran.
+    config = uvicorn.Config(lambda scope, receive, send: None, port=0)
+    assert hasattr(config, "loaded")
+    assert config.loaded is False
+
+    server = uvicorn.Server(config)
+    assert hasattr(server, "should_exit")
+
+    prepared = _prepare_uvicorn(config)
+    assert config.loaded is True
+    assert hasattr(prepared, "lifespan")

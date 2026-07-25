@@ -5,11 +5,13 @@ the optional Telegram interface into one running process.
 THIN by Global Constraints: this module owns lifecycle *sequencing* only —
 zero business logic, zero LLM calls. `serve()`:
 
-  1. Acquires an exclusive instance lock at `data_dir/.dudamel.lock` — a
-     second `serve()` against the same `data_dir` raises `RuntimeError`
-     unless the pid recorded in a leftover lockfile is dead (a crash leaves
-     the file behind with no process left to remove it), in which case it
-     takes the lock over.
+  1. Acquires an exclusive instance lock at `data_dir/.dudamel.lock` via
+     `fcntl.flock` on a persistent fd — a second `serve()` against the same
+     `data_dir` raises `RuntimeError` while the first is live. The kernel
+     drops an `flock` unconditionally when the holding process exits, for
+     any reason (clean shutdown or crash), so a leftover lockfile from a
+     dead process is never mistaken for a live one and needs no pid-based
+     reclaim step.
   2. Builds a `Runtime` and `await`s `start()` (DB migrations).
   3. Starts `Runtime.scheduler` — constructed but not started by `Runtime`
      itself (Task 2's design: only the assembly may start it).
@@ -58,6 +60,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import logging
 import os
 import signal
@@ -91,78 +94,77 @@ _LOCKFILE_NAME = ".dudamel.lock"
 _JOB_DRAIN_SECONDS = 0.1
 
 
-def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # exists, just owned by someone else
-    return True
-
-
 class _InstanceLock:
-    """Exclusive `serve()` lock at `path`, holding the owning pid.
+    """Exclusive `serve()` lock at `path`, enforced via `fcntl.flock` on a
+    persistent file descriptor.
 
-    A crash leaves the lockfile behind with no process left to clean it up;
-    `acquire()` detects that (the recorded pid is dead) and takes the lock
-    over rather than refusing forever.
+    `flock` is owned by the open file description, and the kernel releases
+    it unconditionally when the holding process exits — clean shutdown or
+    crash, it doesn't matter — so there is no "the lockfile is still here
+    but the pid that wrote it is dead" case left to detect and reclaim: a
+    fresh `acquire()` against a dead holder's file just succeeds, the same
+    way it would against a file that was never locked at all. A second
+    `acquire()` while the first is genuinely live raises `BlockingIOError`
+    internally, translated to the same public `RuntimeError` this always
+    raised. The pid is still written into the file, but purely as an
+    operator diagnostic (`cat` the lockfile to see who holds it) — nothing
+    here depends on reading it back for correctness.
     """
 
     def __init__(self, path: Path) -> None:
         self._path = path
-        self._held = False
+        self._fd: int | None = None
 
     def acquire(self) -> None:
-        while True:
-            try:
-                fd = os.open(self._path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
-                if self._reclaim_if_stale():
-                    continue
-                raise RuntimeError(
-                    f"dudamel is already running against {self._path.parent} "
-                    f"(lockfile {self._path} held by a live process)"
-                ) from None
-            with os.fdopen(fd, "w") as f:
-                f.write(str(os.getpid()))
-            self._held = True
-            return
-
-    def _reclaim_if_stale(self) -> bool:
-        """True (and the stale lockfile removed) if the pid recorded in
-        `path` belongs to a process that's no longer alive. An unreadable or
-        non-numeric lockfile is left alone — refuse rather than guess."""
+        fd = os.open(self._path, os.O_CREAT | os.O_RDWR, 0o644)
         try:
-            pid = int(self._path.read_text().strip())
-        except (OSError, ValueError):
-            return False
-        if _pid_alive(pid):
-            return False
-        logger.warning("removing stale lockfile %s (pid %d is dead)", self._path, pid)
-        with contextlib.suppress(FileNotFoundError):
-            self._path.unlink()
-        return True
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            raise RuntimeError(
+                f"dudamel is already running against {self._path.parent} "
+                f"(lockfile {self._path} held by a live process)"
+            ) from None
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode())
+        self._fd = fd
 
     def release(self) -> None:
-        if self._held:
+        if self._fd is not None:
+            fd, self._fd = self._fd, None
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
             with contextlib.suppress(FileNotFoundError):
                 self._path.unlink()
-            self._held = False
 
 
 def _install_signal_handlers(
     loop: asyncio.AbstractEventLoop, stop_event: asyncio.Event
 ) -> list[signal.Signals]:
-    """Best-effort SIGTERM/SIGINT -> `stop_event.set()`. Degrades gracefully
-    (logs and carries on without them) wherever `add_signal_handler` isn't
-    supported — e.g. off the main thread, or platforms without it."""
+    """Best-effort SIGTERM/SIGINT -> `stop_event.set()`. Idempotent by
+    construction: once `stop_event` is already set, a repeat signal just
+    logs and returns instead of doing anything else. That matters because
+    these handlers now stay installed for the ENTIRE shutdown sequence in
+    `serve()`, not just up to it — a second SIGTERM landing while the first
+    is still being handled (an impatient operator, or a container
+    runtime's SIGTERM-then-SIGKILL grace period) must never fall through to
+    default signal disposition mid-shutdown, which would hard-kill the
+    process before the ordered shutdown (and the lockfile release) ever
+    completes. Degrades gracefully (logs and carries on without them)
+    wherever `add_signal_handler` isn't supported — e.g. off the main
+    thread, or platforms without it."""
+
+    def _handle(sig: signal.Signals) -> None:
+        if stop_event.is_set():
+            logger.info("shutdown already in progress; ignoring repeat %s", sig.name)
+            return
+        stop_event.set()
+
     installed = []
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
-            loop.add_signal_handler(sig, stop_event.set)
+            loop.add_signal_handler(sig, _handle, sig)
         except (NotImplementedError, RuntimeError, ValueError) as e:
             logger.warning("signal handler for %s unavailable: %s", sig.name, e)
         else:
@@ -250,23 +252,38 @@ async def serve(
             except asyncio.CancelledError:
                 pass  # task.cancel() is a stop request too — shut down clean
         finally:
-            _remove_signal_handlers(loop, signals_installed)
             # Ordered shutdown (Global Constraints): stop intake (Telegram,
             # then the web server) before the scheduler, then the DB last.
-            # One component failing to stop cleanly must not skip the rest
-            # of the sequence — logged and swallowed, mirroring the
+            # Signal handlers stay installed for this ENTIRE sequence —
+            # removed only once it's fully done, in the innermost `finally`
+            # below — and are idempotent (see `_install_signal_handlers`),
+            # so a second SIGTERM/SIGINT arriving mid-shutdown can't restore
+            # default disposition and let a third signal hard-kill the
+            # process before the lockfile is released. One component
+            # failing to stop cleanly must not skip the rest of the
+            # sequence either — logged and swallowed, mirroring the
             # graceful-degrade rider already applied to the LLM usage-insert
             # and job_runs recording paths elsewhere in the codebase.
-            if telegram is not None:
-                await _stop_quietly("telegram", telegram.stop())
-            if server is not None:
-                server.should_exit = True
-                if web_task is not None:
-                    await _stop_quietly("uvicorn main_loop", web_task)
-                await _stop_quietly("uvicorn shutdown", server.shutdown())
-            with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.sleep(_JOB_DRAIN_SECONDS)
-            await runtime.scheduler.shutdown()
-            await runtime.stop()
+            try:
+                if telegram is not None:
+                    await _stop_quietly("telegram", telegram.stop())
+                if server is not None:
+                    server.should_exit = True
+                    if web_task is not None:
+                        await _stop_quietly("uvicorn main_loop", web_task)
+                    # A failed bind means `startup()` raised before
+                    # `self.servers` was ever assigned, so `shutdown()`
+                    # would blow up on `for server in self.servers` with an
+                    # AttributeError that has nothing to do with actual
+                    # shutdown -- only call it once startup got far enough
+                    # to set either flag.
+                    if getattr(server, "started", False) or hasattr(server, "servers"):
+                        await _stop_quietly("uvicorn shutdown", server.shutdown())
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.sleep(_JOB_DRAIN_SECONDS)
+                await runtime.scheduler.shutdown()
+                await runtime.stop()
+            finally:
+                _remove_signal_handlers(loop, signals_installed)
     finally:
         lock.release()
