@@ -38,3 +38,9 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's DI relies on `Depends(...)` as an argument default — the standard
+# idiom, not a bug; the immutable-calls allowlist opts it (and Query, the
+# same idiom's sibling used by Task 4) out of B008.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query"]

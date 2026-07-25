@@ -172,6 +172,12 @@ class Runtime:
         for app in self._registry.apps.values():
             app._notify = fn
 
+    async def db_ping(self) -> None:
+        """Cheap DB liveness probe for GET /health (Plan 3 Task 3) — touches
+        the database without any business logic; raises if the DB is down."""
+        async with self._db.session() as s:
+            await s.execute(select(1))
+
     async def render_widgets(self) -> list[dict[str, Any]]:
         """Run every registered widget concurrently. Data-plane guarantee: no
         model is ever invoked here (widgets.run_widget calls only widget.fn())."""
