@@ -10,6 +10,8 @@ import os
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from sqlalchemy import select
+
 from dudamel.config import Settings
 from dudamel.convo import ConversationStore
 from dudamel.db import Database
@@ -20,8 +22,10 @@ from dudamel.llm.openai_compat import OpenAICompatProvider
 from dudamel.llm.provider import Provider
 from dudamel.llm.types import Message
 from dudamel.migrate import upgrade_apps, upgrade_core
+from dudamel.models_core import Conversation, PendingConfirmation
 from dudamel.orchestrator import Orchestrator
 from dudamel.router import ChatReply, Router
+from dudamel.widgets import run_widget
 
 logger = logging.getLogger("dudamel.runtime")
 
@@ -36,12 +40,13 @@ class Runtime:
     ) -> None:
         self._settings = settings
         self._db = Database(settings.database_url)
+        self._registry = orchestrator.registry
         tiers = self._build_tiers(providers or {})
         self._llm = LLMClient(tiers=tiers, db=self._db, budget=settings.llm_budget)
         self._convo = ConversationStore(self._db)
         self._router = Router(
             llm=self._llm,
-            registry=orchestrator.registry,
+            registry=self._registry,
             convo=self._convo,
             db=self._db,
             config=settings.router,
@@ -133,6 +138,38 @@ class Runtime:
         return await self._router.resolve_confirmation(
             confirmation_id, approved=approved, user_id=user_id
         )
+
+    async def list_pending_confirmations(self, channel: str | None = None) -> list[dict[str, Any]]:
+        stmt = select(PendingConfirmation).where(PendingConfirmation.status == "pending")
+        if channel is not None:
+            stmt = stmt.join(
+                Conversation, Conversation.id == PendingConfirmation.conversation_id
+            ).where(Conversation.channel == channel)
+        stmt = stmt.order_by(PendingConfirmation.created_at)
+        async with self._db.session() as s:
+            rows = (await s.execute(stmt)).scalars().all()
+        return [
+            {
+                "id": r.id,
+                "tool": r.tool,
+                "args": r.args,
+                "created_at": r.created_at,
+                "expires_at": r.expires_at,
+            }
+            for r in rows
+        ]
+
+    def bind_notify(self, fn: Callable[[str], Awaitable[None]]) -> None:
+        """Rebind every app's app.notify() to fn — used by the assembly
+        (Plan 3 Task 6) once an interface (e.g. Telegram) is up, replacing the
+        WARN-log fallback bound at construction time."""
+        for app in self._registry.apps.values():
+            app._notify = fn
+
+    async def render_widgets(self) -> list[dict[str, Any]]:
+        """Run every registered widget concurrently. Data-plane guarantee: no
+        model is ever invoked here (widgets.run_widget calls only widget.fn())."""
+        return list(await asyncio.gather(*(run_widget(w) for w in self._registry.widgets)))
 
     async def stop(self) -> None:
         await self._db.dispose()
