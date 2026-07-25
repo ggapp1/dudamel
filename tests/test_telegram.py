@@ -337,6 +337,27 @@ async def test_group_message_allowed_when_allow_groups_true(tmp_path: Path, toke
     await rt.stop()
 
 
+async def test_stranger_in_group_with_allow_groups_true_gets_no_reply(
+    tmp_path: Path, token_env: str
+) -> None:
+    """Critical: when allow_groups=True, a stranger's group message must NOT
+    trigger the ID-reveal reply (which would be posted into the group).
+    Strangers should only get replies in private chats."""
+    rt, interface = await build(
+        tmp_path,
+        [],
+        telegram=TelegramConfig(allowed_user_ids=[111], allow_groups=True),
+    )
+    calls = spy_chat(rt)
+    stranger = make_user(id=999)
+    msg = make_message("hello", chat=make_chat(id=-100, type="group"), from_user=stranger)
+    await interface._on_message(make_update(message=msg), None)
+    bot: FakeBot = interface._app.bot
+    assert calls == []  # runtime.chat not called
+    assert bot.sent == []  # no reply sent into the group
+    await rt.stop()
+
+
 # --- long reply splitting --------------------------------------------------------
 
 

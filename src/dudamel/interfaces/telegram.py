@@ -83,7 +83,8 @@ class TelegramInterface:
     async def start(self) -> None:
         await self._app.initialize()
         await self._app.start()
-        assert self._app.updater is not None  # default ApplicationBuilder always wires one
+        if self._app.updater is None:
+            raise RuntimeError("PTB application has no updater")
         await self._app.updater.start_polling(drop_pending_updates=True)
 
     async def stop(self) -> None:
@@ -140,6 +141,13 @@ class TelegramInterface:
         if last is not None and now - last < _STRANGER_COOLDOWN:
             return True
         self._last_stranger_reply[user_id] = now
+        # Bound the dict: prune entries older than 1 hour when size exceeds 1000.
+        if len(self._last_stranger_reply) > 1000:
+            self._last_stranger_reply = {
+                uid: ts
+                for uid, ts in self._last_stranger_reply.items()
+                if now - ts < _STRANGER_COOLDOWN
+            }
         return False
 
     # -- handlers -------------------------------------------------------------------
@@ -152,7 +160,8 @@ class TelegramInterface:
         if not self._chat_authorized(chat.type):
             return  # group rejection: total silence, not even a stranger reply
         if not self._is_allowed(user.id):
-            if not self._rate_limited_stranger(user.id):
+            # Stranger reply only in private chats; silently ignore in groups.
+            if chat.type == "private" and not self._rate_limited_stranger(user.id):
                 await self._send_text(
                     chat.id,
                     f"Your Telegram user ID is {user.id}. Ask the administrator to "
