@@ -22,7 +22,7 @@ from dudamel.llm.openai_compat import OpenAICompatProvider
 from dudamel.llm.provider import Provider
 from dudamel.llm.types import Message
 from dudamel.migrate import upgrade_apps, upgrade_core
-from dudamel.models_core import Conversation, PendingConfirmation
+from dudamel.models_core import Activity, Conversation, JobRun, PendingConfirmation
 from dudamel.orchestrator import Orchestrator
 from dudamel.router import ChatReply, Router
 from dudamel.scheduler import JobScheduler
@@ -182,6 +182,58 @@ class Runtime:
         """Run every registered widget concurrently. Data-plane guarantee: no
         model is ever invoked here (widgets.run_widget calls only widget.fn())."""
         return list(await asyncio.gather(*(run_widget(w) for w in self._registry.widgets)))
+
+    async def recent_messages(self, channel: str, limit: int = 200) -> list[dict[str, Any]]:
+        """Chat history for `channel` — used by the dashboard's /chat page
+        (Plan 3 Task 4). Creates the conversation if it doesn't exist yet
+        (mirrors chat()'s read-or-create); an empty history is a normal
+        result, not an error."""
+        conversation_id = await self._convo.get_or_create(channel)
+        messages = await self._convo.recent(conversation_id, limit)
+        return [m.to_dict() for m in messages]
+
+    async def list_activity(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Most recent activity (tool execution) rows, newest first — used by
+        the dashboard's /activity page (Plan 3 Task 4)."""
+        stmt = select(Activity).order_by(Activity.id.desc()).limit(limit)
+        async with self._db.session() as s:
+            rows = (await s.execute(stmt)).scalars().all()
+        return [
+            {
+                "id": r.id,
+                "tool": r.tool,
+                "args": r.args,
+                "status": r.status,
+                "result_preview": r.result_preview,
+                "created_at": r.created_at,
+            }
+            for r in rows
+        ]
+
+    async def list_job_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Most recent job_runs rows, newest first — used by the dashboard's
+        /jobs page (Plan 3 Task 4)."""
+        stmt = select(JobRun).order_by(JobRun.id.desc()).limit(limit)
+        async with self._db.session() as s:
+            rows = (await s.execute(stmt)).scalars().all()
+        return [
+            {
+                "id": r.id,
+                "job_id": r.job_id,
+                "status": r.status,
+                "started_at": r.started_at,
+                "finished_at": r.finished_at,
+                "detail": r.detail,
+            }
+            for r in rows
+        ]
+
+    def list_jobs(self) -> list[dict[str, Any]]:
+        """Registered jobs with a best-effort next-fire time — used by the
+        dashboard's /jobs page (Plan 3 Task 4). Delegates to JobScheduler,
+        which can answer this whether or not the scheduler has actually been
+        started (Global Constraints: only the assembly calls start())."""
+        return self.scheduler.list_jobs()
 
     async def stop(self) -> None:
         await self._db.dispose()

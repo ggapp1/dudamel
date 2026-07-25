@@ -18,6 +18,7 @@ import asyncio
 import logging
 import traceback
 from datetime import UTC, datetime
+from typing import Any
 
 from apscheduler.events import EVENT_JOB_MAX_INSTANCES, EVENT_JOB_MISSED, JobExecutionEvent
 from apscheduler.job import Job as APSJob
@@ -135,6 +136,23 @@ class JobScheduler:
             # DB hiccup recording that outcome must not raise into the
             # scheduler's executor (mirrors the llm_calls usage-insert rider).
             logger.warning("failed to record job_runs row for job %s: %s", job_id, e)
+
+    def list_jobs(self) -> list[dict[str, Any]]:
+        """Registered jobs with a best-effort next-fire time (Plan 3 Task 4's
+        /jobs page). Computed from each job's trigger directly rather than
+        read off the APScheduler Job's `next_run_time` attribute: APScheduler
+        leaves that attribute entirely UNSET (not None -- absent) on a job
+        added before `start()` runs, and per Global Constraints the scheduler
+        is only started by the assembly (Task 6) -- the dashboard must still
+        work with a constructed-but-never-started scheduler."""
+        now = datetime.now(UTC)
+        jobs = []
+        for job_id, aps_job in self._aps_jobs.items():
+            next_run_time = getattr(aps_job, "next_run_time", None)
+            if next_run_time is None:
+                next_run_time = aps_job.trigger.get_next_fire_time(None, now)
+            jobs.append({"id": job_id, "next_run_time": next_run_time})
+        return jobs
 
     async def start(self) -> None:
         self._scheduler.start()

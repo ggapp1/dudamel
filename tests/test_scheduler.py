@@ -245,6 +245,47 @@ async def test_max_instances_listener_records_skipped_row(tmp_path) -> None:
     assert rows[0].status == "skipped"
 
 
+async def test_list_jobs_reports_next_fire_before_scheduler_starts(tmp_path) -> None:
+    """Plan 3 Task 4 (/jobs dashboard page): APScheduler leaves a pending
+    job's `next_run_time` attribute entirely unset until `start()` runs, so
+    list_jobs() must fall back to computing it from the trigger directly."""
+    app = App("stats", description="d")
+
+    @app.job(cron="30 4 * * *")
+    async def nightly() -> None:
+        pass
+
+    orc = Orchestrator(apps=[app])
+    db = await make_db(tmp_path)
+    sched = JobScheduler(orc.registry, db)
+    try:
+        jobs = sched.list_jobs()
+        assert [j["id"] for j in jobs] == ["stats.nightly"]
+        assert jobs[0]["next_run_time"] is not None
+    finally:
+        await db.dispose()
+
+
+async def test_list_jobs_reflects_real_next_run_time_once_started(tmp_path) -> None:
+    app = App("stats", description="d")
+
+    @app.job(interval_seconds=3600)
+    async def poll() -> None:
+        pass
+
+    orc = Orchestrator(apps=[app])
+    db = await make_db(tmp_path)
+    sched = JobScheduler(orc.registry, db)
+    await sched.start()
+    try:
+        jobs = sched.list_jobs()
+        assert jobs[0]["id"] == "stats.poll"
+        assert jobs[0]["next_run_time"] == sched._aps_jobs["stats.poll"].next_run_time
+    finally:
+        await sched.shutdown()
+        await db.dispose()
+
+
 async def test_start_then_shutdown_is_idempotent_safe(tmp_path) -> None:
     orc = Orchestrator(apps=[])
     db = await make_db(tmp_path)

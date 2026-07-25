@@ -251,3 +251,86 @@ async def test_render_widgets_reports_widget_errors(tmp_path) -> None:
     assert by_id["good"]["data"] == "ok"
     assert by_id["bad"]["error"] == "boom"
     await rt.stop()
+
+
+# --- Plan 3 Task 4: dashboard read surfaces ----------------------------------
+
+
+async def test_recent_messages_round_trips_chat_history(tmp_path) -> None:
+    orc = make_orc()
+    rt = Runtime(
+        orc, make_settings(tmp_path), providers={"standard": FakeProvider([fake_text("hi there")])}
+    )
+    await rt.start()
+    await rt.chat("web:default", "hello", user_id="web")
+    messages = await rt.recent_messages("web:default")
+    assert [m["role"] for m in messages] == ["user", "assistant"]
+    assert messages[0]["text"] == "hello"
+    assert messages[1]["text"] == "hi there"
+    await rt.stop()
+
+
+async def test_recent_messages_empty_for_unseen_channel(tmp_path) -> None:
+    rt = Runtime(make_orc(), make_settings(tmp_path), providers={"standard": FakeProvider([])})
+    await rt.start()
+    assert await rt.recent_messages("web:default") == []
+    await rt.stop()
+
+
+async def test_list_activity_reports_newest_first(tmp_path) -> None:
+    orc = make_orc()
+    rt = Runtime(
+        orc,
+        make_settings(tmp_path),
+        providers={
+            "standard": FakeProvider(
+                [
+                    fake_tool_call("log_workout", {"exercise": "squat"}),
+                    fake_text("ok1"),
+                    fake_tool_call("log_workout", {"exercise": "bench"}),
+                    fake_text("ok2"),
+                ]
+            )
+        },
+    )
+    await rt.start()
+    await rt.chat("web:default", "log squat", user_id="web")
+    await rt.chat("web:default", "log bench", user_id="web")
+    rows = await rt.list_activity()
+    assert [r["tool"] for r in rows] == ["log_workout", "log_workout"]
+    assert rows[0]["args"] == {"exercise": "bench"}  # newest first
+    assert rows[0]["status"] == "ok"
+    await rt.stop()
+
+
+async def test_list_job_runs_reports_newest_first(tmp_path) -> None:
+    from dudamel.db import Database
+    from dudamel.models_core import JobRun
+
+    settings = make_settings(tmp_path)
+    rt = Runtime(make_orc(), settings, providers={"standard": FakeProvider([])})
+    await rt.start()
+    db = Database(settings.database_url)
+    async with db.session() as s:
+        s.add(JobRun(job_id="gym.a", status="ok"))
+    async with db.session() as s:
+        s.add(JobRun(job_id="gym.b", status="error", detail="boom"))
+    rows = await rt.list_job_runs()
+    assert [r["job_id"] for r in rows] == ["gym.b", "gym.a"]  # newest first
+    assert rows[0]["detail"] == "boom"
+    await db.dispose()
+    await rt.stop()
+
+
+def test_list_jobs_reports_next_fire_before_scheduler_starts(tmp_path) -> None:
+    app = App("gym", description="d")
+
+    @app.job(interval_seconds=60)
+    async def poll() -> None:
+        pass
+
+    orc = Orchestrator(apps=[app])
+    rt = Runtime(orc, make_settings(tmp_path), providers={"standard": FakeProvider([])})
+    jobs = rt.list_jobs()  # scheduler never started
+    assert [j["id"] for j in jobs] == ["gym.poll"]
+    assert jobs[0]["next_run_time"] is not None
