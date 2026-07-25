@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}dudamel — jobs{% endblock %}
+{% block content %}
+<h1>Registered jobs</h1>
+<table>
+  <thead><tr><th>Job</th><th>Next fire</th></tr></thead>
+  <tbody>
+    {% for job in jobs %}
+      <tr>
+        <td>{{ job.id }}</td>
+        <td>{% if job.next_run_time %}{{ job.next_run_time.strftime('%Y-%m-%d %H:%M:%S %Z') }}{% else %}—{% endif %}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="2">No jobs registered.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<h1>Recent runs</h1>
+<table>
+  <thead><tr><th>When</th><th>Job</th><th>Status</th><th>Detail</th></tr></thead>
+  <tbody>
+    {% for run in runs %}
+      <tr>
+        <td>{{ run.started_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+        <td>{{ run.job_id }}</td>
+        <td>{{ run.status }}</td>
+        <td>{{ run.detail or '' }}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="4">No runs recorded yet.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

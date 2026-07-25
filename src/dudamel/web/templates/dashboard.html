@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}dudamel — dashboard{% endblock %}
+{% block content %}
+<h1>Dashboard</h1>
+<div id="widget-grid" class="grid"
+     hx-get="/" hx-trigger="every 30s" hx-select="#widget-grid" hx-swap="outerHTML">
+  {% for widget in widgets %}
+    {% if 'error' in widget %}
+      <div class="card error" data-widget-id="{{ widget.id }}">
+        <h3>{{ widget.title }}</h3>
+        <p>Widget failed: {{ widget.error }}</p>
+      </div>
+    {% elif widget.renderer == 'stat' %}
+      <div class="card" data-widget-id="{{ widget.id }}">
+        <h3>{{ widget.title }}</h3>
+        <div class="stat-value">{{ widget.data.value }}{% if widget.data.unit %} {{ widget.data.unit }}{% endif %}</div>
+        {% if widget.data.delta is not none %}<div class="stat-delta">Δ {{ widget.data.delta }}</div>{% endif %}
+      </div>
+    {% elif widget.renderer == 'table' %}
+      <div class="card" data-widget-id="{{ widget.id }}">
+        <h3>{{ widget.title }}</h3>
+        <table>
+          <thead><tr>{% for c in widget.data.columns %}<th>{{ c }}</th>{% endfor %}</tr></thead>
+          <tbody>
+            {% for row in widget.data.rows %}
+              <tr>{% for cell in row %}<td>{{ cell }}</td>{% endfor %}</tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% elif widget.renderer == 'list' %}
+      <div class="card" data-widget-id="{{ widget.id }}">
+        <h3>{{ widget.title }}</h3>
+        <ul>
+          {% for item in widget.data %}
+            <li>
+              {% if item.url %}<a href="{{ item.url }}">{{ item.title }}</a>{% else %}{{ item.title }}{% endif %}
+              {% if item.subtitle %} — {{ item.subtitle }}{% endif %}
+            </li>
+          {% endfor %}
+        </ul>
+      </div>
+    {% elif widget.renderer == 'markdown' %}
+      <div class="card" data-widget-id="{{ widget.id }}">
+        <h3>{{ widget.title }}</h3>
+        <!-- v1: pre-escaped plain text, no markdown parsing (see ui.py docstring) -->
+        <pre class="markdown">{{ widget.data }}</pre>
+      </div>
+    {% endif %}
+  {% else %}
+    <p>No widgets registered.</p>
+  {% endfor %}
+</div>
+{% endblock %}

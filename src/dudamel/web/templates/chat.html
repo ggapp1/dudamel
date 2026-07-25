@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}dudamel — chat{% endblock %}
+{% block content %}
+<h1>Chat</h1>
+<input type="hidden" id="csrf-token" value="{{ csrf_token }}">
+
+<div id="chat-log" hx-get="/chat" hx-trigger="every 5s" hx-select="#chat-log" hx-swap="outerHTML">
+  {% for m in messages %}
+    {% if m.role in ('user', 'assistant') and m.text %}
+      <div class="msg msg-{{ m.role }}">
+        <span class="role">{{ m.role }}</span>
+        <span class="text">{{ m.text }}</span>
+      </div>
+    {% endif %}
+  {% else %}
+    <p>No messages yet — say something below.</p>
+  {% endfor %}
+  {% for p in pending %}
+    <div class="pending" data-confirmation-id="{{ p.id }}">
+      <p>Confirm <code>{{ p.tool }}</code>({{ p.args }})?</p>
+      <button type="button" onclick="resolveConfirm('{{ p.id }}', true)">Approve</button>
+      <button type="button" onclick="resolveConfirm('{{ p.id }}', false)">Deny</button>
+    </div>
+  {% endfor %}
+</div>
+
+<form class="chat-input" onsubmit="return sendMessage(event)">
+  <input type="text" id="chat-text" name="text" placeholder="Message dudamel…" autocomplete="off" required>
+  <button type="submit">Send</button>
+</form>
+
+<script>
+  function csrfToken() {
+    return document.getElementById('csrf-token').value;
+  }
+  async function sendMessage(event) {
+    event.preventDefault();
+    const input = document.getElementById('chat-text');
+    const text = input.value.trim();
+    if (!text) return false;
+    await fetch('/api/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'x-csrf-token': csrfToken()},
+      body: JSON.stringify({text: text, channel: 'web:default'}),
+    });
+    window.location.reload();
+    return false;
+  }
+  async function resolveConfirm(id, approved) {
+    await fetch('/api/confirm/' + encodeURIComponent(id), {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'x-csrf-token': csrfToken()},
+      body: JSON.stringify({approved: approved}),
+    });
+    window.location.reload();
+  }
+</script>
+{% endblock %}

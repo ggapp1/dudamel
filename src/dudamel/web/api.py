@@ -56,6 +56,10 @@ def create_api(runtime: Runtime, settings: Settings) -> FastAPI:
 
     app = FastAPI(title="dudamel", version=__version__)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.web.allowed_hosts)
+    # Stashed so `dudamel.web.ui.add_ui()` (Plan 3 Task 4) can share this
+    # exact SessionStore: a session issued by POST /login below must be
+    # recognized by both the JSON API and the HTML dashboard pages.
+    app.state.sessions = sessions
 
     @app.get("/health")
     async def health() -> dict[str, Any]:

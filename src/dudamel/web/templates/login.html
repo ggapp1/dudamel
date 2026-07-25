@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}dudamel — log in{% endblock %}
+{% block content %}
+<h1>Log in</h1>
+<p id="login-error" style="color:#c0392b; display:none;"></p>
+<form id="login-form" onsubmit="return doLogin(event)">
+  <label for="token">Access token</label><br>
+  <input type="password" id="token" name="token" autocomplete="current-password" required>
+  <button type="submit">Log in</button>
+</form>
+<script>
+  async function doLogin(event) {
+    event.preventDefault();
+    const token = document.getElementById('token').value;
+    const resp = await fetch('/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({token: token}),
+    });
+    if (resp.ok) {
+      window.location.href = '/';
+    } else {
+      const err = document.getElementById('login-error');
+      err.textContent = 'Invalid token.';
+      err.style.display = 'block';
+    }
+    return false;
+  }
+</script>
+{% endblock %}
