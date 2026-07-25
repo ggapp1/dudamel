@@ -6,6 +6,7 @@ from datetime import UTC, datetime, time
 from typing import Any
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import OperationalError
 
 from dudamel.config import BudgetConfig
 from dudamel.db import IN_DB_SCOPE, Database
@@ -65,17 +66,23 @@ class LLMClient:
             max_tokens=t.max_tokens,
             json_schema=json_schema,
         )
-        async with self._db.session() as s:
-            s.add(
-                LlmCall(
-                    tier=t.name,
-                    provider=t.provider.name,
-                    model=t.model,
-                    tokens_in=completion.usage.tokens_in,
-                    tokens_out=completion.usage.tokens_out,
-                    conversation_id=conversation_id,
+        try:
+            async with self._db.session() as s:
+                s.add(
+                    LlmCall(
+                        tier=t.name,
+                        provider=t.provider.name,
+                        model=t.model,
+                        tokens_in=completion.usage.tokens_in,
+                        tokens_out=completion.usage.tokens_out,
+                        conversation_id=conversation_id,
+                    )
                 )
-            )
+        except OperationalError as e:
+            # The model call already completed successfully; a DB hiccup
+            # recording its usage (e.g. "database is locked") must not turn a
+            # good completion into a failure for the caller.
+            logger.warning("failed to record llm_calls usage row for tier %s: %s", t.name, e)
         return completion
 
     async def prompt(self, text: str, *, tier: str = "standard") -> str:

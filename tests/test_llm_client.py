@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 
 from dudamel.config import BudgetConfig
 from dudamel.db import Database
@@ -82,3 +83,25 @@ async def test_warns_inside_db_scope(db: Database, caplog) -> None:
 async def test_prompt_sugar(db: Database) -> None:
     client = make_client(db, [fake_text("answer")])
     assert await client.prompt("q") == "answer"
+
+
+# --- Rider B: usage-insert must not fail an otherwise-completed call --------
+
+
+async def test_usage_insert_operational_error_does_not_fail_completion(
+    db: Database, caplog, monkeypatch
+) -> None:
+    client = make_client(db, [fake_text("hi")])
+
+    def _raising_factory(*args: object, **kwargs: object) -> None:
+        raise OperationalError("insert into llm_calls", {}, Exception("database is locked"))
+
+    # Monkeypatch the session factory so the usage-row insert -- the only DB
+    # write complete() does when no budget is configured -- fails.
+    monkeypatch.setattr(db, "_factory", _raising_factory)
+
+    c = await client.complete([Message(role="user", text="x")])
+
+    assert c.message.text == "hi"  # the completed call still succeeds
+    assert any("llm_calls" in r.message for r in caplog.records)
+    assert any(r.levelname == "WARNING" for r in caplog.records)
