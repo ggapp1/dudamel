@@ -85,3 +85,54 @@ def test_tool_results_truncated_in_window() -> None:
     win = build_window(msgs, token_budget=100_000, tool_result_cap=100)
     tool_msg = next(m for m in win if m.role == "tool")
     assert len(tool_msg.text) < 200 and "truncated" in tool_msg.text
+
+
+# --- Rider A: crash-window sanitizer ----------------------------------------
+
+
+def test_dangling_assistant_tool_call_dropped() -> None:
+    """A hand-built orphan: the process crashed between appending the
+    assistant's tool_calls message and appending its tool result. Feeding
+    this straight to a provider would crash the API call (unmatched
+    tool_use) -- build_window must drop the dangling assistant message."""
+    msgs = [
+        Message(role="user", text="do it"),
+        Message(role="assistant", tool_calls=[ToolCall(id="orphan", name="t", args={})]),
+        # crash here: no matching tool result was ever appended
+    ]
+    win = build_window(msgs, token_budget=10_000)
+    assert win == [msgs[0]]
+    assert all(not m.tool_calls for m in win)
+
+
+def test_dangling_tool_call_dropped_alongside_answered_sibling() -> None:
+    """Two tool_calls in one assistant message, only one answered: the whole
+    assistant message is dropped (a partial match still can't be sent to a
+    provider), and its now-orphaned answered result is dropped too so no
+    stray tool message survives without its assistant."""
+    msgs = [
+        Message(role="user", text="do two things"),
+        Message(
+            role="assistant",
+            tool_calls=[
+                ToolCall(id="answered", name="t", args={}),
+                ToolCall(id="orphan", name="t", args={}),
+            ],
+        ),
+        Message(role="tool", text="ok", tool_call_id="answered"),
+        # crash here: "orphan" never got its result
+    ]
+    win = build_window(msgs, token_budget=10_000)
+    assert win == [msgs[0]]
+
+
+def test_normal_tool_pairs_survive_sanitizer() -> None:
+    """The sanitizer must not touch a well-formed turn."""
+    msgs = [
+        Message(role="user", text="do it"),
+        Message(role="assistant", tool_calls=[ToolCall(id="a", name="t", args={})]),
+        Message(role="tool", text="ok", tool_call_id="a"),
+        Message(role="assistant", text="done"),
+    ]
+    win = build_window(msgs, token_budget=10_000)
+    assert win == msgs

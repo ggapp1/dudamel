@@ -34,6 +34,29 @@ def truncate_tool_result(m: Message, cap_chars: int) -> Message:
     return replace(m, text=m.text[:cap_chars] + f"…[truncated {dropped} chars]")
 
 
+def _drop_dangling_tool_calls(messages: list[Message]) -> list[Message]:
+    """Crash-window sanitizer: if the process died between appending an
+    assistant's tool_calls message and appending its tool result(s), that
+    assistant message survives in the DB with an unanswered tool_call.
+    Provider APIs reject any tool_use without a matching tool_result, so drop
+    such an assistant message outright (a partial match doesn't help either —
+    the provider still rejects it), and drop any tool result that referenced
+    it too, so no message is left answering a tool_call that no longer
+    appears in the window."""
+    answered = {m.tool_call_id for m in messages if m.role == "tool" and m.tool_call_id is not None}
+    kept = [
+        m
+        for m in messages
+        if not (
+            m.role == "assistant"
+            and m.tool_calls
+            and any(tc.id not in answered for tc in m.tool_calls)
+        )
+    ]
+    called = {tc.id for m in kept for tc in m.tool_calls}
+    return [m for m in kept if not (m.role == "tool" and m.tool_call_id not in called)]
+
+
 def _split_turns(messages: list[Message]) -> list[list[Message]]:
     turns: list[list[Message]] = []
     current: list[Message] = []
@@ -68,4 +91,4 @@ def build_window(
             break
         window.insert(0, t)
         spent += cost
-    return [m for t in window for m in t]
+    return _drop_dangling_tool_calls([m for t in window for m in t])
