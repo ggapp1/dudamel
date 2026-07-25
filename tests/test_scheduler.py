@@ -215,6 +215,36 @@ async def test_misfire_listener_records_misfired_row(tmp_path) -> None:
     assert rows[0].status == "misfired"
 
 
+async def test_max_instances_listener_records_skipped_row(tmp_path) -> None:
+    """Directly exercises the EVENT_JOB_MAX_INSTANCES listener (real
+    max-instances collisions need concurrent execution to trigger; the
+    listener itself is unit-tested here rather than waited for)."""
+    from apscheduler.events import EVENT_JOB_MAX_INSTANCES, JobExecutionEvent
+
+    app = App("stats", description="d")
+
+    @app.job(interval_seconds=60)
+    async def poll() -> None:
+        pass
+
+    orc = Orchestrator(apps=[app])
+    db = await make_db(tmp_path)
+    sched = JobScheduler(orc.registry, db)
+    try:
+        event = JobExecutionEvent(
+            code=EVENT_JOB_MAX_INSTANCES,
+            job_id="stats.poll",
+            jobstore="default",
+            scheduled_run_time=datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC),
+        )
+        sched._on_max_instances(event)
+        rows = await poll_job_runs(db, "stats.poll")
+    finally:
+        await db.dispose()
+
+    assert rows[0].status == "skipped"
+
+
 async def test_start_then_shutdown_is_idempotent_safe(tmp_path) -> None:
     orc = Orchestrator(apps=[])
     db = await make_db(tmp_path)

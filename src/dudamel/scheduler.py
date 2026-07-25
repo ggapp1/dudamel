@@ -19,7 +19,7 @@ import logging
 import traceback
 from datetime import UTC, datetime
 
-from apscheduler.events import EVENT_JOB_MISSED, JobExecutionEvent
+from apscheduler.events import EVENT_JOB_MAX_INSTANCES, EVENT_JOB_MISSED, JobExecutionEvent
 from apscheduler.job import Job as APSJob
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -50,6 +50,7 @@ class JobScheduler:
         self._db = db
         self._scheduler = AsyncIOScheduler()
         self._scheduler.add_listener(self._on_missed, EVENT_JOB_MISSED)
+        self._scheduler.add_listener(self._on_max_instances, EVENT_JOB_MAX_INSTANCES)
         # Keeps fire-and-forget misfire-recording tasks alive until they
         # finish (asyncio only holds a weak reference to a bare create_task()
         # result, so without this a task can be garbage-collected mid-flight).
@@ -100,6 +101,18 @@ class JobScheduler:
         started = _utcnow()
         detail = f"scheduled run at {event.scheduled_run_time} was missed"
         task = asyncio.create_task(self._record(event.job_id, "misfired", started, detail))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    def _on_max_instances(self, event: JobExecutionEvent) -> None:
+        """APScheduler listener (sync callback, invoked from the running
+        event loop by AsyncIOScheduler) for EVENT_JOB_MAX_INSTANCES — the job
+        was skipped because a previous invocation is still running (exceeds
+        max_instances=1), so _run_job never ran and never got a chance to
+        record anything itself."""
+        started = _utcnow()
+        detail = "max_instances reached; run skipped"
+        task = asyncio.create_task(self._record(event.job_id, "skipped", started, detail))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
