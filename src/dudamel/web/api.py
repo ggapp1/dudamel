@@ -12,7 +12,7 @@ from fastapi import Depends, FastAPI, HTTPException, Response
 from pydantic import BaseModel
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from dudamel import __version__
+from dudamel._version import __version__
 from dudamel.config import Settings
 from dudamel.runtime import Runtime
 from dudamel.web.auth import (
