@@ -34,6 +34,13 @@ class RouterConfig(BaseModel):
     taint_mode: Literal["turn", "window", "off"] = "turn"
 
 
+class WebConfig(BaseModel):
+    host: str = "127.0.0.1"
+    port: int = 8787
+    token_env: str = "DUDAMEL_WEB_TOKEN"
+    allowed_hosts: list[str] = ["localhost", "127.0.0.1"]
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="DUDAMEL_", extra="ignore")
 
@@ -42,6 +49,7 @@ class Settings(BaseSettings):
     llm_tiers: dict[str, TierConfig] = {}
     llm_budget: BudgetConfig = BudgetConfig()
     router: RouterConfig = RouterConfig()
+    web: WebConfig = WebConfig()
 
     @classmethod
     def settings_customise_sources(
