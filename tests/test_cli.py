@@ -99,6 +99,14 @@ def test_new_into_empty_existing_dir_is_allowed(tmp_path: Path) -> None:
     assert (target / "assistant.py").exists()
 
 
+def test_new_creates_env_with_restricted_permissions(tmp_path: Path) -> None:
+    """Regression test: .env file should have 0o600 permissions after creation."""
+    target = scaffold(tmp_path)
+    env_path = target / ".env"
+    mode = env_path.stat().st_mode & 0o777
+    assert mode == 0o600, f"Expected .env to have 0o600 permissions, got {oct(mode)}"
+
+
 # --- project module discovery / import ---------------------------------------
 
 
@@ -176,6 +184,42 @@ def test_db_migrate_then_no_changes_cycle(
     assert capsys.readouterr().out.strip() == "no changes"
 
 
+def test_db_migrate_applies_core_migrations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Regression test: after new + db migrate, core migrations are applied.
+    Doctor core check should pass (alembic_version_core table exists and is at head)."""
+    from sqlalchemy import create_engine, inspect
+
+    from dudamel.migrate import sync_url
+
+    target = scaffold(tmp_path)
+    monkeypatch.chdir(target)
+    capsys.readouterr()  # drain `new`'s output
+
+    # Before db migrate, the core version table doesn't exist yet
+    db_url = "sqlite+aiosqlite:///" + str(target / "dudamel.db")
+    engine = create_engine(sync_url(db_url))
+    insp = inspect(engine)
+    assert "alembic_version_core" not in insp.get_table_names()
+    engine.dispose()
+
+    # After db migrate, core migrations should be applied
+    assert cli.main(["db", "migrate", "-m", "init"]) == 0
+    capsys.readouterr()  # drain
+
+    # Now alembic_version_core should exist
+    engine = create_engine(sync_url(db_url))
+    insp = inspect(engine)
+    assert "alembic_version_core" in insp.get_table_names()
+    engine.dispose()
+
+    # And doctor should report core migrations at head
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "✓ core migrations" in out
+
+
 def test_db_migrate_requires_message(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     target = scaffold(tmp_path)
     monkeypatch.chdir(target)
@@ -194,12 +238,15 @@ def test_doctor_runs_green_on_scaffolded_project_even_fully_offline(
     endpoint checks degrade to a ✗ line, never an exception."""
     target = scaffold(tmp_path)
     monkeypatch.chdir(target)
+    # Create the database so doctor can connect to it
+    assert cli.main(["db", "migrate", "-m", "init"]) == 0
+    capsys.readouterr()  # drain
 
     rc = cli.main(["doctor"])
     assert rc == 0
     out = capsys.readouterr().out
     assert "database connection" in out
-    assert "✓ database connection" in out  # default sqlite always connects
+    assert "✓ database connection" in out  # now db exists after migrate
     assert "llm tier 'standard'" in out
     assert "llm tier 'fast'" in out
     assert "web token" in out
@@ -231,6 +278,25 @@ def test_doctor_on_non_project_dir_reports_app_import_failure_not_crash(
     assert cli.main(["doctor"]) == 0
     out = capsys.readouterr().out
     assert "✗ app import" in out
+
+
+def test_doctor_in_non_project_dir_does_not_create_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Regression test: doctor in non-project dir should not create .db file."""
+    monkeypatch.chdir(tmp_path)
+
+    # Run doctor in empty temp dir
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+
+    # Verify output mentions database not created
+    assert "✗ database" in out
+    assert "not created yet" in out
+
+    # Verify no .db file was created
+    db_files = list(tmp_path.glob("*.db"))
+    assert len(db_files) == 0, f"doctor should not create .db file, but found: {db_files}"
 
 
 # --- token rotate --------------------------------------------------------
@@ -268,6 +334,22 @@ def test_token_rotate_appends_when_missing(tmp_path: Path, monkeypatch: pytest.M
     lines = (target / ".env").read_text().splitlines()
     assert lines[0] == "FOO=bar"
     assert lines[1].startswith("DUDAMEL_WEB_TOKEN=")
+
+
+def test_token_rotate_preserves_env_permissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test: .env file should have 0o600 permissions after rotation."""
+    target = scaffold(tmp_path)
+    monkeypatch.chdir(target)
+
+    # Rotate the token
+    assert cli.main(["token", "rotate"]) == 0
+
+    # Check that permissions are still 0o600
+    env_path = target / ".env"
+    mode = env_path.stat().st_mode & 0o777
+    assert mode == 0o600, f"Expected .env to have 0o600 permissions after rotate, got {oct(mode)}"
 
 
 def test_token_rotate_without_env_file_is_actionable_error(

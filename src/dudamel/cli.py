@@ -40,7 +40,13 @@ from sqlalchemy import create_engine, text
 from dudamel.config import Settings, TierConfig
 from dudamel.exceptions import DudamelError
 from dudamel.interfaces.telegram import resolve_token as resolve_telegram_token
-from dudamel.migrate import ensure_app_migrations, generate_app_migration, sync_url, upgrade_apps
+from dudamel.migrate import (
+    ensure_app_migrations,
+    generate_app_migration,
+    sync_url,
+    upgrade_apps,
+    upgrade_core,
+)
 from dudamel.orchestrator import Orchestrator
 from dudamel.serve import serve
 from dudamel.web.auth import resolve_token as resolve_web_token
@@ -141,7 +147,9 @@ def cmd_new(args: argparse.Namespace) -> int:
     readme = target / "README.md"
     readme.write_text(readme.read_text().replace("{{PROJECT_NAME}}", args.name))
 
-    (target / ".env").write_text(f"DUDAMEL_WEB_TOKEN={secrets.token_urlsafe(32)}\n")
+    env_path = target / ".env"
+    env_path.write_text(f"DUDAMEL_WEB_TOKEN={secrets.token_urlsafe(32)}\n")
+    os.chmod(env_path, 0o600)
 
     # Ships the migrations/ scaffolding (env.py + script.py.mako + an empty
     # versions/) but deliberately no pre-generated revision -- see the
@@ -177,6 +185,8 @@ def cmd_db_migrate(args: argparse.Namespace) -> int:
     project_dir = Path.cwd()
     settings = Settings.load(project_dir)
     orchestrator = _load_orchestrator(project_dir, _DEFAULT_MODULE)
+    # Apply core migrations first to ensure schema is ready for app autogenerate
+    upgrade_core(settings.database_url)
     path = generate_app_migration(
         orchestrator,
         settings.database_url,
@@ -216,6 +226,14 @@ def _current_heads(db_url: str, version_table: str) -> set[str]:
 
 
 def _check_db_connect(db_url: str) -> tuple[bool, str]:
+    # For SQLite, check if the database file exists before trying to connect
+    if db_url.startswith("sqlite"):
+        if "///" in db_url:
+            raw_path = db_url.split("///", 1)[1].split("?", 1)[0]
+            if raw_path and raw_path != ":memory:":
+                path = Path(raw_path)
+                if not path.exists():
+                    return False, "not created yet (run `dudamel run` first)"
     try:
         engine = create_engine(sync_url(db_url))
         try:
@@ -229,6 +247,18 @@ def _check_db_connect(db_url: str) -> tuple[bool, str]:
 
 
 def _check_core_migrations(db_url: str) -> tuple[bool, str]:
+    # For SQLite, check if database file exists before trying to connect
+    # (avoid creating an empty database file when just running doctor)
+    if db_url.startswith("sqlite"):
+        if "///" in db_url:
+            raw_path = db_url.split("///", 1)[1].split("?", 1)[0]
+            if raw_path and raw_path != ":memory:":
+                path = Path(raw_path)
+                if not path.exists():
+                    return (
+                        False,
+                        "not yet applied — run `dudamel run` or `dudamel db migrate -m <msg>` once",
+                    )
     try:
         script_heads = _script_heads(str(files("dudamel") / "migrations"))
         current = _current_heads(db_url, "alembic_version_core")
@@ -239,7 +269,7 @@ def _check_core_migrations(db_url: str) -> tuple[bool, str]:
     if current == script_heads:
         return True, "at head"
     if not current:
-        return False, "not yet applied — run `dudamel run` (or `dudamel db migrate`) once"
+        return False, "not yet applied — run `dudamel run` or `dudamel db migrate -m <msg>` once"
     return False, f"behind head ({sorted(current)} != {sorted(script_heads)})"
 
 
@@ -399,6 +429,7 @@ def cmd_token_rotate(args: argparse.Namespace) -> int:
     if not env_path.exists():
         raise CliError(f"{env_path} not found — is {project_dir} a dudamel project?")
     _rewrite_env_var(env_path, settings.web.token_env, secrets.token_urlsafe(32))
+    os.chmod(env_path, 0o600)
     print(f"rotated {settings.web.token_env} in {env_path}")
     return 0
 

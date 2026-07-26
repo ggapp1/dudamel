@@ -191,7 +191,7 @@ def generate_app_migration(
                 raise DestructiveMigrationError(
                     "migration contains destructive operations: "
                     + "; ".join(destructive)
-                    + " — re-run with allow_destructive=True after reviewing"
+                    + " — re-run with --allow-destructive after reviewing"
                 )
 
             # Rendered here, inside the `with engine.connect()` block, while
