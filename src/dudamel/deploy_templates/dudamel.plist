@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd user agent for a dudamel project. Install with:
+
+    cp deploy/dudamel.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/dudamel.plist
+
+  `-l` on the login shell picks up the same PATH your terminal has (so `uv`
+  resolves the same way it does when you type `uv run` yourself) --
+  launchd's own default environment does not include it. If your shell is
+  not zsh, or `uv` still isn't found, replace /bin/zsh below with your
+  shell's path.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dudamel.{{PROJECT_NAME}}</string>
+    <key>WorkingDirectory</key>
+    <string>{{PROJECT_DIR}}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-l</string>
+        <string>-c</string>
+        <string>exec uv run dudamel run</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{{PROJECT_DIR}}/dudamel.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{PROJECT_DIR}}/dudamel.log</string>
+</dict>
+</plist>

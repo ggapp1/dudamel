@@ -20,7 +20,9 @@ import asyncio
 import contextlib
 import importlib
 import json
+import logging
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -54,6 +56,19 @@ from dudamel.web.auth import resolve_token as resolve_web_token
 __all__ = ["main"]
 
 _DEFAULT_MODULE = "assistant"
+
+_INVALID_PROJECT_NAME_CHARS = re.compile(r"[^a-z0-9._-]+")
+
+
+def _sanitize_project_name(raw: str) -> str:
+    """Turn a project directory name into a valid packaging project name
+    (PEP 503 normalization rules: lowercase, only `[a-z0-9._-]`, no
+    leading/trailing separator) for the scaffolded `pyproject.toml`'s
+    `[project] name` — an arbitrary directory name (spaces, `_`, capitals,
+    a leading dot) would otherwise produce a `pyproject.toml` `uv`/`pip`
+    reject outright."""
+    sanitized = _INVALID_PROJECT_NAME_CHARS.sub("-", raw.strip().lower()).strip("-._")
+    return sanitized or "dudamel-project"
 
 
 class CliError(DudamelError):
@@ -128,6 +143,24 @@ def _load_dotenv_into_environ(project_dir: Path) -> None:
 
 # --- new ---------------------------------------------------------------------
 
+_DEPLOY_TEMPLATE_NAMES = ("dudamel.plist", "dudamel.service")
+
+
+def _write_deploy_templates(target: Path, project_name: str) -> None:
+    """Copy the launchd/systemd supervisor templates into `<project>/deploy/`
+    with `{{PROJECT_DIR}}`/`{{PROJECT_NAME}}` filled in -- both need the
+    project's own absolute path (a service manager doesn't run with the cwd
+    a user typed `dudamel new` from), which `scaffold_template/`'s plain
+    `shutil.copytree` in `cmd_new` above has no way to supply."""
+    deploy_dir = target / "deploy"
+    deploy_dir.mkdir(exist_ok=True)
+    template_dir = Path(str(files("dudamel") / "deploy_templates"))
+    for name in _DEPLOY_TEMPLATE_NAMES:
+        text = (template_dir / name).read_text()
+        text = text.replace("{{PROJECT_DIR}}", str(target.resolve()))
+        text = text.replace("{{PROJECT_NAME}}", project_name)
+        (deploy_dir / name).write_text(text)
+
 
 def cmd_new(args: argparse.Namespace) -> int:
     target = Path(args.name)
@@ -146,6 +179,12 @@ def cmd_new(args: argparse.Namespace) -> int:
     shutil.copytree(template_dir, target, dirs_exist_ok=True)
     readme = target / "README.md"
     readme.write_text(readme.read_text().replace("{{PROJECT_NAME}}", args.name))
+
+    project_name = _sanitize_project_name(target.name)
+    pyproject_path = target / "pyproject.toml"
+    pyproject_path.write_text(pyproject_path.read_text().replace("{{PROJECT_NAME}}", project_name))
+
+    _write_deploy_templates(target, project_name)
 
     env_path = target / ".env"
     env_path.write_text(f"DUDAMEL_WEB_TOKEN={secrets.token_urlsafe(32)}\n")

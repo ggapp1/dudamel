@@ -55,12 +55,15 @@ def test_new_creates_expected_tree(tmp_path: Path) -> None:
         "apps/__init__.py",
         "apps/workouts.py",
         "dudamel.toml",
+        "pyproject.toml",
         ".env",
         ".env.example",
         ".gitignore",
         "README.md",
         "migrations/env.py",
         "migrations/script.py.mako",
+        "deploy/dudamel.plist",
+        "deploy/dudamel.service",
     ):
         assert (target / rel).is_file(), rel
     # migrations/versions/ exists and is committed empty (no revisions yet)
@@ -74,6 +77,39 @@ def test_new_creates_expected_tree(tmp_path: Path) -> None:
     readme = (target / "README.md").read_text()
     assert "{{PROJECT_NAME}}" not in readme
     assert "proj" in readme
+
+
+def test_new_scaffolds_pyproject_toml_so_uv_run_works_in_project(tmp_path: Path) -> None:
+    """C1 (BLOCKER): `uv run dudamel ...` inside the scaffolded project
+    (the README's quickstart) requires a `pyproject.toml` declaring
+    `dudamel` as a dependency -- without one, `uv run` has no project to
+    resolve it into."""
+    target = scaffold(tmp_path)
+    pyproject = (target / "pyproject.toml").read_text()
+    assert "{{PROJECT_NAME}}" not in pyproject
+    assert 'name = "proj"' in pyproject
+    assert 'dependencies = ["dudamel"]' in pyproject
+    assert 'requires-python = ">=3.12"' in pyproject
+
+
+def test_new_sanitizes_project_name_for_pyproject_toml(tmp_path: Path) -> None:
+    target = scaffold(tmp_path, name="My Cool App!!")
+    pyproject = (target / "pyproject.toml").read_text()
+    assert 'name = "my-cool-app"' in pyproject
+
+
+def test_new_writes_deploy_templates_with_project_path_substituted(tmp_path: Path) -> None:
+    target = scaffold(tmp_path)
+    plist = (target / "deploy" / "dudamel.plist").read_text()
+    service = (target / "deploy" / "dudamel.service").read_text()
+    for rendered in (plist, service):
+        assert "{{PROJECT_DIR}}" not in rendered
+        assert "{{PROJECT_NAME}}" not in rendered
+        assert str(target.resolve()) in rendered
+    assert "dudamel run" in plist
+    assert "KeepAlive" in plist
+    assert "Restart=always" in service
+    assert "dudamel run" in service
 
 
 def test_new_refuses_nonempty_target_dir(tmp_path: Path) -> None:

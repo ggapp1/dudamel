@@ -1,0 +1,25 @@
+# systemd user unit for a dudamel project. Install with:
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/dudamel.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now dudamel.service
+#
+# `loginctl enable-linger $USER` keeps this running after you log out /
+# without an active session (otherwise systemd stops all --user units at
+# logout). `journalctl --user -u dudamel -f` follows its logs.
+
+[Unit]
+Description=dudamel assistant ({{PROJECT_NAME}})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={{PROJECT_DIR}}
+ExecStart=/usr/bin/env uv run dudamel run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

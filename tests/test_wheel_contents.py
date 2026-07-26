@@ -33,7 +33,10 @@ def test_wheel_contains_scaffold_template_and_web_assets(tmp_path: Path) -> None
 
     assert has_prefix("dudamel/scaffold_template/"), names
     assert "dudamel/scaffold_template/apps/workouts.py" in names
+    assert "dudamel/scaffold_template/pyproject.toml" in names
     assert has_prefix("dudamel/web/templates/"), names
     assert "dudamel/web/static/htmx.min.js" in names
     assert has_prefix("dudamel/migrations/versions/"), names
     assert has_prefix("dudamel/migrations_app_template/"), names
+    assert "dudamel/deploy_templates/dudamel.plist" in names
+    assert "dudamel/deploy_templates/dudamel.service" in names

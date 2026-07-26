@@ -138,6 +138,25 @@ public internet is not recommended — it puts the dashboard's auth layer
 directly in front of arbitrary internet traffic, which Tailscale and
 Telegram's outbound polling both avoid needing to do at all.
 
+### Running as a service
+
+A personal assistant is only useful if it's actually running. `dudamel new`
+writes a launchd plist and a systemd user unit into `<project>/deploy/`,
+both with the project's own path already filled in:
+
+- **macOS** — `deploy/dudamel.plist`, loaded with `launchctl load
+  ~/Library/LaunchAgents/dudamel.plist` (after copying it there). Sleep
+  stops everything, though: run `caffeinate` while it matters, or enable
+  Power Nap / "Wake for network access" in Energy Saver settings so
+  scheduled jobs and Telegram still fire while the machine is asleep.
+- **Linux** — `deploy/dudamel.service`, a systemd `--user` unit with
+  `Restart=always`; enable it with `systemctl --user enable --now
+  dudamel.service` and run `loginctl enable-linger $USER` so it keeps
+  running after you log out.
+
+Both templates restart `dudamel run` automatically if it exits — see the
+comments at the top of each file for the exact install steps.
+
 ## Security
 
 - **Confirm gates**: a tool registered with `confirm=True` always stops

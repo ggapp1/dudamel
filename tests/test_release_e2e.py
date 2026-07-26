@@ -1,14 +1,17 @@
-"""Release e2e (Plan 4 Task 4): the full "new user" path -- `dudamel new`,
-`dudamel db migrate -m init`, then serve() against the scaffolded project
-with a FakeProvider standing in for the model -- reaching a real socket's
-/health and /api/widgets, then a clean shutdown. Proves the README's
-quickstart actually works end to end, with no model involved.
+"""Release e2e: the full "new user" path -- `dudamel new`, `dudamel db
+migrate -m init`, then serve() against the scaffolded project with a
+FakeProvider standing in for the model -- reaching a real socket's /health
+and /api/widgets, then a clean shutdown. Proves the README's quickstart
+actually works end to end, with no model involved. A second test below
+shells out to a real `uv run` subprocess to prove the same for the parts
+that can't be exercised in-process (packaging, `pyproject.toml`).
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import subprocess
 import time
 from pathlib import Path
 
@@ -19,6 +22,8 @@ from dudamel import cli
 from dudamel.config import Settings
 from dudamel.llm.testing import FakeProvider
 from dudamel.serve import serve
+
+REPO_ROOT = Path(__file__).parent.parent
 
 
 @pytest.fixture(autouse=True)
@@ -97,3 +102,58 @@ async def test_new_user_path_scaffold_migrate_serve_health_and_widgets(
             await asyncio.wait_for(task, timeout=5.0)
 
     assert not (target / ".dudamel.lock").exists()
+
+
+@pytest.mark.slow
+def test_quickstart_runs_via_real_uv_run_subprocess_in_scaffolded_project(
+    tmp_path: Path,
+) -> None:
+    """LITERAL-SHELL regression: the README's quickstart tells a new user to
+    `cd` into a freshly scaffolded project and run `uv run dudamel ...` --
+    that only works if the scaffold itself is a `uv`-resolvable project
+    (a `pyproject.toml` declaring `dudamel` as a dependency). Everything
+    above this test drives the same commands in-process, which would stay
+    green even if the scaffold were missing that file entirely; this one
+    shells out for real, exactly as a reader following the README would.
+
+    `dudamel` is not yet published to PyPI, so `--find-links` points `uv` at
+    a wheel built from THIS checkout instead -- every other dependency still
+    resolves from the real index. Slow (a wheel build plus two real `uv`
+    subprocess invocations, each spinning up a project venv) but must always
+    run, not be skipped, since it is the one test that would catch a
+    packaging regression the in-process tests structurally cannot see.
+    """
+    dist_dir = tmp_path / "dist"
+    subprocess.run(
+        ["uv", "build", "--wheel", "-o", str(dist_dir)],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    target = tmp_path / "my-assistant"
+    assert cli.main(["new", str(target)]) == 0
+    assert (target / "pyproject.toml").is_file()
+
+    help_proc = subprocess.run(
+        ["uv", "run", "--find-links", str(dist_dir), "dudamel", "--help"],
+        cwd=target,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert help_proc.returncode == 0, help_proc.stderr
+    assert "usage: dudamel" in help_proc.stdout
+
+    migrate_proc = subprocess.run(
+        ["uv", "run", "--find-links", str(dist_dir), "dudamel", "db", "migrate", "-m", "init"],
+        cwd=target,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert migrate_proc.returncode == 0, migrate_proc.stderr
+    revisions = list((target / "migrations" / "versions").glob("*.py"))
+    assert len(revisions) == 1, revisions

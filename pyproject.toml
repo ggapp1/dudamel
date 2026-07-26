@@ -38,6 +38,9 @@ packages = ["src/dudamel"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "slow: shells out to real subprocesses (uv build/run) -- several seconds, always runs in CI but selectable via -m 'not slow' for a fast local loop",
+]
 
 [tool.ruff]
 line-length = 100

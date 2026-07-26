@@ -1,0 +1,9 @@
+# Makes this directory a project `uv` can manage on its own: without a
+# `[project]` table here, `uv run dudamel ...` has nothing to resolve
+# `dudamel` (and its dependencies) into, and fails before your code ever
+# runs. Add your own dependencies below as your apps need them.
+[project]
+name = "{{PROJECT_NAME}}"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["dudamel"]
