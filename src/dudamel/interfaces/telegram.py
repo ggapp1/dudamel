@@ -60,6 +60,22 @@ def _split_message(text: str, limit: int = _MAX_MESSAGE_LEN) -> list[str]:
     return [text[i : i + limit] for i in range(0, len(text), limit)]
 
 
+_TRUNCATION_MARKER = "… [truncated]"
+
+
+def _fit_single_message(text: str, limit: int = _MAX_MESSAGE_LEN) -> str:
+    """Fit `text` inside Telegram's per-message hard limit by truncating,
+    for the two call sites that must stay a SINGLE message rather than being
+    split across several the way `_send_text`/`notify` can: an inline
+    keyboard lives on exactly one message, and editing a message can't fan
+    out into more than the one it's editing. A tool call's args summary
+    (arbitrary user/model-supplied values -- see `Router._request_
+    confirmation`) is the realistic way this gets hit."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
+
+
 class TelegramInterface:
     """Wraps a PTB `Application`. Construction builds the Application and
     registers handlers (cheap, no network — network only happens in
@@ -124,7 +140,21 @@ class TelegramInterface:
                 ]
             ]
         )
-        await self._app.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+        text = _fit_single_message(text)
+        try:
+            await self._app.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+        except BadRequest as e:
+            # The args summary embedded in `text` is arbitrary user/model
+            # data (see `Router._request_confirmation`) and the API can
+            # reject it for reasons the length check above doesn't cover --
+            # degrade to a short, guaranteed-safe prompt rather than lose
+            # the confirm/cancel buttons entirely.
+            logger.warning("telegram confirmation send rejected (%s); using plain fallback", e)
+            await self._app.bot.send_message(
+                chat_id=chat_id,
+                text="Confirmation required (original prompt could not be delivered).",
+                reply_markup=keyboard,
+            )
 
     # -- authorization ------------------------------------------------------------
     def _is_allowed(self, user_id: int) -> bool:
@@ -206,12 +236,22 @@ class TelegramInterface:
             confirmation_id, approved=(action == "yes"), user_id=str(user.id)
         )
         if message is not None:
-            await self._app.bot.edit_message_text(
-                chat_id=message.chat.id,
-                message_id=message.message_id,
-                text=reply.text,
-                reply_markup=None,
-            )
+            edit_text = _fit_single_message(reply.text)
+            try:
+                await self._app.bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=message.message_id,
+                    text=edit_text,
+                    reply_markup=None,
+                )
+            except BadRequest as e:
+                logger.warning("telegram confirmation edit rejected (%s); using plain fallback", e)
+                await self._app.bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=message.message_id,
+                    text="Done (original reply could not be delivered).",
+                    reply_markup=None,
+                )
         await self._app.bot.answer_callback_query(query.id)
 
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:

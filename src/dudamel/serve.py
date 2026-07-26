@@ -240,7 +240,16 @@ async def serve(
             app = create_api(runtime, settings)
             add_ui(app, runtime, settings)
             config = uvicorn.Config(
-                app, host=settings.web.host, port=settings.web.port, log_level="warning"
+                app,
+                host=settings.web.host,
+                port=settings.web.port,
+                log_level="warning",
+                # Bound `server.shutdown()`'s drain wait (see the module
+                # docstring's mention of the job-drain pause below) instead
+                # of the uvicorn default of no timeout at all -- a
+                # connection that never finishes on its own must not hang
+                # the whole ordered shutdown sequence indefinitely.
+                timeout_graceful_shutdown=20,
             )
             server = _prepare_uvicorn(config)
             await server.startup()

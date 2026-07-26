@@ -75,6 +75,46 @@ class MarkdownRejectingBot(FakeBot):
         )
 
 
+class ConfirmationRejectingBot(FakeBot):
+    """Rejects the first `send_message` call unconditionally, then behaves
+    normally — exercises `_send_confirmation`'s BadRequest-degrade retry
+    (fix wave item 3), independent of message length."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._raised = False
+
+    async def send_message(
+        self, *, chat_id: int, text: str, parse_mode: str | None = None, reply_markup: Any = None
+    ) -> None:
+        if not self._raised:
+            self._raised = True
+            raise BadRequest("simulated failure")
+        await super().send_message(
+            chat_id=chat_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup
+        )
+
+
+class EditRejectingBot(FakeBot):
+    """Rejects the first `edit_message_text` call unconditionally, then
+    behaves normally — exercises the confirmation callback's
+    BadRequest-degrade retry (fix wave item 3)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._raised = False
+
+    async def edit_message_text(
+        self, *, chat_id: int, message_id: int, text: str, reply_markup: Any = None
+    ) -> None:
+        if not self._raised:
+            self._raised = True
+            raise BadRequest("simulated failure")
+        await super().edit_message_text(
+            chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup
+        )
+
+
 class FakeUpdater:
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -463,6 +503,77 @@ async def test_confirm_button_from_unauthorized_user_does_not_resolve(
     assert resolve_calls == []
     assert bot.edited == []
     assert bot.answered == [{"id": "cbq2", "text": "Not authorized.", "show_alert": True}]
+    await rt.stop()
+
+
+# --- confirmation hardening (fix wave item 3) -------------------------------------
+
+
+async def test_confirmation_send_badrequest_degrades_to_plain_fallback(
+    tmp_path: Path, token_env: str
+) -> None:
+    rt, interface = await build(
+        tmp_path, [fake_tool_call("wipe", {"reason": "clean"})], bot=ConfirmationRejectingBot()
+    )
+    msg = make_message("wipe it", chat=make_chat(id=777), from_user=make_user(id=111))
+    await interface._on_message(make_update(message=msg), None)
+    bot: ConfirmationRejectingBot = interface._app.bot
+    assert len(bot.sent) == 1  # the rejected first attempt is never recorded
+    assert bot.sent[0]["text"] == "Confirmation required (original prompt could not be delivered)."
+    assert isinstance(bot.sent[0]["reply_markup"], InlineKeyboardMarkup)
+    await rt.stop()
+
+
+async def test_confirmation_prompt_over_limit_is_truncated(tmp_path: Path, token_env: str) -> None:
+    huge_reason = "x" * 5000
+    rt, interface = await build(tmp_path, [fake_tool_call("wipe", {"reason": huge_reason})])
+    msg = make_message("wipe it", chat=make_chat(id=777), from_user=make_user(id=111))
+    await interface._on_message(make_update(message=msg), None)
+    bot: FakeBot = interface._app.bot
+    assert len(bot.sent) == 1
+    assert len(bot.sent[0]["text"]) <= 4096
+    assert bot.sent[0]["text"].endswith("[truncated]")
+    await rt.stop()
+
+
+async def test_confirm_edit_badrequest_degrades_to_plain_fallback(
+    tmp_path: Path, token_env: str
+) -> None:
+    rt, interface = await build(
+        tmp_path,
+        [fake_tool_call("wipe", {"reason": "clean"}), fake_text("All done")],
+        bot=EditRejectingBot(),
+    )
+    resolve_calls = spy_resolve_confirmation(rt)
+    original_chat = make_chat(id=777)
+    msg = make_message("wipe it", chat=original_chat, from_user=make_user(id=111))
+    await interface._on_message(make_update(message=msg), None)
+    bot: EditRejectingBot = interface._app.bot
+    callback_data = bot.sent[0]["reply_markup"].inline_keyboard[0][0].callback_data
+
+    sent_message = make_message(
+        None, chat=original_chat, from_user=make_user(id=111), message_id=99
+    )
+    query = CallbackQuery(
+        id="cbq3",
+        from_user=make_user(id=111),
+        chat_instance="ci3",
+        message=sent_message,
+        data=callback_data,
+    )
+    await interface._on_callback(make_update(callback_query=query, update_id=2), None)
+
+    assert resolve_calls == [
+        {"confirmation_id": callback_data.split(":")[1], "approved": True, "user_id": "111"}
+    ]
+    assert bot.edited == [
+        {
+            "chat_id": 777,
+            "message_id": 99,
+            "text": "Done (original reply could not be delivered).",
+            "reply_markup": None,
+        }
+    ]
     await rt.stop()
 
 
