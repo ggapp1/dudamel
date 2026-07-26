@@ -45,6 +45,7 @@ ordinary column sense.
 
 from __future__ import annotations
 
+import inspect
 import re
 from datetime import UTC, date, datetime
 from types import UnionType
@@ -189,7 +190,13 @@ def _rewrite_annotations(cls: type, app_name: str, table: str | None) -> None:
     # subclass — only `cls.__dict__["__annotations__"]` was ever checked.
     bare: dict[str, object] = {}
     for ancestor in _mro_ancestors(cls):
-        bare.update(ancestor.__dict__.get("__annotations__", {}))
+        # inspect.get_annotations reads each class's OWN annotations across
+        # Python versions: on <=3.13 that's cls.__dict__["__annotations__"];
+        # on >=3.14 (PEP 649) annotations are lazily computed via
+        # __annotate__ and never appear in the class __dict__ eagerly — a
+        # raw __dict__ lookup returns nothing there and every bare
+        # annotation would silently be dropped.
+        bare.update(inspect.get_annotations(ancestor))
 
     new_annotations: dict[str, object] = {}
     has_pk = "id" in bare
