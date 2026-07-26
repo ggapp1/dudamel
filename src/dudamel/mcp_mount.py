@@ -26,6 +26,7 @@ silently no-opping.
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import os
 import re
@@ -118,7 +119,12 @@ class McpToolSchema:
 
     @property
     def json_schema(self) -> dict[str, Any]:
-        return self._schema
+        # Deepcopy, not the live reference: `ToolSpec.from_tool` and friends
+        # hand this straight to callers outside dudamel's control (LLM
+        # provider payload construction, etc); a caller mutating the
+        # returned dict must never corrupt the schema every future call to
+        # this tool validates and describes itself with.
+        return copy.deepcopy(self._schema)
 
     def validate(self, args: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(args, dict):
