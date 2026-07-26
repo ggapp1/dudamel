@@ -36,6 +36,14 @@ FIXTURE = Path(__file__).parent / "fixtures" / "mcp_echo_server.py"
 FIXTURE_CMD = shlex.join([sys.executable, str(FIXTURE)])
 
 
+def fixture_cmd(name: str) -> str:
+    """A fixture command that self-reports serverInfo.name = `name` instead
+    of the default "fixture" -- for tests that need two mounted servers with
+    DISTINCT identities (as opposed to tests that mount FIXTURE_CMD twice on
+    purpose to exercise the same-identity collision/spoofing path)."""
+    return shlex.join([sys.executable, str(FIXTURE), name])
+
+
 def make_settings(tmp_path: Path, **tiers: TierConfig) -> Settings:
     return Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/mcp.db",
@@ -344,3 +352,46 @@ async def test_server_initiated_callbacks_are_refused_immediately() -> None:
     for result in (sampling, elicitation, roots):
         assert isinstance(result, types.ErrorData)
         assert "not supported in dudamel v1" in result.message
+
+
+# -- Fix round 1, item 1: close order must be reversed (LIFO), or a 2nd+ ------
+# mounted server's cancel-scope teardown raises CancelledError (a
+# BaseException) that escapes `contextlib.suppress(Exception)`, poisoning the
+# task and crashing Runtime.stop()/serve(). Repeated 3x in-test: this is a
+# subprocess-timing-sensitive regression, so a flaky pass on run 1 that fails
+# on run 2/3 would otherwise slip through.
+
+
+async def test_mcp_mount_close_reversed_order_survives_two_servers() -> None:
+    """anyio cancel scopes are stacked per-task, in mount order, across ALL
+    mounted servers -- each server's own AsyncExitStack only guarantees LIFO
+    *within itself*. Closing servers in forward mount order tries to exit a
+    scope that is no longer innermost, and anyio raises CancelledError.
+    fixture_cmd gives the two servers DISTINCT identities on purpose: this
+    test isolates the close-order fix from the separate MCP-vs-MCP
+    collision/dedupe policy exercised elsewhere."""
+    for _ in range(3):
+        mount = MCPMount([fixture_cmd("alpha"), fixture_cmd("beta")])
+        tools = await mount.mount()
+        assert {t.app_name for t in tools} == {"mcp:alpha", "mcp:beta"}
+        await mount.close()  # must not raise
+
+
+async def test_runtime_start_stop_survives_two_mounted_servers_repeatedly(
+    tmp_path: Path,
+) -> None:
+    """Same regression at the actual reported crash site: Runtime.stop()
+    (and by the same code path, serve()'s shutdown sequence)."""
+    for _ in range(3):
+        orc = Orchestrator(apps=[], mcp=[fixture_cmd("alpha"), fixture_cmd("beta")])
+        rt = Runtime(
+            orc, make_settings(tmp_path), providers={"standard": FakeProvider([fake_text("hi")])}
+        )
+        await rt.start()
+        assert set(orc.registry.tools) == {
+            "alpha__echo",
+            "alpha__mutate",
+            "beta__echo",
+            "beta__mutate",
+        }
+        await rt.stop()  # must not raise

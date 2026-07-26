@@ -314,7 +314,7 @@ async def serve(
                 with contextlib.suppress(asyncio.CancelledError):
                     await asyncio.sleep(_JOB_DRAIN_SECONDS)
                 await runtime.scheduler.shutdown()
-                await runtime.stop()
+                await _stop_quietly("runtime", runtime.stop())
             finally:
                 _remove_signal_handlers(loop, signals_installed)
     finally:

@@ -26,7 +26,6 @@ silently no-opping.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import re
 import shlex
@@ -207,9 +206,28 @@ class _MountedServer:
 
     async def close(self) -> None:
         # Best-effort: a server that's already dead/misbehaving must not make
-        # shutdown itself fail.
-        with contextlib.suppress(Exception):
+        # shutdown itself fail. Primary defense against cross-server
+        # cancel-scope corruption is `MCPMount.close()` closing servers in
+        # reverse (LIFO) mount order, matching anyio's per-task cancel-scope
+        # stack discipline -- but this is defense in depth for whatever stray
+        # cancel-scope misuse still slips through (this SDK's stdio transport
+        # and ClientSession both open anyio task groups / cancel scopes via
+        # `_stack`'s context managers). Such misuse surfaces as
+        # `CancelledError`, a `BaseException` that a plain `except Exception`
+        # would NOT catch -- it's shutdown plumbing, not a real cancellation,
+        # so catch broadly here but still let a genuine
+        # KeyboardInterrupt/SystemExit through.
+        try:
             await self._stack.aclose()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as e:
+            logger.warning(
+                "mcp: error closing server %r during shutdown (%s: %s) -- ignoring, best-effort",
+                self.command,
+                type(e).__name__,
+                e,
+            )
 
 
 # -- the mount --------------------------------------------------------------------
@@ -273,5 +291,12 @@ class MCPMount:
         return tools
 
     async def close(self) -> None:
-        for server in self._servers:
+        # Reverse (LIFO) mount order: anyio cancel scopes are stacked
+        # per-task, in the order they were entered, across ALL mounted
+        # servers (each server's own AsyncExitStack only guarantees LIFO
+        # *within itself*) -- closing server 1 before server 2 tries to
+        # exit a scope that isn't innermost anymore and anyio raises
+        # `CancelledError` (a BaseException), which `contextlib.suppress`
+        # calls used to let straight through the whole rest of shutdown.
+        for server in reversed(self._servers):
             await server.close()
