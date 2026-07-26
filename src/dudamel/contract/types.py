@@ -30,6 +30,7 @@ class Widget:
     title: str
     renderer: str
     fn: Callable[[], Awaitable[Any]]
+    timeout: float = 15.0
 
 
 @dataclass

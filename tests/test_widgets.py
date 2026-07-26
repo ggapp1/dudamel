@@ -74,6 +74,26 @@ def test_widget_with_defaulted_arg_allowed():
     assert "has_default" in app.widgets
 
 
+def test_widget_default_timeout():
+    app = App("workouts", description="d")
+
+    @app.widget(title="X", renderer="stat")
+    async def w() -> dict:
+        return {"label": "x", "value": 1}
+
+    assert app.widgets["w"].timeout == 15.0
+
+
+def test_widget_custom_timeout():
+    app = App("workouts", description="d")
+
+    @app.widget(title="X", renderer="stat", timeout=2.5)
+    async def w() -> dict:
+        return {"label": "x", "value": 1}
+
+    assert app.widgets["w"].timeout == 2.5
+
+
 def test_duplicate_widget_id_rejected():
     app = App("workouts", description="d")
 

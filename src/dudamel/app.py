@@ -89,7 +89,7 @@ class App:
         return fn
 
     # --- widgets -----------------------------------------------------------
-    def widget(self, *, title: str, renderer: str) -> Callable:
+    def widget(self, *, title: str, renderer: str, timeout: float = 15.0) -> Callable:
         if renderer not in RENDERERS:
             raise RegistryError(f"unknown renderer {renderer!r}; choose one of {sorted(RENDERERS)}")
 
@@ -110,7 +110,7 @@ class App:
             if wid in self.widgets:
                 raise RegistryError(f"widget {wid!r} already registered on app {self.name!r}")
             self.widgets[wid] = Widget(
-                id=wid, app_name=self.name, title=title, renderer=renderer, fn=fn
+                id=wid, app_name=self.name, title=title, renderer=renderer, fn=fn, timeout=timeout
             )
             return fn
 
