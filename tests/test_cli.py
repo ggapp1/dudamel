@@ -1,10 +1,11 @@
-"""Acceptance tests for dudamel/cli.py (Plan 4 Task 3) -- the `dudamel`
-command: `new/run/db migrate/doctor/token rotate`. argparse only, actionable
-errors (never a bare traceback unless --debug), every command works from a
-scaffolded project directory (Global Constraints)."""
+"""Acceptance tests for dudamel/cli.py -- the `dudamel` command: `new/run/db
+migrate/doctor/token rotate`. argparse only, actionable errors (never a bare
+traceback unless --debug), every command works from a scaffolded project
+directory."""
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from pathlib import Path
 
@@ -176,6 +177,44 @@ def test_run_debug_flag_reraises_instead_of_swallowing(
     monkeypatch.chdir(tmp_path)
     with pytest.raises(cli.CliError, match="assistant.py"):
         cli.main(["run", "--debug"])
+
+
+def test_run_configures_info_level_logging_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M2: `dudamel run` is a fresh interpreter with no other logging setup,
+    so it must call `logging.basicConfig` itself or serve()'s own INFO
+    startup/shutdown logging would be silently dropped. Patches
+    `logging.basicConfig` itself (never really reconfiguring the root
+    logger) so this can't leak level/handler changes into the rest of the
+    suite, which shares one process across every test."""
+    target = scaffold(tmp_path)
+    monkeypatch.chdir(target)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(cli.logging, "basicConfig", lambda **kw: captured.update(kw))
+
+    async def fake_serve(orchestrator, settings, **kwargs):
+        pass
+
+    monkeypatch.setattr(cli, "serve", fake_serve)
+    assert cli.main(["run"]) == 0
+    assert captured["level"] == logging.INFO
+
+
+def test_run_debug_flag_configures_debug_level_logging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = scaffold(tmp_path)
+    monkeypatch.chdir(target)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(cli.logging, "basicConfig", lambda **kw: captured.update(kw))
+
+    async def fake_serve(orchestrator, settings, **kwargs):
+        pass
+
+    monkeypatch.setattr(cli, "serve", fake_serve)
+    assert cli.main(["run", "--debug"]) == 0
+    assert captured["level"] == logging.DEBUG
 
 
 def test_run_wires_orchestrator_and_settings_into_serve(

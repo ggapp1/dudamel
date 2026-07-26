@@ -207,8 +207,22 @@ def cmd_new(args: argparse.Namespace) -> int:
 
 # --- run -----------------------------------------------------------------
 
+_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+_LOG_DATEFMT = "%H:%M:%S"
+
 
 def cmd_run(args: argparse.Namespace) -> int:
+    # A real `dudamel run` invocation is a fresh interpreter with nothing
+    # else configuring logging, so INFO-and-up (DEBUG with --debug) reaching
+    # the terminal by default is what makes serve()'s own startup/shutdown
+    # logging (dashboard URL, telegram status, ordered-shutdown messages)
+    # visible at all rather than silently discarded by logging's default
+    # "no handler configured" behavior.
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format=_LOG_FORMAT,
+        datefmt=_LOG_DATEFMT,
+    )
     project_dir = Path.cwd()
     _load_dotenv_into_environ(project_dir)
     settings = Settings.load(project_dir)

@@ -31,7 +31,10 @@ zero business logic, zero LLM calls. `serve()`:
      logged and swallowed rather than taking the already-running web
      surface and scheduler down with it (spec §9: "Telegram unreachable ->
      core and dashboard unaffected"). `telegram` stays `None` on failure so
-     step 6's shutdown skips it.
+     step 6's shutdown skips it. Once this step resolves either way, an INFO
+     log line reports the dashboard URL/token env var and whether Telegram
+     ended up enabled — the two facts an operator needs right after startup,
+     without reading source to find them.
   6. Waits for a stop signal (SIGTERM/SIGINT, or this coroutine's own task
      being cancelled), then shuts everything down in the mandated order —
      Telegram -> uvicorn -> scheduler -> Runtime (DB dispose) — releasing
@@ -279,13 +282,21 @@ async def serve(
                     )
                     telegram = None
 
+            logger.info(
+                "dudamel dashboard: http://%s:%s (login with %s)",
+                settings.web.host,
+                settings.web.port,
+                settings.web.token_env,
+            )
+            logger.info("telegram: %s", "enabled" if telegram is not None else "disabled")
+
             try:
                 await stop_event.wait()
             except asyncio.CancelledError:
                 pass  # task.cancel() is a stop request too — shut down clean
         finally:
-            # Ordered shutdown (Global Constraints): stop intake (Telegram,
-            # then the web server) before the scheduler, then the DB last.
+            # Ordered shutdown: stop intake (Telegram, then the web server)
+            # before the scheduler, then the DB last.
             # Signal handlers stay installed for this ENTIRE sequence —
             # removed only once it's fully done, in the innermost `finally`
             # below — and are idempotent (see `_install_signal_handlers`),

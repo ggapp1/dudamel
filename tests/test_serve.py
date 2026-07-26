@@ -1,12 +1,13 @@
-"""Acceptance tests for dudamel/serve.py (Plan 3 Task 6): the single-process
-assembly. All timing-sensitive assertions poll with a deadline -- never a
-bare sleep-and-hope (Global Constraints / plan directive for this task).
+"""Acceptance tests for dudamel/serve.py: the single-process assembly. All
+timing-sensitive assertions poll with a deadline -- never a bare
+sleep-and-hope, which would make failures flaky instead of deterministic.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import signal
 import subprocess
@@ -130,6 +131,48 @@ async def test_health_and_widgets_respond_over_real_localhost_socket(
             # /api/* still requires auth even over the real socket.
             unauthed = await c.get("/api/widgets")
             assert unauthed.status_code == 401
+    finally:
+        await cancel_and_await(task)
+
+
+async def test_serve_logs_dashboard_url_and_telegram_status_on_boot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """M2: a successful boot must be visible without reading source -- the
+    dashboard URL/token env var and whether Telegram came up are the two
+    facts an operator needs immediately after starting `dudamel run`."""
+    monkeypatch.setenv("DUDAMEL_WEB_TOKEN", TOKEN)
+    caplog.set_level(logging.INFO, logger="dudamel.serve")
+    settings = make_settings(tmp_path)
+    task = asyncio.create_task(
+        serve(make_orc(), settings, providers={"standard": FakeProvider([])})
+    )
+    try:
+        port = await wait_for_port(settings)
+        assert any(
+            f"dudamel dashboard: http://127.0.0.1:{port}" in r.message
+            and "DUDAMEL_WEB_TOKEN" in r.message
+            for r in caplog.records
+        )
+        assert any(r.message == "telegram: disabled" for r in caplog.records)
+    finally:
+        await cancel_and_await(task)
+
+
+async def test_serve_logs_telegram_enabled_when_it_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _FakeTelegram.instances.clear()
+    monkeypatch.setattr(serve_module, "resolve_telegram_token", lambda settings: "fake-token")
+    monkeypatch.setattr(serve_module, "TelegramInterface", _FakeTelegram)
+    caplog.set_level(logging.INFO, logger="dudamel.serve")
+    settings = make_settings(tmp_path)
+    task = asyncio.create_task(
+        serve(make_orc(), settings, providers={"standard": FakeProvider([])})
+    )
+    try:
+        await wait_for_port(settings)
+        assert any(r.message == "telegram: enabled" for r in caplog.records)
     finally:
         await cancel_and_await(task)
 
