@@ -47,6 +47,14 @@ class TelegramConfig(BaseModel):
     allow_groups: bool = False
 
 
+class McpConfig(BaseModel):
+    # Env passthrough to MCP subprocesses is explicit config, never ambient:
+    # only variables named here ever reach a mounted stdio server's
+    # environment beyond the SDK's own safe default set (PATH etc.) --
+    # see `MCPMount`/`_MountedServer` in mcp_mount.py.
+    env_passthrough: list[str] = []
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="DUDAMEL_", extra="ignore")
 
@@ -57,6 +65,7 @@ class Settings(BaseSettings):
     router: RouterConfig = RouterConfig()
     web: WebConfig = WebConfig()
     telegram: TelegramConfig = TelegramConfig()
+    mcp: McpConfig = McpConfig()
 
     @classmethod
     def settings_customise_sources(

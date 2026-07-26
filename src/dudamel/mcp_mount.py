@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import shlex
 from collections.abc import Awaitable, Callable, Sequence
@@ -179,17 +180,24 @@ def _build_tool(
 
 
 class _MountedServer:
-    def __init__(self, command: str) -> None:
+    def __init__(self, command: str, *, env_passthrough: Sequence[str] = ()) -> None:
         self.command = command
         self.session: ClientSession | None = None
         self.server_name: str = ""
+        self._env_passthrough = list(env_passthrough)
         self._stack = AsyncExitStack()
 
     async def connect(self) -> None:
         argv = shlex.split(self.command)
         if not argv:
             raise ValueError(f"empty MCP command: {self.command!r}")
-        params = StdioServerParameters(command=argv[0], args=argv[1:])
+        # Env passthrough is explicit config (design doc), never ambient: the
+        # SDK's own `stdio_client` already merges this dict OVER its safe
+        # default environment (PATH etc.) when `env` is not None, so an
+        # empty passthrough list behaves identically to omitting `env`
+        # entirely -- nothing here needs to duplicate that merge.
+        env = {var: os.environ[var] for var in self._env_passthrough if var in os.environ}
+        params = StdioServerParameters(command=argv[0], args=argv[1:], env=env)
         read, write = await self._stack.enter_async_context(stdio_client(params))
         session = await self._stack.enter_async_context(
             ClientSession(
@@ -319,15 +327,16 @@ class MCPMount:
     something an external MCP server should be able to trigger.
     """
 
-    def __init__(self, commands: Sequence[str]) -> None:
+    def __init__(self, commands: Sequence[str], *, env_passthrough: Sequence[str] = ()) -> None:
         self._commands = list(commands)
+        self._env_passthrough = list(env_passthrough)
         self._servers: list[_MountedServer] = []
 
     async def mount(self) -> list[Tool]:
         tools: list[Tool] = []
         seen_names: set[str] = set()
         for command in self._commands:
-            server = _MountedServer(command)
+            server = _MountedServer(command, env_passthrough=self._env_passthrough)
             try:
                 await asyncio.wait_for(server.connect(), timeout=MOUNT_TIMEOUT)
                 listed = await asyncio.wait_for(server.session.list_tools(), timeout=MOUNT_TIMEOUT)  # type: ignore[union-attr]

@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from dudamel import App, Orchestrator, Runtime
-from dudamel.config import Settings, TierConfig
+from dudamel.config import McpConfig, Settings, TierConfig
 from dudamel.contract.types import TOOL_NAME_RE, Tool
 from dudamel.exceptions import RegistryError, ToolValidationError
 from dudamel.llm.testing import FakeProvider, fake_text, fake_tool_call
@@ -45,11 +45,17 @@ def fixture_cmd(name: str) -> str:
     return shlex.join([sys.executable, str(FIXTURE), name])
 
 
-def make_settings(tmp_path: Path, **tiers: TierConfig) -> Settings:
+def make_settings(
+    tmp_path: Path,
+    *,
+    mcp: McpConfig | None = None,
+    **tiers: TierConfig,
+) -> Settings:
     return Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/mcp.db",
         data_dir=tmp_path,
         llm_tiers=tiers or {"standard": TierConfig(provider="fake", model="f")},
+        mcp=mcp or McpConfig(),
     )
 
 
@@ -63,9 +69,10 @@ async def test_mount_discovers_fixture_tools_namespaced_and_annotated() -> None:
     finally:
         await mount.close()
     by_name = {t.name: t for t in tools}
-    assert set(by_name) == {"fixture__echo", "fixture__mutate"}
+    assert set(by_name) == {"fixture__echo", "fixture__mutate", "fixture__read_env"}
     assert by_name["fixture__echo"].read_only is True
     assert by_name["fixture__mutate"].read_only is False  # unannotated -> mutating
+    assert by_name["fixture__read_env"].read_only is True
     assert all(t.origin == "mcp" for t in by_name.values())
     assert all(t.description.startswith("[experimental MCP]") for t in by_name.values())
     assert all(t.timeout == 30.0 for t in by_name.values())
@@ -211,7 +218,11 @@ async def test_mixed_reachable_and_unreachable_servers(tmp_path: Path) -> None:
     )
     await rt.start()
     try:
-        assert set(orc.registry.tools) == {"fixture__echo", "fixture__mutate"}
+        assert set(orc.registry.tools) == {
+            "fixture__echo",
+            "fixture__mutate",
+            "fixture__read_env",
+        }
     finally:
         await rt.stop()
 
@@ -392,8 +403,10 @@ async def test_runtime_start_stop_survives_two_mounted_servers_repeatedly(
         assert set(orc.registry.tools) == {
             "alpha__echo",
             "alpha__mutate",
+            "alpha__read_env",
             "beta__echo",
             "beta__mutate",
+            "beta__read_env",
         }
         await rt.stop()  # must not raise
 
@@ -449,7 +462,7 @@ async def test_spoofed_server_identity_drops_colliding_tool_and_start_succeeds(
     )
     await rt.start()  # must NOT raise
     try:
-        assert set(orc.registry.tools) == {"fixture__echo", "fixture__mutate"}
+        assert set(orc.registry.tools) == {"fixture__echo", "fixture__mutate", "fixture__read_env"}
         assert any("dropping this one" in r.message for r in caplog.records)
     finally:
         await rt.stop()
@@ -475,3 +488,38 @@ async def test_runtime_start_raises_registry_error_when_mcp_tool_collides_with_n
     with pytest.raises(RegistryError, match="collides"):
         await rt.start()
     await rt.stop()
+
+
+# -- Fix round 1, item 3: env passthrough is explicit config, never ambient --
+
+
+async def test_env_passthrough_forwards_configured_var_to_mcp_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DUDAMEL_TEST_MCP_PASSTHROUGH_VAR", "secret-value")
+    orc = Orchestrator(apps=[], mcp=[FIXTURE_CMD])
+    settings = make_settings(
+        tmp_path, mcp=McpConfig(env_passthrough=["DUDAMEL_TEST_MCP_PASSTHROUGH_VAR"])
+    )
+    rt = Runtime(orc, settings, providers={"standard": FakeProvider([fake_text("hi")])})
+    await rt.start()
+    try:
+        read_env = orc.registry.tools["fixture__read_env"]
+        assert await read_env.fn(name="DUDAMEL_TEST_MCP_PASSTHROUGH_VAR") == "secret-value"
+    finally:
+        await rt.stop()
+
+
+async def test_env_passthrough_absent_var_stays_absent_without_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DUDAMEL_TEST_MCP_PASSTHROUGH_VAR", "secret-value")
+    orc = Orchestrator(apps=[], mcp=[FIXTURE_CMD])
+    settings = make_settings(tmp_path)  # McpConfig() default: nothing passed through
+    rt = Runtime(orc, settings, providers={"standard": FakeProvider([fake_text("hi")])})
+    await rt.start()
+    try:
+        read_env = orc.registry.tools["fixture__read_env"]
+        assert await read_env.fn(name="DUDAMEL_TEST_MCP_PASSTHROUGH_VAR") == ""
+    finally:
+        await rt.stop()

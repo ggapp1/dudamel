@@ -135,7 +135,9 @@ class Runtime:
             # (or another mcp) tool is the one thing that DOES raise here
             # (Registry.add_mcp_tools): that's a configuration bug, not
             # environmental flakiness.
-            self._mcp_mount = MCPMount(self._mcp_commands)
+            self._mcp_mount = MCPMount(
+                self._mcp_commands, env_passthrough=self._settings.mcp.env_passthrough
+            )
             tools = await self._mcp_mount.mount()
             if tools:
                 self._registry.add_mcp_tools(tools)

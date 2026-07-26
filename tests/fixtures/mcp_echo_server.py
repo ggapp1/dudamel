@@ -1,11 +1,15 @@
 """Minimal stdio MCP server fixture for Plan 4 Task 2 acceptance tests.
 
-Exposes two tools:
+Exposes three tools:
 
 - ``echo(text)`` -- annotated ``readOnlyHint=True``; the mount must map this
   to a read-only dudamel Tool.
 - ``mutate(value)`` -- no annotations at all; per the Global Constraint,
   unannotated MCP tools are treated as MUTATING (taint applies).
+- ``read_env(name)`` -- annotated ``readOnlyHint=True``; returns
+  ``os.environ.get(name, "")`` as observed by the SUBPROCESS, so tests can
+  prove env-passthrough config actually reaches the spawned server (and that
+  omitting a variable from the passthrough list keeps it absent there).
 
 The server's self-reported ``serverInfo.name`` (the ``{server}`` half of
 ``{server}__{tool}``) is ``"fixture"`` by default, overridable via either a
@@ -14,6 +18,8 @@ tests that need two DISTINCT mounted servers (e.g. the close-order
 regression test, which wants to isolate LIFO-close behavior from the
 separate MCP-vs-MCP collision/dedupe policy) launch two instances of this
 same file with different names instead of maintaining a second fixture.
+Tests that want two servers to genuinely COLLIDE (e.g. spoofed-identity
+dedupe) launch two instances with the SAME (default) name on purpose.
 
 Not meant to be run interactively: tests spawn it as
 ``[sys.executable, <this file>]`` (optionally plus a name arg) and speak MCP
@@ -43,6 +49,13 @@ def echo(text: str) -> str:
 def mutate(value: str) -> str:
     """Pretend to mutate state somewhere (unannotated -- treated as mutating)."""
     return f"mutated:{value}"
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+def read_env(name: str) -> str:
+    """Return this subprocess's own os.environ.get(name, "") -- proves
+    env-passthrough config actually reached the spawned server."""
+    return os.environ.get(name, "")
 
 
 if __name__ == "__main__":
