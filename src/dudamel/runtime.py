@@ -21,6 +21,7 @@ from dudamel.llm.client import LLMClient, Tier
 from dudamel.llm.openai_compat import OpenAICompatProvider
 from dudamel.llm.provider import Provider
 from dudamel.llm.types import Message
+from dudamel.mcp_mount import MCPMount
 from dudamel.migrate import upgrade_apps, upgrade_core
 from dudamel.models_core import Activity, Conversation, JobRun, PendingConfirmation
 from dudamel.orchestrator import Orchestrator
@@ -42,6 +43,8 @@ class Runtime:
         self._settings = settings
         self._db = Database(settings.database_url)
         self._registry = orchestrator.registry
+        self._mcp_commands = list(orchestrator.mcp)
+        self._mcp_mount: MCPMount | None = None
         tiers = self._build_tiers(providers or {})
         self._llm = LLMClient(tiers=tiers, db=self._db, budget=settings.llm_budget)
         self._convo = ConversationStore(self._db)
@@ -125,6 +128,18 @@ class Runtime:
         migrations_dir = self._settings.data_dir / "migrations"
         if migrations_dir.exists():
             await asyncio.to_thread(upgrade_apps, url, self._settings.data_dir)
+        if self._mcp_commands:
+            # EXPERIMENTAL: a broken/unreachable MCP server degrades to a
+            # warning and zero tools from it (MCPMount.mount()'s job) — it
+            # must never make start() fail. A name collision with a native
+            # (or another mcp) tool is the one thing that DOES raise here
+            # (Registry.add_mcp_tools): that's a configuration bug, not
+            # environmental flakiness.
+            self._mcp_mount = MCPMount(self._mcp_commands)
+            tools = await self._mcp_mount.mount()
+            if tools:
+                self._registry.add_mcp_tools(tools)
+                self._router.refresh_tool_specs()
 
     async def chat(
         self,
@@ -236,4 +251,6 @@ class Runtime:
         return self.scheduler.list_jobs()
 
     async def stop(self) -> None:
+        if self._mcp_mount is not None:
+            await self._mcp_mount.close()
         await self._db.dispose()

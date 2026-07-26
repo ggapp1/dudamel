@@ -78,6 +78,22 @@ class Router:
         self._locks: dict[int, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
 
+    def refresh_tool_specs(self) -> None:
+        """Rebuild the tool specs offered to the model from the registry's
+        current tool set. Tool registration is normally frozen at Router
+        construction, but Plan 4's MCP mount adds tools to the (shared)
+        Registry object later, during `Runtime.start()` -- after this Router
+        already exists. `Runtime.start()` calls this once mounting is done so
+        those tools actually reach the LLM instead of silently existing only
+        in `registry.tools`."""
+        if len(self._registry.tools) > self._config.max_tools:
+            raise RegistryError(
+                f"{len(self._registry.tools)} tools registered but router max_tools is "
+                f"{self._config.max_tools} — small models' tool selection collapses beyond "
+                "this; raise [router].max_tools deliberately or split apps"
+            )
+        self._specs = [ToolSpec.from_tool(t) for t in self._registry.tools.values()]
+
     # -- public ---------------------------------------------------------------
     async def handle(
         self,
