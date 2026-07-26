@@ -372,6 +372,58 @@ async def test_no_telegram_interface_built_without_a_token(
         await cancel_and_await(task)
 
 
+class _FakeTelegramThatFailsToStart(_FakeTelegram):
+    """`start()` always raises -- proves a broken Telegram interface can
+    never take the web dashboard down with it (spec §9: "Telegram
+    unreachable -> core and dashboard unaffected")."""
+
+    async def start(self) -> None:
+        self.calls.append("start")
+        raise ConnectionError("telegram is unreachable")
+
+
+async def test_telegram_start_failure_does_not_prevent_web_from_serving(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _FakeTelegram.instances.clear()
+    monkeypatch.setattr(serve_module, "resolve_telegram_token", lambda settings: "fake-token")
+    monkeypatch.setattr(serve_module, "TelegramInterface", _FakeTelegramThatFailsToStart)
+
+    settings = make_settings(tmp_path)
+    lockfile = settings.data_dir / ".dudamel.lock"
+    task = asyncio.create_task(
+        serve(make_orc(), settings, providers={"standard": FakeProvider([])})
+    )
+    try:
+        port = await wait_for_port(settings)
+
+        # The web surface came up and answers over the real socket despite
+        # the broken Telegram interface.
+        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as c:
+            health = await c.get("/health")
+            assert health.status_code == 200
+            assert health.json()["status"] == "ok"
+
+        assert any("telegram interface failed to start" in r.message for r in caplog.records)
+
+        # notify() stayed on the Runtime WARN-log fallback -- bind_notify()
+        # was never reached because the exception fired inside the same
+        # try block, before that call.
+        fake = _FakeTelegram.instances[0]
+        assert fake.calls == ["start"]
+        app = fake.runtime._registry.apps["stats"]
+        await app._notify("still on the fallback")
+        assert any("notify (no channel configured)" in r.message for r in caplog.records)
+    finally:
+        # Clean shutdown afterwards: the task completes without raising,
+        # and shutdown must not call .stop() on a telegram that never
+        # started (telegram=None on the failure path).
+        await cancel_and_await(task)
+
+    assert fake.calls == ["start"]
+    assert not lockfile.exists()
+
+
 # --- _InstanceLock unit coverage ----------------------------------------------
 
 

@@ -25,7 +25,13 @@ zero business logic, zero LLM calls. `serve()`:
      `Runtime.bind_notify` to its `notify()` so `app.notify()` calls reach
      Telegram instead of the WARN-log fallback `Runtime` binds at
      construction. No token configured → that fallback stays in place; the
-     web surface runs either way.
+     web surface runs either way. Construction, `start()`, and the
+     `bind_notify` call are wrapped in a single `try/except Exception` —
+     Telegram being unreachable (bad token, network failure, anything) is
+     logged and swallowed rather than taking the already-running web
+     surface and scheduler down with it (spec §9: "Telegram unreachable ->
+     core and dashboard unaffected"). `telegram` stays `None` on failure so
+     step 6's shutdown skips it.
   6. Waits for a stop signal (SIGTERM/SIGINT, or this coroutine's own task
      being cancelled), then shuts everything down in the mandated order —
      Telegram -> uvicorn -> scheduler -> Runtime (DB dispose) — releasing
@@ -243,9 +249,26 @@ async def serve(
             web_task = asyncio.create_task(server.main_loop())
 
             if resolve_telegram_token(settings) is not None:
-                telegram = TelegramInterface(runtime, settings)
-                await telegram.start()
-                runtime.bind_notify(telegram.notify)
+                try:
+                    telegram = TelegramInterface(runtime, settings)
+                    await telegram.start()
+                    runtime.bind_notify(telegram.notify)
+                except Exception as e:
+                    # Spec §9: "Telegram unreachable -> core and dashboard
+                    # unaffected." A bad token, network failure, or any other
+                    # construction/start blowup here must never take the web
+                    # surface (already bound above) or the scheduler down
+                    # with it -- log and carry on with `notify()` left at the
+                    # WARN-log fallback `Runtime.__init__` already bound;
+                    # `telegram` stays None so the shutdown path below skips
+                    # it entirely rather than calling `.stop()` on something
+                    # that never (fully) started.
+                    logger.warning(
+                        "telegram interface failed to start (%s); continuing without it "
+                        "— web and scheduler unaffected",
+                        e,
+                    )
+                    telegram = None
 
             try:
                 await stop_event.wait()

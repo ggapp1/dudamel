@@ -78,6 +78,7 @@ class TelegramInterface:
         self._app: Application = ApplicationBuilder().token(token).build()
         self._app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message))
         self._app.add_handler(CallbackQueryHandler(self._on_callback))
+        self._app.add_error_handler(self._on_error)
 
     # -- lifecycle --------------------------------------------------------------
     async def start(self) -> None:
@@ -212,3 +213,11 @@ class TelegramInterface:
                 reply_markup=None,
             )
         await self._app.bot.answer_callback_query(query.id)
+
+    async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Registered via `Application.add_error_handler` — PTB routes any
+        exception raised inside `_on_message`/`_on_callback` (or its own
+        polling internals) here instead of letting it propagate and kill the
+        update-processing loop. Logged, not silently swallowed, so a handler
+        bug shows up rather than just going dark."""
+        logger.error("telegram handler error: %s", context.error)

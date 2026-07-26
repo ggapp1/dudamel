@@ -495,6 +495,32 @@ async def test_notify_with_no_allowed_users_does_not_crash(tmp_path: Path, token
 # --- lifecycle -------------------------------------------------------------------
 
 
+async def test_error_handler_registered_with_the_application(
+    tmp_path: Path, token_env: str
+) -> None:
+    rt, interface = await build(tmp_path, [])
+    assert interface._on_error in interface._app.error_handlers
+    await rt.stop()
+
+
+async def test_error_handler_logs_handler_exceptions(
+    tmp_path: Path, token_env: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Invoked directly with a stub context, mirroring how PTB itself would
+    call it after catching an exception raised inside `_on_message`/
+    `_on_callback`."""
+    rt, interface = await build(tmp_path, [])
+
+    class _StubContext:
+        error = RuntimeError("boom")
+
+    await interface._on_error(None, _StubContext())  # type: ignore[arg-type]
+    assert any(
+        "telegram handler error" in r.message and "boom" in r.message for r in caplog.records
+    )
+    await rt.stop()
+
+
 async def test_start_stop_use_lifecycle_api_not_run_polling(tmp_path: Path, token_env: str) -> None:
     rt, interface = await build(tmp_path, [])
     fake_app = FakeApplication()
