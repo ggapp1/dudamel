@@ -5,6 +5,28 @@ description = "A framework for personal AI assistants on your own hardware"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
+keywords = [
+    "personal assistant",
+    "llm",
+    "agent",
+    "telegram",
+    "dashboard",
+    "mcp",
+    "home server",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Chat",
+    "Topic :: Home Automation",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "pydantic>=2.7",
     "pydantic-settings>=2.2",
@@ -23,6 +45,10 @@ dependencies = [
 
 [project.scripts]
 dudamel = "dudamel.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/ggapp1/dudamel"
+Repository = "https://github.com/ggapp1/dudamel"
 
 [dependency-groups]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.5"]
