@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from dudamel import App, Orchestrator, Runtime
-from dudamel.config import McpConfig, Settings, TierConfig
+from dudamel.config import McpConfig, RouterConfig, Settings, TierConfig
 from dudamel.contract.types import TOOL_NAME_RE, Tool
 from dudamel.exceptions import RegistryError, ToolValidationError
 from dudamel.llm.testing import FakeProvider, fake_text, fake_tool_call
@@ -48,6 +48,7 @@ def fixture_cmd(name: str) -> str:
 def make_settings(
     tmp_path: Path,
     *,
+    router: RouterConfig | None = None,
     mcp: McpConfig | None = None,
     **tiers: TierConfig,
 ) -> Settings:
@@ -55,6 +56,7 @@ def make_settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/mcp.db",
         data_dir=tmp_path,
         llm_tiers=tiers or {"standard": TierConfig(provider="fake", model="f")},
+        router=router or RouterConfig(),
         mcp=mcp or McpConfig(),
     )
 
@@ -523,3 +525,23 @@ async def test_env_passthrough_absent_var_stays_absent_without_config(
         assert await read_env.fn(name="DUDAMEL_TEST_MCP_PASSTHROUGH_VAR") == ""
     finally:
         await rt.stop()
+
+
+# -- Fix round 1, item 4: post-mount max_tools ceiling stays fail-loud -------
+# Deliberately NOT degraded to a warn-and-drop like the MCP-vs-MCP collision
+# policy above: too many tools breaks tool-selection quality for the
+# operator's WHOLE assistant (small models' routing collapses past a modest
+# tool count -- see RouterConfig.max_tools / Router.__init__), not just for
+# whichever MCP server happened to mount last. That's a capacity problem the
+# operator must consciously fix (raise max_tools or mount fewer servers), not
+# something dudamel should silently paper over by dropping tools the
+# operator explicitly configured.
+
+
+async def test_mount_exceeding_max_tools_raises_out_of_start(tmp_path: Path) -> None:
+    orc = Orchestrator(apps=[], mcp=[FIXTURE_CMD])  # fixture mounts 3 tools
+    settings = make_settings(tmp_path, router=RouterConfig(max_tools=1))
+    rt = Runtime(orc, settings, providers={"standard": FakeProvider([fake_text("hi")])})
+    with pytest.raises(RegistryError, match="max_tools"):
+        await rt.start()
+    await rt.stop()  # cleanup must still succeed even though start() raised
