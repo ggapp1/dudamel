@@ -292,6 +292,32 @@ def test_doctor_runs_green_on_scaffolded_project_even_fully_offline(
     # tool-safety table
     assert "log_workout" in out
     assert "read_only" in out and "confirm" in out and "origin" in out
+    # no MCP servers configured in the bundled scaffold -- no note printed
+    assert "MCP server(s) configured" not in out
+
+
+def test_doctor_notes_mcp_servers_configured_without_mounting_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """I1: `doctor` never starts the orchestrator, so MCP tools (only
+    discoverable by actually connecting -- see mcp_mount.py) can't appear in
+    the tool-safety table; this surfaces that gap instead of silently
+    under-reporting it."""
+    target = scaffold(tmp_path)
+    monkeypatch.chdir(target)
+    assistant = target / "assistant.py"
+    assistant.write_text(
+        assistant.read_text().replace(
+            "Orchestrator(apps=[workouts_app])",
+            'Orchestrator(apps=[workouts_app], mcp=["true", "false"])',
+        )
+    )
+    capsys.readouterr()  # drain `new`'s output
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "ℹ 2 MCP server(s) configured — tools mount at run time" in out
+    assert "safety flags visible then" in out
 
 
 def test_doctor_reports_missing_web_token(

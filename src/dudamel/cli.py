@@ -433,6 +433,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(_line(False, f"app import ({_DEFAULT_MODULE})", str(e)))
     else:
         print(_render_tool_table(orchestrator))
+        # `doctor` never starts the orchestrator, so MCP-mounted tools (only
+        # discovered by actually connecting to each server -- see
+        # mcp_mount.py) aren't in the table above yet; this makes that gap
+        # visible instead of silently under-reporting the tool-safety table.
+        if orchestrator.mcp:
+            n = len(orchestrator.mcp)
+            print(
+                f"ℹ {n} MCP server(s) configured — tools mount at run time; "
+                "safety flags visible then"
+            )
     return 0
 
 
