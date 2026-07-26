@@ -12,7 +12,13 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python-version: ["3.12", "3.13"]
+        python-version: ["3.12", "3.13", "3.14"]
+    env:
+      # Force uv to use the matrix interpreter for sync AND every `uv run`.
+      # Without this, uv may prefer a system Python that satisfies
+      # requires-python (macos-latest shipped Homebrew 3.14, which is how an
+      # unpinned 3.14 broke the matrix'd "3.12"/"3.13" jobs).
+      UV_PYTHON: ${{ matrix.python-version }}
     steps:
       - uses: actions/checkout@v4
 
