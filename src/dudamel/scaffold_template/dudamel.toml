@@ -1,0 +1,20 @@
+# dudamel project configuration.
+#
+# Both tiers below point at a local Ollama server (an OpenAI-compatible HTTP
+# API) so this project runs fully offline out of the box. Swap `model` for
+# whatever you have pulled locally (`ollama pull ...`), or repoint a tier at
+# a hosted provider later — see `provider = "anthropic"` in the docs.
+
+[llm.tiers.standard]
+provider = "openai-compatible"
+base_url = "http://localhost:11434/v1"
+model = "qwen3.5:9b"
+
+[llm.tiers.fast]
+provider = "openai-compatible"
+base_url = "http://localhost:11434/v1"
+model = "qwen3.5:1.5b"
+
+[web]
+host = "127.0.0.1"
+port = 8787

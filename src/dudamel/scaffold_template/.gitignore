@@ -1,0 +1,12 @@
+# --- secrets & local state ---
+.env
+*.db
+*.db.bak
+*.db-wal
+*.db-shm
+.dudamel.lock
+
+# --- python ---
+__pycache__/
+*.py[cod]
+.venv/
