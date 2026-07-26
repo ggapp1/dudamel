@@ -215,6 +215,10 @@ your app's tools, widgets, and jobs against a real database (typically
 `tmp_path` and SQLite) — no network calls, no model, fully deterministic
 output to assert against.
 
+## Why "dudamel"?
+
+[check this out](https://www.youtube.com/watch?v=jfDprp0NlQ4)
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
