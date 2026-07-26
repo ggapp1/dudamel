@@ -5,6 +5,7 @@ Zero business logic and zero LLM calls live here.
 
 from __future__ import annotations
 
+import logging
 import secrets
 from typing import Any
 
@@ -22,6 +23,8 @@ from dudamel.web.auth import (
     SessionStore,
     resolve_token,
 )
+
+logger = logging.getLogger("dudamel.web.api")
 
 __all__ = ["create_api"]
 
@@ -50,6 +53,12 @@ def create_api(runtime: Runtime, settings: Settings) -> FastAPI:
             f"refusing to start: binding to non-loopback host {settings.web.host!r} "
             f"requires a web token — set the {settings.web.token_env} environment variable"
         )
+    if settings.web.host == "127.0.0.1" and token is None:
+        # Loopback-only is safe to start unauthenticated (the RuntimeError
+        # above is what actually gates off-box exposure), but a dev who
+        # forgets to set a token can't log into the dashboard at all — that's
+        # easy to miss silently, so flag it loudly at startup instead.
+        logger.warning("dashboard login impossible until %s is set", settings.web.token_env)
 
     sessions = SessionStore()
     authenticate = Authenticator(settings, sessions)
@@ -62,12 +71,17 @@ def create_api(runtime: Runtime, settings: Settings) -> FastAPI:
     app.state.sessions = sessions
 
     @app.get("/health")
-    async def health() -> dict[str, Any]:
+    async def health(response: Response) -> dict[str, Any]:
         try:
             await runtime.db_ping()
             db_ok = True
         except Exception:
             db_ok = False
+        if not db_ok:
+            # Body is intentionally unchanged either way -- only the status
+            # code communicates liveness to infra (load balancers, container
+            # orchestrators) that key off it rather than parsing the body.
+            response.status_code = 503
         return {"status": "ok" if db_ok else "error", "version": __version__, "db": db_ok}
 
     @app.post("/login")

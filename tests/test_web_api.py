@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import httpx
@@ -221,6 +222,28 @@ async def test_health_open_no_auth(tmp_path: Path) -> None:
     await rt.stop()
 
 
+async def test_health_returns_503_when_db_ping_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Body shape is unchanged either way -- only the status code moves, so
+    infra that keys off the HTTP status (load balancers, orchestrators)
+    sees the failure without every /health caller having to parse JSON."""
+    rt, transport = await build(tmp_path, [])
+
+    async def broken_ping() -> None:
+        raise RuntimeError("db is down")
+
+    monkeypatch.setattr(rt, "db_ping", broken_ping)
+    async with client(transport) as c:
+        resp = await c.get("/health")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["db"] is False
+    assert "version" in body
+    await rt.stop()
+
+
 # --- startup guard -------------------------------------------------------------
 
 
@@ -240,3 +263,31 @@ def test_startup_guard_allows_non_loopback_with_token(tmp_path: Path, token_env:
     settings = make_settings(tmp_path, web=WebConfig(host="0.0.0.0"))
     rt = Runtime(orc, settings, providers={"standard": FakeProvider([])})
     create_api(rt, settings)  # must not raise
+
+
+def test_loopback_without_token_warns_dashboard_login_impossible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.delenv("DUDAMEL_WEB_TOKEN", raising=False)
+    orc = make_orc()
+    settings = make_settings(tmp_path)  # default WebConfig(): host is loopback
+    rt = Runtime(orc, settings, providers={"standard": FakeProvider([])})
+    with caplog.at_level(logging.WARNING):
+        create_api(rt, settings)
+    assert any(
+        "dashboard login impossible until DUDAMEL_WEB_TOKEN is set" in r.message
+        for r in caplog.records
+    )
+
+
+def test_loopback_with_token_does_not_warn(
+    tmp_path: Path, token_env: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    orc = make_orc()
+    settings = make_settings(tmp_path)
+    rt = Runtime(orc, settings, providers={"standard": FakeProvider([])})
+    with caplog.at_level(logging.WARNING):
+        create_api(rt, settings)
+    assert not any("dashboard login impossible" in r.message for r in caplog.records)
