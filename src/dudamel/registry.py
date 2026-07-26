@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 
 from sqlalchemy import MetaData
@@ -8,6 +9,8 @@ from dudamel.app import App
 from dudamel.contract.types import TOOL_NAME_RE, Job, Tool, Widget
 from dudamel.exceptions import RegistryError
 from dudamel.models_core import CoreBase
+
+logger = logging.getLogger("dudamel.registry")
 
 RESERVED_APP_NAMES = {"dudamel", "core"}
 
@@ -73,11 +76,21 @@ class Registry:
 
         Unlike `MCPMount.mount()`'s per-server "warn and skip" degradation for
         environmental failures (server unreachable, handshake failure), a
-        name problem here is a configuration bug the operator must fix, so it
-        raises `RegistryError` immediately and mounts nothing from this
-        batch -- both a malformed name and a collision with an existing
-        (native or already-mounted mcp) tool are checked before anything is
-        added, so a batch either fully succeeds or fully fails.
+        malformed name or a collision with a NATIVE tool here is a
+        configuration bug the operator must fix, so it raises `RegistryError`
+        immediately and mounts nothing from this batch -- both are checked
+        before anything is added, so a batch either fully succeeds or fully
+        fails.
+
+        A collision with another MCP-origin tool (already registered, or
+        earlier in this same batch -- `MCPMount.mount()` already dedupes its
+        own output this way, but this is the sanctioned entry point and
+        defends independently) is NOT a configuration bug an operator can
+        fix: it can come from an untrusted MCP server spoofing another's
+        identity, or two long tool names truncating to the same 64-char
+        name. Raising there would let one hostile/accidental MCP server
+        take the whole batch (or, via `Runtime.start()`, the process) down.
+        So that case is a WARN + drop (first mount wins) instead.
         """
         seen: dict[str, Tool] = {}
         for tool in tools:
@@ -91,10 +104,19 @@ class Registry:
                 )
             existing = self.tools.get(tool.name) or seen.get(tool.name)
             if existing is not None:
-                raise RegistryError(
-                    f"mcp tool name {tool.name!r} (from {tool.app_name!r}) collides with an "
-                    f"existing {existing.origin} tool registered by {existing.app_name!r}; "
-                    "rename the MCP tool or the native one"
+                if existing.origin != "mcp":
+                    raise RegistryError(
+                        f"mcp tool name {tool.name!r} (from {tool.app_name!r}) collides with an "
+                        f"existing {existing.origin} tool registered by {existing.app_name!r}; "
+                        "rename the MCP tool or the native one"
+                    )
+                logger.warning(
+                    "mcp: tool %r from %r collides with an existing mcp tool from %r -- "
+                    "dropping this one (first mount wins)",
+                    tool.name,
+                    tool.app_name,
+                    existing.app_name,
                 )
+                continue
             seen[tool.name] = tool
         self.tools.update(seen)

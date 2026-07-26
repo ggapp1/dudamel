@@ -230,6 +230,68 @@ class _MountedServer:
             )
 
 
+# -- per-server tool collection + MCP-vs-MCP dedupe ----------------------------
+
+
+def _collect_server_tools(
+    session: ClientSession,
+    *,
+    server_name: str,
+    command: str,
+    mcp_tools: Sequence[types.Tool],
+    seen_names: set[str],
+) -> list[Tool]:
+    """Build dudamel `Tool`s from one server's `list_tools()` result,
+    applying the MCP-vs-MCP collision policy inline: a tool whose
+    sanitized/truncated `{server}__{tool}` name is already in `seen_names`
+    -- another tool on the SAME server colliding after 64-char truncation,
+    or an EARLIER server in this `mount()` call (including one spoofing an
+    already-seen `serverInfo.name`) -- gets a warning and is dropped, first
+    mount wins, never raised. `seen_names` is mutated in place so callers
+    iterating multiple servers accumulate the claimed-name set correctly
+    across calls. (Collision with a NATIVE tool is a separate, fail-loud
+    check that lives in `Registry.add_mcp_tools` instead -- that's an
+    operator config bug, not something an external MCP server should be
+    able to trigger.)
+    """
+    tools: list[Tool] = []
+    for mcp_tool in mcp_tools:
+        name = mcp_tool_name(server_name, mcp_tool.name)
+        if not TOOL_NAME_RE.match(name):
+            logger.warning(
+                "mcp: tool %r from server %r sanitizes to %r, which still doesn't "
+                "match the tool-name pattern -- skipping this tool",
+                mcp_tool.name,
+                command,
+                name,
+            )
+            continue
+        if name in seen_names:
+            logger.warning(
+                "mcp: tool %r from server %r (serverInfo.name %r) maps to %r, which an "
+                "earlier mcp tool already claimed -- dropping this one (first mount wins); "
+                "this may be two long tool names colliding after 64-char truncation, or a "
+                "server spoofing another's serverInfo.name",
+                mcp_tool.name,
+                command,
+                server_name,
+                name,
+            )
+            continue
+        seen_names.add(name)
+        read_only = bool(mcp_tool.annotations and mcp_tool.annotations.readOnlyHint)
+        tools.append(
+            _build_tool(
+                session,
+                server_name=server_name,
+                tool_name=name,
+                mcp_tool=mcp_tool,
+                read_only=read_only,
+            )
+        )
+    return tools
+
+
 # -- the mount --------------------------------------------------------------------
 
 
@@ -243,6 +305,18 @@ class MCPMount:
     handshake within `MOUNT_TIMEOUT` contributes zero tools and logs a
     warning -- it never raises out of `mount()`. Sibling servers, and core
     startup, are unaffected.
+
+    A tool name colliding with another MCP-origin tool -- two tool names
+    from the SAME server that sanitize/truncate to the same 64-char name,
+    or two different servers (including a hostile or merely misconfigured
+    server that spoofs another's `serverInfo.name`) producing the same
+    `{server}__{tool}` name -- is a WARN-and-drop, first-mount-wins
+    situation, never a raise: one MCP server must never be able to take
+    down mounting for its siblings (or the whole process) just by
+    colliding with a name, accidentally or on purpose. Colliding with a
+    NATIVE tool is the one case that stays fail-loud, checked separately by
+    `Registry.add_mcp_tools` -- that is an operator configuration bug, not
+    something an external MCP server should be able to trigger.
     """
 
     def __init__(self, commands: Sequence[str]) -> None:
@@ -251,6 +325,7 @@ class MCPMount:
 
     async def mount(self) -> list[Tool]:
         tools: list[Tool] = []
+        seen_names: set[str] = set()
         for command in self._commands:
             server = _MountedServer(command)
             try:
@@ -267,27 +342,15 @@ class MCPMount:
                 continue
             self._servers.append(server)
             assert server.session is not None
-            for mcp_tool in listed.tools:
-                name = mcp_tool_name(server.server_name, mcp_tool.name)
-                if not TOOL_NAME_RE.match(name):
-                    logger.warning(
-                        "mcp: tool %r from server %r sanitizes to %r, which still doesn't "
-                        "match the tool-name pattern -- skipping this tool",
-                        mcp_tool.name,
-                        command,
-                        name,
-                    )
-                    continue
-                read_only = bool(mcp_tool.annotations and mcp_tool.annotations.readOnlyHint)
-                tools.append(
-                    _build_tool(
-                        server.session,
-                        server_name=server.server_name,
-                        tool_name=name,
-                        mcp_tool=mcp_tool,
-                        read_only=read_only,
-                    )
+            tools.extend(
+                _collect_server_tools(
+                    server.session,
+                    server_name=server.server_name,
+                    command=command,
+                    mcp_tools=listed.tools,
+                    seen_names=seen_names,
                 )
+            )
         return tools
 
     async def close(self) -> None:

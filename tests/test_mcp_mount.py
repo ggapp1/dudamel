@@ -23,6 +23,7 @@ from dudamel.llm.testing import FakeProvider, fake_text, fake_tool_call
 from dudamel.mcp_mount import (
     MCPMount,
     McpToolSchema,
+    _collect_server_tools,
     _make_call_fn,
     _refuse_elicitation,
     _refuse_list_roots,
@@ -395,3 +396,82 @@ async def test_runtime_start_stop_survives_two_mounted_servers_repeatedly(
             "beta__mutate",
         }
         await rt.stop()  # must not raise
+
+
+# -- Fix round 1, item 2: MCP-vs-MCP collisions warn + drop, never raise -----
+# (collision with a NATIVE tool stays fail-loud -- RegistryError, see the
+# `test_registry_add_mcp_tools_rejects_native_collision` test above and the
+# e2e version below).
+
+
+async def test_truncation_collision_within_one_server_drops_second_and_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Two tool names >=55 chars from the SAME server whose `{server}__{tool}`
+    form collides after 64-char truncation: the first one mounted wins, the
+    second is dropped with a warning -- an MCP server picking its own tool
+    names must never be able to crash mounting via a naming accident."""
+    import mcp.types as types
+
+    long_a = "a" * 55 + "AAAA"
+    long_b = "a" * 55 + "BBBB"
+    # Sanity check: they DO collide once server+tool are joined and truncated.
+    assert mcp_tool_name("fixture", long_a) == mcp_tool_name("fixture", long_b)
+    tool_a = types.Tool(name=long_a, description="first", inputSchema={"type": "object"})
+    tool_b = types.Tool(name=long_b, description="second", inputSchema={"type": "object"})
+
+    caplog.set_level("WARNING")
+    seen: set[str] = set()
+    tools = _collect_server_tools(
+        None,  # type: ignore[arg-type]  # never called: fn is a closure, not invoked here
+        server_name="fixture",
+        command="fixture-cmd",
+        mcp_tools=[tool_a, tool_b],
+        seen_names=seen,
+    )
+    assert len(tools) == 1
+    assert tools[0].description.endswith("first")
+    assert any("dropping this one" in r.message for r in caplog.records)
+
+
+async def test_spoofed_server_identity_drops_colliding_tool_and_start_succeeds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Two REAL servers reporting the SAME serverInfo.name (the simplest
+    spoof: two instances of the same fixture, default name) produce
+    identical `{server}__{tool}` names for their identical tool sets --
+    first mount wins, second server's overlapping tools are dropped with a
+    warning, and Runtime.start() succeeds instead of raising."""
+    caplog.set_level("WARNING")
+    orc = Orchestrator(apps=[], mcp=[FIXTURE_CMD, FIXTURE_CMD])
+    rt = Runtime(
+        orc, make_settings(tmp_path), providers={"standard": FakeProvider([fake_text("hi")])}
+    )
+    await rt.start()  # must NOT raise
+    try:
+        assert set(orc.registry.tools) == {"fixture__echo", "fixture__mutate"}
+        assert any("dropping this one" in r.message for r in caplog.records)
+    finally:
+        await rt.stop()
+
+
+async def test_runtime_start_raises_registry_error_when_mcp_tool_collides_with_native(
+    tmp_path: Path,
+) -> None:
+    """Unlike an MCP-vs-MCP collision, a mounted mcp tool colliding with a
+    NATIVE tool stays fail-loud -- that's an operator configuration bug, not
+    something an external MCP server should be able to shrug off."""
+    app = App("web", description="d")
+
+    @app.tool
+    async def fixture__echo(text: str) -> str:
+        """Collides on purpose with the mounted mcp tool's name."""
+        return "x"
+
+    orc = Orchestrator(apps=[app], mcp=[FIXTURE_CMD])
+    rt = Runtime(
+        orc, make_settings(tmp_path), providers={"standard": FakeProvider([fake_text("hi")])}
+    )
+    with pytest.raises(RegistryError, match="collides"):
+        await rt.start()
+    await rt.stop()
