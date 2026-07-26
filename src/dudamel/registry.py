@@ -5,7 +5,7 @@ from collections.abc import Sequence
 from sqlalchemy import MetaData
 
 from dudamel.app import App
-from dudamel.contract.types import Job, Tool, Widget
+from dudamel.contract.types import TOOL_NAME_RE, Job, Tool, Widget
 from dudamel.exceptions import RegistryError
 from dudamel.models_core import CoreBase
 
@@ -66,3 +66,35 @@ class Registry:
             self.widgets.extend(app.widgets.values())
             self.jobs.extend(app.jobs.values())
             self.metadatas[app.name] = app.metadata
+
+    def add_mcp_tools(self, tools: Sequence[Tool]) -> None:
+        """Sanctioned entry point for grafting MCP-discovered tools in after
+        construction (Plan 4 Task 2) -- `Runtime.start()` is the only caller.
+
+        Unlike `MCPMount.mount()`'s per-server "warn and skip" degradation for
+        environmental failures (server unreachable, handshake failure), a
+        name problem here is a configuration bug the operator must fix, so it
+        raises `RegistryError` immediately and mounts nothing from this
+        batch -- both a malformed name and a collision with an existing
+        (native or already-mounted mcp) tool are checked before anything is
+        added, so a batch either fully succeeds or fully fails.
+        """
+        seen: dict[str, Tool] = {}
+        for tool in tools:
+            if tool.origin != "mcp":
+                raise RegistryError(
+                    f"add_mcp_tools received a non-mcp tool {tool.name!r} (origin={tool.origin!r})"
+                )
+            if not TOOL_NAME_RE.match(tool.name):
+                raise RegistryError(
+                    f"mcp tool name {tool.name!r} must match {TOOL_NAME_RE.pattern}"
+                )
+            existing = self.tools.get(tool.name) or seen.get(tool.name)
+            if existing is not None:
+                raise RegistryError(
+                    f"mcp tool name {tool.name!r} (from {tool.app_name!r}) collides with an "
+                    f"existing {existing.origin} tool registered by {existing.app_name!r}; "
+                    "rename the MCP tool or the native one"
+                )
+            seen[tool.name] = tool
+        self.tools.update(seen)
