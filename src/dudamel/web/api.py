@@ -1,6 +1,6 @@
-"""JSON API surface (Plan 3 Task 3). THIN by Global Constraints: every route
-does request parsing -> a single `Runtime` call -> response serialization.
-Zero business logic and zero LLM calls live here.
+"""JSON API surface. Intentionally thin: every route does request parsing ->
+a single `Runtime` call -> response serialization. Zero business logic and
+zero LLM calls live here.
 """
 
 from __future__ import annotations
@@ -65,9 +65,9 @@ def create_api(runtime: Runtime, settings: Settings) -> FastAPI:
 
     app = FastAPI(title="dudamel", version=__version__)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.web.allowed_hosts)
-    # Stashed so `dudamel.web.ui.add_ui()` (Plan 3 Task 4) can share this
-    # exact SessionStore: a session issued by POST /login below must be
-    # recognized by both the JSON API and the HTML dashboard pages.
+    # Stashed so `dudamel.web.ui.add_ui()` can share this exact SessionStore:
+    # a session issued by POST /login below must be recognized by both the
+    # JSON API and the HTML dashboard pages.
     app.state.sessions = sessions
 
     @app.get("/health")

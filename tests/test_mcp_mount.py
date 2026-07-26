@@ -1,4 +1,4 @@
-"""Plan 4 Task 2 acceptance tests: MCP mounting (experimental).
+"""Acceptance tests: MCP mounting (experimental).
 
 These spawn a real stdio MCP server subprocess (tests/fixtures/mcp_echo_server.py)
 via the mcp SDK's client transport. That's the whole point -- they ARE the
@@ -368,10 +368,10 @@ async def test_server_initiated_callbacks_are_refused_immediately() -> None:
         assert "not supported in dudamel v1" in result.message
 
 
-# -- Fix round 1, item 1: close order must be reversed (LIFO), or a 2nd+ ------
-# mounted server's cancel-scope teardown raises CancelledError (a
-# BaseException) that escapes `contextlib.suppress(Exception)`, poisoning the
-# task and crashing Runtime.stop()/serve(). Repeated 3x in-test: this is a
+# -- close order must be reversed (LIFO), or a 2nd+ mounted server's ---------
+# cancel-scope teardown raises CancelledError (a BaseException) that escapes
+# `contextlib.suppress(Exception)`, poisoning the task and crashing
+# Runtime.stop()/serve(). Repeated 3x in-test: this is a
 # subprocess-timing-sensitive regression, so a flaky pass on run 1 that fails
 # on run 2/3 would otherwise slip through.
 
@@ -413,7 +413,7 @@ async def test_runtime_start_stop_survives_two_mounted_servers_repeatedly(
         await rt.stop()  # must not raise
 
 
-# -- Fix round 1, item 2: MCP-vs-MCP collisions warn + drop, never raise -----
+# -- MCP-vs-MCP collisions warn + drop, never raise --------------------------
 # (collision with a NATIVE tool stays fail-loud -- RegistryError, see the
 # `test_registry_add_mcp_tools_rejects_native_collision` test above and the
 # e2e version below).
@@ -492,7 +492,7 @@ async def test_runtime_start_raises_registry_error_when_mcp_tool_collides_with_n
     await rt.stop()
 
 
-# -- Fix round 1, item 3: env passthrough is explicit config, never ambient --
+# -- env passthrough is explicit config, never ambient -----------------------
 
 
 async def test_env_passthrough_forwards_configured_var_to_mcp_subprocess(
@@ -527,7 +527,7 @@ async def test_env_passthrough_absent_var_stays_absent_without_config(
         await rt.stop()
 
 
-# -- Fix round 1, item 4: post-mount max_tools ceiling stays fail-loud -------
+# -- post-mount max_tools ceiling stays fail-loud -----------------------------
 # Deliberately NOT degraded to a warn-and-drop like the MCP-vs-MCP collision
 # policy above: too many tools breaks tool-selection quality for the
 # operator's WHOLE assistant (small models' routing collapses past a modest

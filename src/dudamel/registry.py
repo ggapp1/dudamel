@@ -72,7 +72,7 @@ class Registry:
 
     def add_mcp_tools(self, tools: Sequence[Tool]) -> None:
         """Sanctioned entry point for grafting MCP-discovered tools in after
-        construction (Plan 4 Task 2) -- `Runtime.start()` is the only caller.
+        construction -- `Runtime.start()` is the only caller.
 
         Unlike `MCPMount.mount()`'s per-server "warn and skip" degradation for
         environmental failures (server unreachable, handshake failure), a

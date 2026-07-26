@@ -51,8 +51,8 @@ async def test_client_msg_id_dedupe(store: ConversationStore) -> None:
 
 
 async def test_concurrent_get_or_create_same_new_channel(store: ConversationStore) -> None:
-    """Reproduces the reviewer's TOCTOU repro: two get_or_create() calls for
-    the same brand-new channel both SELECT and find nothing before either
+    """Regression test for a TOCTOU race: two get_or_create() calls for the
+    same brand-new channel both SELECT and find nothing before either
     commits an INSERT. Each racer's session boundary is gated by a shared
     asyncio.Event so neither can reach its INSERT until *both* have
     completed their SELECT -- exactly the interleaving the raw

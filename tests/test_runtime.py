@@ -124,7 +124,7 @@ def test_fake_tier_requires_override(tmp_path) -> None:
         Runtime(make_orc(), make_settings(tmp_path))  # fake tier, no providers=
 
 
-# --- Plan 3 Task 1: Runtime extensions --------------------------------------
+# --- Runtime extensions: pending confirmations, notify fallback, widgets ----
 
 
 async def test_list_pending_confirmations(tmp_path) -> None:
@@ -204,7 +204,7 @@ async def test_render_widgets_runs_concurrently(tmp_path) -> None:
     await rt.stop()
 
 
-# --- Plan 3 Task 2: scheduler wiring ----------------------------------------
+# --- scheduler wiring: created-but-not-started, jobs registered -------------
 
 
 async def test_runtime_has_scheduler_created_but_not_started(tmp_path) -> None:
@@ -253,7 +253,7 @@ async def test_render_widgets_reports_widget_errors(tmp_path) -> None:
     await rt.stop()
 
 
-# --- Plan 3 Task 4: dashboard read surfaces ----------------------------------
+# --- dashboard read surfaces: chat history, activity, job runs, job list ----
 
 
 async def test_recent_messages_round_trips_chat_history(tmp_path) -> None:

@@ -1,6 +1,6 @@
-"""Telegram interface tests (Plan 3 Task 5). No network: handlers are called
-directly with hand-built telegram.Update/Message/User/CallbackQuery objects,
-and `TelegramInterface._app.bot` is swapped for a stub that records calls
+"""Telegram interface tests. No network: handlers are called directly with
+hand-built telegram.Update/Message/User/CallbackQuery objects, and
+`TelegramInterface._app.bot` is swapped for a stub that records calls
 instead of hitting the Bot API.
 """
 

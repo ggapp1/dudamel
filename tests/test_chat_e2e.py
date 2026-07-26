@@ -1,6 +1,6 @@
 # tests/test_chat_e2e.py
-"""Plan 2 finish line: full chat flows through Runtime with a scripted
-provider — the exact wiring Plan 3's Telegram/web interfaces will call."""
+"""Full chat flows through Runtime with a scripted provider — the exact
+wiring the Telegram and web interfaces call in production."""
 
 from datetime import UTC, datetime
 from pathlib import Path

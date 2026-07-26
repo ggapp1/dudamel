@@ -1,8 +1,8 @@
-"""Telegram interface (Plan 3 Task 5). THIN by Global Constraints: every
-handler parses an Update, authorizes the sender, then calls exactly one
-`Runtime` method — zero business logic, zero LLM calls live here.
+"""Telegram interface. Intentionally thin: every handler parses an Update,
+authorizes the sender, then calls exactly one `Runtime` method — zero
+business logic, zero LLM calls live here.
 
-Auth rules (Global Constraints, binding):
+Auth rules (binding for this interface):
   - per-USER allowlist (`from_user.id`), deny-by-default
   - groups rejected unless `allow_groups`
   - callback queries are authorized the same way as text messages, PLUS the
@@ -14,8 +14,9 @@ Auth rules (Global Constraints, binding):
     backlog of messages queued while the process was down
 
 Lifecycle is PTB's low-level API (`initialize`/`start`/`updater.start_polling`)
-rather than `run_polling`: the assembly (Plan 3 Task 6) owns the event loop,
-running this alongside uvicorn and the scheduler in the same process.
+rather than `run_polling`: the single-process assembly (dudamel.serve.serve)
+owns the event loop, running this alongside uvicorn and the scheduler in the
+same process.
 """
 
 from __future__ import annotations

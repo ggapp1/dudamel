@@ -1,6 +1,6 @@
-"""Server-rendered HTMX dashboard (Plan 3 Task 4).
+"""Server-rendered HTMX dashboard.
 
-Interfaces are THIN by Global Constraints: every page route does a session
+Interfaces here are intentionally thin: every page route does a session
 check -> one or more `Runtime` read calls -> template render. Zero business
 logic, zero LLM calls, and (this is the important bit for this module) zero
 state changes live here.
@@ -8,18 +8,20 @@ state changes live here.
 Mounting: call ``add_ui(app, runtime, settings)`` AFTER ``create_api(runtime,
 settings)`` has built ``app`` — it reads the ``SessionStore`` that
 ``create_api()`` stashes on ``app.state.sessions`` so a single ``POST
-/login`` (Task 3's JSON route) issues a session cookie that both the JSON
-API and these HTML pages recognize. ``add_ui`` never creates its own session
-store or duplicates login logic; sessions stay strictly Task 3's concern.
+/login`` (the JSON API's own login route) issues a session cookie that both
+the JSON API and these HTML pages recognize. ``add_ui`` never creates its
+own session store or duplicates login logic; sessions stay strictly
+``web/api.py``'s concern.
 
 State changes (sending a chat message, approving/declining a pending
 confirmation) are NOT re-implemented here. Each page ships a few lines of
-vanilla JS that call Task 3's existing, already-CSRF-protected ``/api/chat``
-and ``/api/confirm/{id}`` JSON endpoints directly from the browser, using
-the session cookie already on the page and a CSRF token embedded in a
-hidden form field (``#csrf-token``) — literally "CSRF token embedded in
-forms for cookie POSTs" per the Global Constraints. ui.py's own routes are
-therefore all plain ``GET``s; it never proxies a POST through Python.
+vanilla JS that call the JSON API's existing, already-CSRF-protected
+``/api/chat`` and ``/api/confirm/{id}`` endpoints directly from the browser,
+using the session cookie already on the page and a CSRF token embedded in a
+hidden form field (``#csrf-token``) — the standard "CSRF token embedded in
+forms for cookie POSTs" mitigation for cookie-authenticated state changes.
+ui.py's own routes are therefore all plain ``GET``s; it never proxies a POST
+through Python.
 
 HTMX is used only for its core strength — polling GETs — via
 ``hx-trigger="every Ns"`` + ``hx-select`` (dashboard: 30s, chat: 5s), so
@@ -28,12 +30,12 @@ outside the polled fragment).
 
 Markdown widgets are rendered as pre-escaped plain text (Jinja's
 ``autoescape`` is on for all ``.html`` templates here) inside a styled
-``<pre>`` block — there is no markdown parser in this module by design
-(Global Constraints / Task 3 review): pulling a markdown library was
-explicitly out of scope for v1; "plain text in a styled block" is the
-documented v1 behavior. Because autoescape applies uniformly to every
-renderer's template output (stat/table/list/markdown and the error card),
-this is also what makes a `<script>` in ANY widget payload inert.
+``<pre>`` block — there is no markdown parser in this module by design:
+pulling a markdown library was explicitly out of scope for v1; "plain text
+in a styled block" is the documented v1 behavior. Because autoescape
+applies uniformly to every renderer's template output (stat/table/list/
+markdown and the error card), this is also what makes a `<script>` in ANY
+widget payload inert.
 """
 
 from __future__ import annotations
@@ -65,7 +67,8 @@ def add_ui(app: FastAPI, runtime: Runtime, settings: Settings) -> None:
 
     `settings` isn't read yet (no [web] dashboard knob exists) but is kept
     in the signature for symmetry with `create_api(runtime, settings)` and
-    because the assembly (Plan 3 Task 6) will need to pass it either way."""
+    because the single-process assembly (dudamel.serve.serve) will need to
+    pass it either way."""
     sessions: SessionStore | None = getattr(app.state, "sessions", None)
     if sessions is None:
         raise RuntimeError(

@@ -1,5 +1,5 @@
-"""Acceptance tests for dudamel/widgets.py::run_widget (Plan 3 Task 1, Plan 4
-Task 1 timeout enforcement)."""
+"""Acceptance tests for dudamel/widgets.py::run_widget, including its
+timeout enforcement."""
 
 import asyncio
 

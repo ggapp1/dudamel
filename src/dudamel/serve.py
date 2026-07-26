@@ -1,9 +1,9 @@
-"""Single-process assembly (Plan 3 Task 6): the composition root that wires
-`Runtime`, `JobScheduler`, the FastAPI web surface (served by uvicorn), and
-the optional Telegram interface into one running process.
+"""Single-process assembly: the composition root that wires `Runtime`,
+`JobScheduler`, the FastAPI web surface (served by uvicorn), and the
+optional Telegram interface into one running process.
 
-THIN by Global Constraints: this module owns lifecycle *sequencing* only —
-zero business logic, zero LLM calls. `serve()`:
+Intentionally thin: this module owns lifecycle *sequencing* only — zero
+business logic, zero LLM calls. `serve()`:
 
   1. Acquires an exclusive instance lock at `data_dir/.dudamel.lock` via
      `fcntl.flock` on a persistent fd — a second `serve()` against the same
@@ -14,7 +14,7 @@ zero business logic, zero LLM calls. `serve()`:
      reclaim step.
   2. Builds a `Runtime` and `await`s `start()` (DB migrations).
   3. Starts `Runtime.scheduler` — constructed but not started by `Runtime`
-     itself (Task 2's design: only the assembly may start it).
+     itself (only this assembly function may start it).
   4. Builds the web app (`create_api` + `add_ui`) and binds it via uvicorn,
      in-process. `settings.web.port` is rewritten in place with the actual
      bound port once the socket exists, so a caller that requested `port=0`

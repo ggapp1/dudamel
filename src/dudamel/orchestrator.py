@@ -8,7 +8,7 @@ from dudamel.registry import Registry
 
 class Orchestrator:
     """Pure registration. All side effects (db, scheduler, bot, MCP) happen in
-    the run phase (`dudamel run`, Plan 3/4) — never at construction, so that
+    the run phase (`dudamel run`) — never at construction, so that
     `dudamel db migrate` and tests can import a project safely."""
 
     def __init__(self, apps: Sequence[App] = (), mcp: Sequence[str] = ()) -> None:

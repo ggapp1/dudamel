@@ -42,8 +42,9 @@ def scaffold(tmp_path: Path, name: str = "proj") -> Path:
 
 
 def test_scaffold_workouts_byte_identical_to_examples() -> None:
-    """Global Constraints: the scaffold's bundled app must be byte-identical
-    to the documented hero example."""
+    """The scaffold's bundled app must be byte-identical to the documented
+    hero example -- README.md's quickstart shows this file verbatim and
+    promises readers "this is the whole file"."""
     scaffold_copy = REPO_ROOT / "src" / "dudamel" / "scaffold_template" / "apps" / "workouts.py"
     hero = REPO_ROOT / "examples" / "workouts.py"
     assert scaffold_copy.read_bytes() == hero.read_bytes()

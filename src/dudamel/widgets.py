@@ -1,9 +1,9 @@
 """Widget execution: turns a registered Widget into dashboard-ready JSON.
 
-Thin runner — zero business logic, zero LLM calls (Global Constraints). A
-widget that raises, times out its own fn(), or returns a payload its renderer
-rejects must never take down the whole dashboard: it degrades to an error
-entry instead of propagating.
+Thin runner — zero business logic, zero LLM calls. A widget that raises,
+times out its own fn(), or returns a payload its renderer rejects must never
+take down the whole dashboard: it degrades to an error entry instead of
+propagating.
 """
 
 from __future__ import annotations

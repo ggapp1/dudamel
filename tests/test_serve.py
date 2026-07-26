@@ -399,8 +399,8 @@ async def test_telegram_started_and_bound_when_token_configured(
 async def test_no_telegram_interface_built_without_a_token(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Global Constraints: web always on; Telegram absent -> notify() stays
-    the Runtime WARN-log fallback."""
+    """The web dashboard always comes up; with no Telegram token configured,
+    notify() stays on the Runtime WARN-log fallback."""
     _FakeTelegram.instances.clear()
     monkeypatch.setattr(serve_module, "TelegramInterface", _FakeTelegram)
 

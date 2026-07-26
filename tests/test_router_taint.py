@@ -41,7 +41,7 @@ def make_registry() -> Registry:
         return "0"
 
     registry = Registry([app])
-    # graft a simulated MCP-origin tool the way Plan 4's mount will
+    # graft a simulated MCP-origin tool the way `Registry.add_mcp_tools` does
     mcp = Tool(
         name="web__fetch_page",
         app_name="web",
@@ -107,7 +107,7 @@ async def test_mutation_after_mcp_result_requires_confirm(tmp_path) -> None:
 
 
 async def test_failed_mcp_execution_still_taints(tmp_path) -> None:
-    """I3: an mcp-origin tool that RAISES must still taint the turn — the
+    """An mcp-origin tool that RAISES must still taint the turn — the
     subsequent native mutation is confirm-gated and does not execute, exactly
     as if the mcp call had succeeded."""
     script = [

@@ -1,4 +1,5 @@
-"""Acceptance tests for dudamel/web/ui.py (Plan 3 Task 4)."""
+"""Acceptance tests for dudamel/web/ui.py: the server-rendered HTMX
+dashboard."""
 
 from __future__ import annotations
 
@@ -152,7 +153,7 @@ async def test_chat_page_shows_message_text(tmp_path: Path, token_env: str) -> N
 async def test_chat_page_embedded_csrf_token_actually_works(tmp_path: Path, token_env: str) -> None:
     """The hidden #csrf-token field the chat page ships must be a genuine,
     currently-valid CSRF token for THIS session — usable against the real
-    (Task 3) /api/chat CSRF check, not a decorative placeholder."""
+    /api/chat CSRF check, not a decorative placeholder."""
     rt, _settings, transport = await build(tmp_path, [fake_text("ok!")])
     async with client(transport) as c:
         await login(c, token_env)

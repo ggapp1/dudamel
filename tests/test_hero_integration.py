@@ -1,4 +1,4 @@
-"""Plan 1 finish line: the hero app registers, migrates, and its tool and
+"""The hero (`workouts`) example app registers, migrates, and its tool and
 widget work end-to-end against a real SQLite database — no LLM involved."""
 
 import sys
@@ -33,7 +33,7 @@ async def test_hero_app_end_to_end(tmp_path: Path):
     assert generate_app_migration(orc, url, "init", tmp_path) is not None
     upgrade_apps(url, tmp_path)
 
-    # bind db and drive the tool exactly as the Plan 2 router will:
+    # bind db and drive the tool exactly as Router.handle() will:
     # coerce string-ish LLM args -> call the tool fn
     db = Database(url)
     workouts_app.bind_database(db)

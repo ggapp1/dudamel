@@ -1,4 +1,4 @@
-"""Acceptance tests for dudamel/scheduler.py::JobScheduler (Plan 3 Task 2)."""
+"""Acceptance tests for dudamel/scheduler.py::JobScheduler."""
 
 from __future__ import annotations
 
@@ -166,7 +166,9 @@ async def test_interval_job_uses_interval_trigger(tmp_path) -> None:
 
 
 async def test_job_registered_with_global_constraint_settings(tmp_path) -> None:
-    """coalesce/max_instances/misfire_grace_time per Global Constraints."""
+    """Every registered job must set coalesce/max_instances/misfire_grace_time
+    consistently, regardless of trigger type — a mis-set value on any one of
+    them lets a slow-running job pile up overlapping executions."""
     app = App("stats", description="d")
 
     @app.job(interval_seconds=60)
@@ -246,9 +248,10 @@ async def test_max_instances_listener_records_skipped_row(tmp_path) -> None:
 
 
 async def test_list_jobs_reports_next_fire_before_scheduler_starts(tmp_path) -> None:
-    """Plan 3 Task 4 (/jobs dashboard page): APScheduler leaves a pending
-    job's `next_run_time` attribute entirely unset until `start()` runs, so
-    list_jobs() must fall back to computing it from the trigger directly."""
+    """The /jobs dashboard page needs a next-fire estimate even before the
+    scheduler starts: APScheduler leaves a pending job's `next_run_time`
+    attribute entirely unset until `start()` runs, so list_jobs() must fall
+    back to computing it from the trigger directly."""
     app = App("stats", description="d")
 
     @app.job(cron="30 4 * * *")

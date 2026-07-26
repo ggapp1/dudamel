@@ -33,9 +33,9 @@ class App:
         self.tools: dict[str, Tool] = {}
         self.widgets: dict[str, Widget] = {}
         self.jobs: dict[str, Job] = {}
-        self._llm: Callable[..., Awaitable[Any]] | None = None  # bound in Plan 2
-        self._notify: Callable[..., Awaitable[None]] | None = None  # bound in Plan 3
-        self._database: Any | None = None  # bound in Task 9 tests / run phase
+        self._llm: Callable[..., Awaitable[Any]] | None = None  # bound by Runtime at run time
+        self._notify: Callable[..., Awaitable[None]] | None = None  # bound by Runtime at run time
+        self._database: Any | None = None  # bound by tests, or by Runtime at run time
         self._model_base: type | None = None
 
     # --- tools -------------------------------------------------------------
@@ -155,12 +155,14 @@ class App:
     # --- runtime capabilities ------------------------------------------------
     async def llm(self, *args: Any, **kwargs: Any) -> Any:
         if self._llm is None:
-            raise RuntimeNotBoundError("app.llm is bound at run time (Plan 2); not in tests/import")
+            raise RuntimeNotBoundError(
+                "app.llm is bound at run time by Runtime; not in tests/import"
+            )
         return await self._llm(*args, **kwargs)
 
     async def notify(self, *args: Any, **kwargs: Any) -> None:
         if self._notify is None:
-            raise RuntimeNotBoundError("app.notify is bound at run time (Plan 3)")
+            raise RuntimeNotBoundError("app.notify is bound at run time by Runtime")
         await self._notify(*args, **kwargs)
 
     async def to_thread(self, fn: Callable, *args: Any, **kwargs: Any) -> Any:

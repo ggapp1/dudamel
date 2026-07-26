@@ -1,10 +1,10 @@
-"""`dudamel` command-line entry point (Plan 4 Task 3) — the product's front
-door: `dudamel new/run/db migrate/doctor/token rotate`.
+"""`dudamel` command-line entry point — the product's front door: `dudamel
+new/run/db migrate/doctor/token rotate`.
 
-argparse only (Global Constraints: no click/typer). Every command below
-operates on the project in the CURRENT working directory (`new` is the one
-exception — it creates a project elsewhere) — this mirrors the scaffold's
-own README, which always tells you to `cd` into the project first.
+argparse only (no click/typer dependency). Every command below operates on
+the project in the CURRENT working directory (`new` is the one exception —
+it creates a project elsewhere) — this mirrors the scaffold's own README,
+which always tells you to `cd` into the project first.
 
 Errors are actionable sentences, never tracebacks: `main()` catches
 `DudamelError` (and its CLI-local subclass `CliError`) and any other

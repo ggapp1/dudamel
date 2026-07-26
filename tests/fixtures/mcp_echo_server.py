@@ -1,11 +1,12 @@
-"""Minimal stdio MCP server fixture for Plan 4 Task 2 acceptance tests.
+"""Minimal stdio MCP server fixture for the MCP-mounting acceptance tests.
 
 Exposes three tools:
 
 - ``echo(text)`` -- annotated ``readOnlyHint=True``; the mount must map this
   to a read-only dudamel Tool.
-- ``mutate(value)`` -- no annotations at all; per the Global Constraint,
-  unannotated MCP tools are treated as MUTATING (taint applies).
+- ``mutate(value)`` -- no annotations at all; dudamel treats an unannotated
+  MCP tool as MUTATING by default (taint applies), matching the router's
+  "unannotated == mutating" rule for anything it can't prove is safe.
 - ``read_env(name)`` -- annotated ``readOnlyHint=True``; returns
   ``os.environ.get(name, "")`` as observed by the SUBPROCESS, so tests can
   prove env-passthrough config actually reaches the spawned server (and that

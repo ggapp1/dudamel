@@ -1,6 +1,6 @@
-"""APScheduler wiring (Plan 3 Task 2): turns every registered Job into a
-running APScheduler job and records EVERY outcome (ok/error/timeout/misfired)
-as a `job_runs` row.
+"""APScheduler wiring: turns every registered Job into a running APScheduler
+job and records EVERY outcome (ok/error/timeout/misfired) as a `job_runs`
+row.
 
 Thin wrapper — the scheduler calls only `job.fn()`. Job functions are
 command-plane (unlike widgets): they may use `app.llm`/`app.notify`, but
@@ -9,7 +9,8 @@ fires); the scheduler itself never touches the LLM directly.
 
 Construction only registers jobs with the underlying `AsyncIOScheduler`
 (cheap, side-effect-free — safe to do in `Runtime.__init__`); nothing
-actually fires until `start()`, which the assembly (Plan 3 Task 6) calls.
+actually fires until `start()`, which the single-process assembly
+(dudamel.serve.serve) calls.
 """
 
 from __future__ import annotations
@@ -138,13 +139,14 @@ class JobScheduler:
             logger.warning("failed to record job_runs row for job %s: %s", job_id, e)
 
     def list_jobs(self) -> list[dict[str, Any]]:
-        """Registered jobs with a best-effort next-fire time (Plan 3 Task 4's
-        /jobs page). Computed from each job's trigger directly rather than
-        read off the APScheduler Job's `next_run_time` attribute: APScheduler
-        leaves that attribute entirely UNSET (not None -- absent) on a job
-        added before `start()` runs, and per Global Constraints the scheduler
-        is only started by the assembly (Task 6) -- the dashboard must still
-        work with a constructed-but-never-started scheduler."""
+        """Registered jobs with a best-effort next-fire time, for the
+        dashboard's /jobs page. Computed from each job's trigger directly
+        rather than read off the APScheduler Job's `next_run_time`
+        attribute: APScheduler leaves that attribute entirely UNSET (not
+        None -- absent) on a job added before `start()` runs, and since the
+        scheduler is only started by the single-process assembly, the
+        dashboard must still work with a constructed-but-never-started
+        scheduler."""
         now = datetime.now(UTC)
         jobs = []
         for job_id, aps_job in self._aps_jobs.items():

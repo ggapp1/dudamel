@@ -1,5 +1,4 @@
-"""Bearer-token / session-cookie auth + CSRF enforcement for the web API
-(Plan 3 Task 3, Global Constraints).
+"""Bearer-token / session-cookie auth + CSRF enforcement for the web API.
 
 A request is authenticated if it carries EITHER:
   - a valid ``Authorization: Bearer <token>`` header (constant-time compared
@@ -49,9 +48,10 @@ class _Session:
 
 
 class SessionStore:
-    """In-memory session table. The Global Constraints' single-process
-    assembly makes this sufficient — no cross-process session sharing is
-    required, and sessions are intentionally lost on restart."""
+    """In-memory session table. dudamel always runs as one single process
+    (see dudamel.serve.serve), which makes this sufficient — no cross-process
+    session sharing is required, and sessions are intentionally lost on
+    restart."""
 
     def __init__(self) -> None:
         self._sessions: dict[str, _Session] = {}

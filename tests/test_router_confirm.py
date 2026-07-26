@@ -187,13 +187,14 @@ async def test_unknown_confirmation_id(tmp_path) -> None:
     await db.dispose()
 
 
-# --- mandated adaptation tests (Task 11 strong-model review) ------------------
+# --- resume honesty: what a post-suspension model failure reports -----------
 
 
 async def test_post_approve_llm_error_reports_action_completed(tmp_path) -> None:
-    """DEVIATION: loop_state carries executed_any across the suspension gap.
-    After approve, the confirmed tool ran, so a model failure on resume must
-    honestly report the action completed — not that the model was unavailable."""
+    """loop_state carries executed_any across the suspension gap: after
+    approve, the confirmed tool ran, so a model failure on resume must
+    honestly report the action completed — not that the model was
+    unavailable."""
     script = [
         fake_tool_call("wipe_log", {"reason": "x"}),
         LLMError("connection reset", retryable=True),
@@ -207,8 +208,8 @@ async def test_post_approve_llm_error_reports_action_completed(tmp_path) -> None
 
 
 async def test_approve_with_failing_tool_reports_failure_honestly(tmp_path) -> None:
-    """Fix round 1: the confirmed tool RAISES and there is no prior success, so
-    a post-resume LLMError must report the model as unavailable — NOT falsely
+    """The confirmed tool RAISES and there is no prior success, so a
+    post-resume LLMError must report the model as unavailable — NOT falsely
     claim "I completed the action(s)"."""
 
     app = App("gym", description="d")
@@ -253,10 +254,10 @@ async def test_approve_with_failing_tool_reports_failure_honestly(tmp_path) -> N
 
 
 async def test_taint_survives_suspension_gap(tmp_path) -> None:
-    """DEVIATION: loop_state carries turn_tainted across the suspension gap.
-    An MCP result in the suspended batch taints the turn; after approving the
-    first mutation, a LATER native mutation (in an mcp-free batch) must still
-    be confirm-gated — proven by a SECOND pending confirmation, not execution."""
+    """loop_state carries turn_tainted across the suspension gap: an MCP
+    result in the suspended batch taints the turn; after approving the first
+    mutation, a LATER native mutation (in an mcp-free batch) must still be
+    confirm-gated — proven by a SECOND pending confirmation, not execution."""
     turn1 = Completion(
         message=Message(
             role="assistant",

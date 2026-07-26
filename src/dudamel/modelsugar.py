@@ -88,8 +88,8 @@ def _unwrap_optional(ann: object) -> tuple[object, bool]:
 def make_model_base(app_name: str) -> type:
     """Build a fresh declarative base + abstract `Model` for one app.
 
-    Each app gets its own `MetaData`/registry so table names, autogenerate
-    (Task 12), and metadata introspection (Task 10) stay app-scoped.
+    Each app gets its own `MetaData`/registry so table names, alembic
+    autogenerate, and metadata introspection all stay app-scoped.
     """
 
     class Base(DeclarativeBase):

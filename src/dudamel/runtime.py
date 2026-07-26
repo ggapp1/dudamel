@@ -1,5 +1,5 @@
-"""Composition root. Interfaces (Plan 3) call chat()/resolve_confirmation()
-and nothing else. Construction is in-memory only; start() touches the world."""
+"""Composition root. Interfaces call chat()/resolve_confirmation() and
+nothing else. Construction is in-memory only; start() touches the world."""
 
 from __future__ import annotations
 
@@ -57,8 +57,9 @@ class Runtime:
         )
         # Created here so Runtime construction (safe to do in tests / at
         # import-adjacent time) fully wires the process, but NOT started:
-        # only the assembly (Plan 3 Task 6) calls scheduler.start(), once
-        # everything else (db migrations, interfaces) is up.
+        # only the single-process assembly (dudamel.serve.serve) calls
+        # scheduler.start(), once everything else (db migrations,
+        # interfaces) is up.
         self.scheduler = JobScheduler(self._registry, self._db)
         for app in orchestrator.registry.apps.values():
             app.bind_database(self._db)
@@ -183,15 +184,15 @@ class Runtime:
         ]
 
     def bind_notify(self, fn: Callable[[str], Awaitable[None]]) -> None:
-        """Rebind every app's app.notify() to fn — used by the assembly
-        (Plan 3 Task 6) once an interface (e.g. Telegram) is up, replacing the
-        WARN-log fallback bound at construction time."""
+        """Rebind every app's app.notify() to fn — used by the single-process
+        assembly (dudamel.serve.serve) once an interface (e.g. Telegram) is
+        up, replacing the WARN-log fallback bound at construction time."""
         for app in self._registry.apps.values():
             app._notify = fn
 
     async def db_ping(self) -> None:
-        """Cheap DB liveness probe for GET /health (Plan 3 Task 3) — touches
-        the database without any business logic; raises if the DB is down."""
+        """Cheap DB liveness probe for GET /health — touches the database
+        without any business logic; raises if the DB is down."""
         async with self._db.session() as s:
             await s.execute(select(1))
 
@@ -201,17 +202,17 @@ class Runtime:
         return list(await asyncio.gather(*(run_widget(w) for w in self._registry.widgets)))
 
     async def recent_messages(self, channel: str, limit: int = 200) -> list[dict[str, Any]]:
-        """Chat history for `channel` — used by the dashboard's /chat page
-        (Plan 3 Task 4). Creates the conversation if it doesn't exist yet
-        (mirrors chat()'s read-or-create); an empty history is a normal
-        result, not an error."""
+        """Chat history for `channel` — used by the dashboard's /chat page.
+        Creates the conversation if it doesn't exist yet (mirrors chat()'s
+        read-or-create); an empty history is a normal result, not an
+        error."""
         conversation_id = await self._convo.get_or_create(channel)
         messages = await self._convo.recent(conversation_id, limit)
         return [m.to_dict() for m in messages]
 
     async def list_activity(self, limit: int = 100) -> list[dict[str, Any]]:
         """Most recent activity (tool execution) rows, newest first — used by
-        the dashboard's /activity page (Plan 3 Task 4)."""
+        the dashboard's /activity page."""
         stmt = select(Activity).order_by(Activity.id.desc()).limit(limit)
         async with self._db.session() as s:
             rows = (await s.execute(stmt)).scalars().all()
@@ -229,7 +230,7 @@ class Runtime:
 
     async def list_job_runs(self, limit: int = 50) -> list[dict[str, Any]]:
         """Most recent job_runs rows, newest first — used by the dashboard's
-        /jobs page (Plan 3 Task 4)."""
+        /jobs page."""
         stmt = select(JobRun).order_by(JobRun.id.desc()).limit(limit)
         async with self._db.session() as s:
             rows = (await s.execute(stmt)).scalars().all()
@@ -247,9 +248,9 @@ class Runtime:
 
     def list_jobs(self) -> list[dict[str, Any]]:
         """Registered jobs with a best-effort next-fire time — used by the
-        dashboard's /jobs page (Plan 3 Task 4). Delegates to JobScheduler,
-        which can answer this whether or not the scheduler has actually been
-        started (Global Constraints: only the assembly calls start())."""
+        dashboard's /jobs page. Delegates to JobScheduler, which can answer
+        this whether or not the scheduler has actually been started (only
+        the single-process assembly calls start(), not Runtime itself)."""
         return self.scheduler.list_jobs()
 
     async def stop(self) -> None:

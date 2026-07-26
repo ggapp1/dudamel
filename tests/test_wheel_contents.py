@@ -1,9 +1,9 @@
-"""`uv build` sanity (Plan 4 Task 4): the shipped wheel must actually contain
-the scaffold template, web templates/static assets, and both migrations
-trees -- a future pyproject.toml packaging regression (e.g. an errant
-`packages =` edit) would otherwise ship a broken `dudamel new`/`dudamel run`
-silently, since the test suite itself runs against the editable install, not
-a built wheel."""
+"""`uv build` sanity: the shipped wheel must actually contain the scaffold
+template, the deploy (launchd/systemd) templates, web templates/static
+assets, and both migrations trees -- a future pyproject.toml packaging
+regression (e.g. an errant `packages =` edit) would otherwise ship a broken
+`dudamel new`/`dudamel run` silently, since the test suite itself runs
+against the editable install, not a built wheel."""
 
 from __future__ import annotations
 

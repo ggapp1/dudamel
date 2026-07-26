@@ -81,11 +81,11 @@ class Router:
     def refresh_tool_specs(self) -> None:
         """Rebuild the tool specs offered to the model from the registry's
         current tool set. Tool registration is normally frozen at Router
-        construction, but Plan 4's MCP mount adds tools to the (shared)
-        Registry object later, during `Runtime.start()` -- after this Router
-        already exists. `Runtime.start()` calls this once mounting is done so
-        those tools actually reach the LLM instead of silently existing only
-        in `registry.tools`."""
+        construction, but MCP mounting adds tools to the (shared) Registry
+        object later, during `Runtime.start()` -- after this Router already
+        exists. `Runtime.start()` calls this once mounting is done so those
+        tools actually reach the LLM instead of silently existing only in
+        `registry.tools`."""
         if len(self._registry.tools) > self._config.max_tools:
             raise RegistryError(
                 f"{len(self._registry.tools)} tools registered but router max_tools is "
@@ -166,8 +166,11 @@ class Router:
         executed_any: bool,
         initial_taint: bool = False,
     ) -> ChatReply:
-        # DEVIATION (Task 11 review): resumes seed taint from the suspended
-        # turn's stored flag so MCP taint survives the suspension gap.
+        # Seeded from the suspended turn's stored taint flag rather than
+        # reset to False, so MCP-origin taint survives a confirm-gate
+        # suspension: without this, a resumed turn would forget it had
+        # already seen untrusted output and let a later native mutating call
+        # skip the taint-forced confirm gate.
         turn_tainted = initial_taint
         for iteration in range(start_iteration, self._config.iteration_cap):
             history = await self._convo.recent(conv_id)
@@ -264,7 +267,7 @@ class Router:
         async def run_one(call: ToolCall) -> Message:
             tool = self._registry.tools[call.name]
             if tool.origin == "mcp":
-                # I3: taint on EVERY mcp-origin outcome — validation error,
+                # Taint on EVERY mcp-origin outcome — validation error,
                 # timeout, exception, or success — not just success. A
                 # raising/timing-out MCP tool still feeds attacker-influenceable
                 # error text to the model and must not escape the taint gate.
@@ -355,7 +358,8 @@ class Router:
                         is_error=True,
                     )
                 )
-            # "pending" gets its result at resolution time (Task 12)
+            # "pending" gets its result at resolution time, once the user
+            # approves or declines it (see resolve_confirmation() below).
         return outcome
 
     async def _suspend(
@@ -387,9 +391,10 @@ class Router:
                         "pending_call_id": call.id,
                         "iteration": iteration,
                         "tier": tier,
-                        # DEVIATION (Task 11 review): persist the loop's
-                        # executed_any and taint at suspension so resume can
-                        # report honestly and keep MCP taint across the gap.
+                        # Persisted so resume can report honestly (did an
+                        # earlier tool call in this turn already succeed?)
+                        # and keep MCP-origin taint intact across the
+                        # suspension gap rather than silently losing it.
                         "executed_any": executed_any,
                         "turn_tainted": turn_tainted,
                     },
@@ -488,9 +493,12 @@ class Router:
                     row.status = "confirmed" if approved else "declined"
                     expired = False
             state = row.loop_state
-            # DEVIATION (Task 11 review): honest resume state — the stored
-            # executed_any (pre-suspension side effects) OR any successful
-            # result in the suspended batch; taint carried across the gap.
+            # Resume state must stay honest: the stored executed_any
+            # (pre-suspension side effects) OR any successful result in the
+            # suspended batch, with taint carried across the gap too --
+            # otherwise a resumed turn could under- or over-report what
+            # actually happened, or forget it had already seen untrusted
+            # (MCP) output.
             stored_executed_any = state.get("executed_any", False)
             results_have_success = any(not d.get("is_error", False) for d in state["results"])
             initial_taint = state.get("turn_tainted", False)
@@ -531,12 +539,12 @@ class Router:
             for d in state["results"]:
                 await self._convo.append(row.conversation_id, Message.from_dict(d))
             await self._convo.append(row.conversation_id, result)
-            # DEVIATION (Fix round 1 review): mirror the deny path's honesty —
-            # executed_any must reflect whether ANY tool actually succeeded
-            # (pre-suspension successes, suspended-batch successes, or this
-            # just-run confirmed call), not unconditionally True. A confirmed
-            # tool that raised must not make a post-resume LLMError claim
-            # "I completed the action(s)" when nothing actually succeeded.
+            # Mirrors the deny path's honesty above: executed_any must
+            # reflect whether ANY tool actually succeeded (pre-suspension
+            # successes, suspended-batch successes, or this just-run
+            # confirmed call), not unconditionally True. A confirmed tool
+            # that raised must not make a post-resume LLMError claim "I
+            # completed the action(s)" when nothing actually succeeded.
             executed_any = stored_executed_any or results_have_success or (not result.is_error)
             return await self._loop(
                 row.conversation_id,

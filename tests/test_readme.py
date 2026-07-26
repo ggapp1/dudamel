@@ -1,7 +1,7 @@
-"""Acceptance test (Plan 4 Task 4): the `workouts` example embedded in
-README.md's quickstart must stay byte-identical to examples/workouts.py --
-the README promises readers "this is the whole file", so any drift between
-the two would make the README lie about the hero app."""
+"""Acceptance test: the `workouts` example embedded in README.md's
+quickstart must stay byte-identical to examples/workouts.py -- the README
+promises readers "this is the whole file", so any drift between the two
+would make the README lie about the hero app."""
 
 from __future__ import annotations
 

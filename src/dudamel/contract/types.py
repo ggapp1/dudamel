@@ -20,7 +20,7 @@ class Tool:
     read_only: bool
     confirm: bool
     timeout: float
-    origin: str = "native"  # "native" | "mcp" (Plan 4)
+    origin: str = "native"  # "native" | "mcp" (mounted via mcp_mount.py)
 
 
 @dataclass
