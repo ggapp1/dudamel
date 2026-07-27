@@ -1,0 +1,62 @@
+name: Release
+
+# Publishes to PyPI when a v* tag is pushed. Authentication is PyPI's trusted
+# publishing (OIDC): the `id-token: write` permission below lets this workflow
+# mint a short-lived token at run time, so no API token is stored in repository
+# secrets or on anyone's machine.
+#
+# A PyPI upload is final — a version number can never be reused, even after the
+# release is deleted. Everything that can fail cheaply (tag/version agreement,
+# lint, tests, build) therefore runs before the publish step.
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    env:
+      # Pin the interpreter for sync AND every `uv run`. Left unset, uv may
+      # prefer whatever system Python satisfies requires-python, which is not
+      # necessarily the one this release was tested against.
+      UV_PYTHON: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          python-version: "3.12"
+
+      - name: Check the tag matches the package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(uv run --no-project python -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          if [ "$tag" != "$version" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match pyproject version ${version}" >&2
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Lint (ruff check)
+        run: uv run ruff check src tests examples
+
+      - name: Format check (ruff format)
+        run: uv run ruff format --check src tests examples
+
+      - name: Test
+        run: uv run pytest -q
+
+      - name: Build
+        run: uv build
+
+      - name: Publish to PyPI
+        # `always` rather than the default `automatic`: fail loudly if the OIDC
+        # exchange is unavailable instead of silently falling back to looking
+        # for a token that does not exist.
+        run: uv publish --trusted-publishing always
