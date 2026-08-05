@@ -24,12 +24,12 @@ jobs:
       # necessarily the one this release was tested against.
       UV_PYTHON: "3.12"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v3
-        with:
-          python-version: "3.12"
+        # Pinned exactly: setup-uv stopped publishing floating major tags at
+        # v8, so `@v9` does not resolve and must never be used here.
+        uses: astral-sh/setup-uv@v9.0.0
 
       - name: Check the tag matches the package version
         run: |
