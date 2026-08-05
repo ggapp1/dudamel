@@ -1,0 +1,77 @@
+name: Fresh deps
+
+# Re-resolves every dependency against the live index, ignoring uv.lock, and
+# runs the full suite against the result. uv.lock pins versions, so the
+# ordinary CI workflow structurally cannot see a dependency shipping a
+# breaking release -- only a from-scratch resolve can, which is what every
+# new user gets.
+#
+# Informational, never release-blocking: a failure here means the outside
+# world changed, not that this branch is wrong. The job name is deliberately
+# NOT `test` -- that string is a required status check on main, and a run
+# against a pull-request SHA would otherwise satisfy or block merges.
+#
+# GitHub disables scheduled workflows on public repositories after 60 days
+# with no repository activity, so workflow_dispatch is the fallback and a
+# manual fresh resolve is part of the release checklist.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  fresh:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.14"]
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          # This lane must be unambiguously fresh; a restored cache would
+          # muddy what "resolved today" means.
+          enable-cache: false
+
+      - name: Re-resolve every dependency against the live index
+        run: uv lock --upgrade
+
+      - name: Show what moved
+        run: git --no-pager diff --stat uv.lock
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Test
+        # Never -m 'not slow': the slow lane is the fresh-resolve lane. It
+        # builds a wheel, scaffolds a project and shells out to a real
+        # `uv run`, which is the only place a from-scratch resolution of the
+        # published package is actually exercised.
+        run: uv run pytest -q
+
+      - name: Report a failure as an issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Fresh dependency resolve is failing (py${{ matrix.python-version }})"
+          existing="$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number')"
+          body="The weekly fresh-resolve run failed on Python ${{ matrix.python-version }}.
+          A dependency released something that breaks a from-scratch install --
+          which is what every new user gets, and what uv.lock hides from ordinary CI.
+
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
