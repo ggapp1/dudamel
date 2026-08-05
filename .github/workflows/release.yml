@@ -41,7 +41,7 @@ jobs:
           fi
 
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --locked
 
       - name: Lint (ruff check)
         run: uv run ruff check src tests examples
