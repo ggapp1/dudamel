@@ -1,0 +1,15 @@
+# Complements .github/workflows/freshdeps.yml. That workflow re-resolves
+# within the declared constraints, so it can only see drift a cap allows;
+# this one reports a new MAJOR of a capped dependency, which is the signal
+# that a cap should be considered for raising.
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
