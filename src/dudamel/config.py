@@ -39,6 +39,11 @@ class WebConfig(BaseModel):
     port: int = 8787
     token_env: str = "DUDAMEL_WEB_TOKEN"
     allowed_hosts: list[str] = ["localhost", "127.0.0.1"]
+    # Peers whose X-Forwarded-For dudamel will believe. Empty means forwarded
+    # headers are ignored entirely and the client address is always the real
+    # peer. Only list a proxy you actually run: anything here can name any
+    # client it likes.
+    trusted_proxies: list[str] = []
 
 
 class TelegramConfig(BaseModel):

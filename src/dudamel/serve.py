@@ -253,6 +253,13 @@ async def serve(
                 # connection that never finishes on its own must not hang
                 # the whole ordered shutdown sequence indefinitely.
                 timeout_graceful_shutdown=20,
+                # Explicit, because uvicorn's own default is proxy_headers=True
+                # with 127.0.0.1 already trusted: left unset, a local reverse
+                # proxy's X-Forwarded-For would silently decide what
+                # `request.client.host` is. Nothing is trusted unless the
+                # operator names it.
+                proxy_headers=bool(settings.web.trusted_proxies),
+                forwarded_allow_ips=list(settings.web.trusted_proxies),
             )
             server = _prepare_uvicorn(config)
             await server.startup()
