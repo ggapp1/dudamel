@@ -64,7 +64,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           title="Fresh dependency resolve is failing (py${{ matrix.python-version }})"
-          existing="$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number')"
+          # `// empty` is load-bearing: on no match the array is [], and a
+          # bare `.[0].number` prints the string "null", which is non-empty
+          # and would send the comment branch to `gh issue comment null`.
+          existing="$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')"
           body="The weekly fresh-resolve run failed on Python ${{ matrix.python-version }}.
           A dependency released something that breaks a from-scratch install --
           which is what every new user gets, and what uv.lock hides from ordinary CI.
