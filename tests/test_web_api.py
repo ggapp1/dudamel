@@ -291,3 +291,46 @@ def test_loopback_with_token_does_not_warn(
     with caplog.at_level(logging.WARNING):
         create_api(rt, settings)
     assert not any("dashboard login impossible" in r.message for r in caplog.records)
+
+
+# --- channel namespace ---------------------------------------------------------
+
+
+async def test_chat_rejects_a_channel_outside_the_web_namespace(
+    tmp_path: Path, token_env: str
+) -> None:
+    """The channel names the conversation the message joins, and handling a
+    message auto-declines that conversation's pending confirmations. Left
+    unrestricted, a web caller could decline a Telegram user's pending action
+    and write into their history."""
+    rt, transport = await build(tmp_path, [fake_text("hi")])
+    try:
+        async with client(transport) as c:
+            headers = {"Authorization": f"Bearer {TOKEN}"}
+            bad = await c.post(
+                "/api/chat",
+                json={"text": "decline that", "channel": "telegram:12345"},
+                headers=headers,
+            )
+            assert bad.status_code == 400
+            assert "web:" in bad.json()["detail"]
+
+            ok = await c.post(
+                "/api/chat", json={"text": "hi", "channel": "web:other"}, headers=headers
+            )
+            assert ok.status_code == 200
+    finally:
+        await rt.stop()
+
+
+async def test_chat_default_channel_is_accepted(tmp_path: Path, token_env: str) -> None:
+    rt, transport = await build(tmp_path, [fake_text("hi")])
+    try:
+        async with client(transport) as c:
+            resp = await c.post(
+                "/api/chat", json={"text": "hi"}, headers={"Authorization": f"Bearer {TOKEN}"}
+            )
+            assert resp.status_code == 200
+            assert resp.json()["text"] == "hi"
+    finally:
+        await rt.stop()
