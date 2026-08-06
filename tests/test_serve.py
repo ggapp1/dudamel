@@ -577,3 +577,67 @@ def test_uvicorn_internals_serve_relies_on_still_exist() -> None:
     prepared = _prepare_uvicorn(config)
     assert config.loaded is True
     assert hasattr(prepared, "lifespan")
+
+
+# --- forwarded-header trust: proxy_headers wiring ------------------------------
+
+
+async def test_forwarded_headers_are_not_trusted_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """uvicorn enables proxy_headers by default and rewrites the client
+    address from X-Forwarded-For for any peer in its trusted list -- which
+    includes 127.0.0.1 out of the box. Left alone, a header would decide who
+    the client is. Nothing here trusts a proxy unless one is configured."""
+    captured: dict[str, object] = {}
+    real_config = uvicorn.Config
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return real_config(*args, **kwargs)
+
+    # Patched on the module object itself, not via the dotted string
+    # "dudamel.serve.uvicorn.Config" -- pytest's string resolver walks
+    # attributes starting from `dudamel`, and `dudamel.serve` is the
+    # `serve` function by the time this runs (see the `serve_module`
+    # comment above), not the submodule, so it can't continue on to
+    # `.uvicorn.Config` from there. `uvicorn` is the same module object
+    # everywhere it's imported, so patching it here reaches the
+    # `uvicorn.Config(...)` call inside `serve.py` too.
+    monkeypatch.setattr(uvicorn, "Config", spy)
+
+    settings = make_settings(tmp_path)
+    orc = Orchestrator(apps=[])
+    task = asyncio.create_task(serve(orc, settings, providers={"standard": FakeProvider([])}))
+    try:
+        await wait_for_port(settings)
+        assert captured["proxy_headers"] is False
+        assert captured["forwarded_allow_ips"] == []
+    finally:
+        await cancel_and_await(task)
+
+
+async def test_configured_trusted_proxies_enable_forwarded_headers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Naming a peer in `[web] trusted_proxies` is what turns forwarded-header
+    trust back on, scoped to exactly the peers listed."""
+    captured: dict[str, object] = {}
+    real_config = uvicorn.Config
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return real_config(*args, **kwargs)
+
+    monkeypatch.setattr(uvicorn, "Config", spy)  # see comment in the test above
+
+    settings = make_settings(tmp_path)
+    settings.web.trusted_proxies = ["127.0.0.1"]
+    orc = Orchestrator(apps=[])
+    task = asyncio.create_task(serve(orc, settings, providers={"standard": FakeProvider([])}))
+    try:
+        await wait_for_port(settings)
+        assert captured["proxy_headers"] is True
+        assert captured["forwarded_allow_ips"] == ["127.0.0.1"]
+    finally:
+        await cancel_and_await(task)
