@@ -92,14 +92,16 @@ class ConversationStore:
         caller of this method ignores return values, so swallowing a genuine
         integrity failure here would lose messages in silence.
 
-        The per-message `flush()` is not about SQLite, where `add_all` plus a
-        single commit already emits one INSERT per row in list order. It is
-        about Postgres: `add_all` folds into a single multi-row INSERT via
-        insertmanyvalues, and while SQLAlchemy guarantees the returned primary
-        keys correlate to the right objects, nothing guarantees the sequence
-        assigns them in VALUES order -- and `recent()` orders by id, so a
-        reordered group would put tool results before the assistant message
-        that called them.
+        Each message is flushed individually so that at most one row is ever
+        pending. That keeps ordering independent of how a given backend and
+        driver version choose to emit a batch: SQLAlchemy's insertmanyvalues
+        path can fold several pending rows into one multi-row INSERT ...
+        RETURNING, and neither SQLite nor Postgres documents the order in
+        which such a statement assigns primary keys. `recent()` orders by id,
+        so a group whose tool results outranked the assistant message that
+        called them would read back scrambled -- and a history like that is
+        rejected outright by provider APIs. One row per flush sidesteps the
+        question rather than depending on any backend's current behaviour.
         """
         if not messages:
             return
