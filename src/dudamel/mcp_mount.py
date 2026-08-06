@@ -14,9 +14,15 @@ sanitized to `dudamel.contract.types.TOOL_NAME_RE`
 protocol already gives us a stable identity, so we don't need to parse argv.
 
 `readOnlyHint` is honored; a tool with no annotations at all -- the MCP spec
-leaves annotations fully optional -- is treated as MUTATING, matching the
-router's existing "unannotated == mutating" default for anything it can't
-prove is safe.
+leaves annotations fully optional -- is treated as MUTATING. That
+classification is load-bearing: once a turn has seen any mcp output, the
+router confirm-gates every mutating tool it is asked to run, mcp-origin ones
+included.
+
+Note what this does NOT defend against: annotations are self-reported by the
+server, so a hostile one can declare a destructive tool `readOnlyHint: true`
+and skip the gate. The real trust boundary is which servers the operator
+chooses to mount.
 
 Server-initiated callbacks (sampling / elicitation / roots) are refused
 explicitly and immediately -- never left to the SDK default of hanging or

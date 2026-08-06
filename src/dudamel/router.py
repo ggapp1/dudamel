@@ -235,11 +235,36 @@ class Router:
         return False
 
     def _needs_confirm(self, tool: Tool, *, turn_tainted: bool, batch_has_mcp: bool) -> bool:
+        """Whether this call must be approved by the user before it runs.
+
+        The taint rule: once a turn has seen output from an untrusted (mcp)
+        tool, anything the model does next may be acting on injected
+        instructions rather than the user's request, so mutations stop and ask.
+
+        The two origins are gated on deliberately different signals:
+
+        - A NATIVE mutation is gated once the turn is tainted, and also when
+          the same batch contains an mcp call. The batch clause is defensive:
+          the calls were chosen together, and pairing a fetch with a write in
+          one batch is the shape an injection attempt takes.
+        - An MCP mutation is gated on turn taint ONLY. Adding the batch clause
+          would gate every mutating mcp tool unconditionally -- such a tool
+          makes `batch_has_mcp` true by its own presence -- which is exactly
+          the confirm-on-everything outcome that makes mcp unusable. Before a
+          single mcp result has been seen there is nothing injected to act on.
+
+        Read-only tools are never gated, whatever their origin; fetch and
+        search are the common case and must stay frictionless.
+        """
         if tool.confirm:
             return True
         if self._config.taint_mode == "off":
             return False
-        return tool.origin == "native" and not tool.read_only and (turn_tainted or batch_has_mcp)
+        if tool.read_only:
+            return False
+        if tool.origin == "native":
+            return turn_tainted or batch_has_mcp
+        return turn_tainted
 
     async def _execute_batch(
         self, conv_id: int, calls: list[ToolCall], *, turn_tainted: bool
