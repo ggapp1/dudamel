@@ -220,9 +220,7 @@ class Router:
                     executed_any=executed_any,
                     turn_tainted=turn_tainted,
                 )
-            await self._convo.append(conv_id, msg)
-            for r in outcome.results:
-                await self._convo.append(conv_id, r)
+            await self._convo.append_many(conv_id, [msg, *outcome.results])
         return ChatReply(
             text="I couldn't finish within the step limit — the request may be "
             "too complex; try narrowing it."
@@ -445,21 +443,21 @@ class Router:
         """Append the suspended assistant turn, its already-run results, and a
         final error result for the un-run pending call — in that order — so the
         persisted history never carries an assistant tool_call without a
-        matching tool result. Appends commit per-message (see self-review notes
-        on the crash window); the ordering guarantees a valid pairing on the
-        success path."""
+        matching tool result. The group is written in a single transaction, so
+        a crash cannot interleave it."""
         state = row.loop_state
-        await self._convo.append(row.conversation_id, Message.from_dict(state["assistant"]))
-        for d in state["results"]:
-            await self._convo.append(row.conversation_id, Message.from_dict(d))
-        await self._convo.append(
+        await self._convo.append_many(
             row.conversation_id,
-            Message(
-                role="tool",
-                text=note,
-                tool_call_id=state["pending_call_id"],
-                is_error=True,
-            ),
+            [
+                Message.from_dict(state["assistant"]),
+                *(Message.from_dict(d) for d in state["results"]),
+                Message(
+                    role="tool",
+                    text=note,
+                    tool_call_id=state["pending_call_id"],
+                    is_error=True,
+                ),
+            ],
         )
 
     async def resolve_confirmation(
@@ -535,10 +533,14 @@ class Router:
             # final result are appended, so no dangling tool_call persists.
             call = ToolCall(id=state["pending_call_id"], name=row.tool, args=dict(row.args))
             result = await self._execute_confirmed(row.conversation_id, call)
-            await self._convo.append(row.conversation_id, Message.from_dict(state["assistant"]))
-            for d in state["results"]:
-                await self._convo.append(row.conversation_id, Message.from_dict(d))
-            await self._convo.append(row.conversation_id, result)
+            await self._convo.append_many(
+                row.conversation_id,
+                [
+                    Message.from_dict(state["assistant"]),
+                    *(Message.from_dict(d) for d in state["results"]),
+                    result,
+                ],
+            )
             # Mirrors the deny path's honesty above: executed_any must
             # reflect whether ANY tool actually succeeded (pre-suspension
             # successes, suspended-batch successes, or this just-run

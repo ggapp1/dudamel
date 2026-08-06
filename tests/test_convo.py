@@ -186,3 +186,49 @@ async def test_recent_respects_limit(store: ConversationStore) -> None:
         await store.append(cid, Message(role="user", text=str(i)))
     msgs = await store.recent(cid, limit=4)
     assert [m.text for m in msgs] == ["6", "7", "8", "9"]  # last 4, chronological
+
+
+async def test_append_many_preserves_order(store: ConversationStore) -> None:
+    cid = await store.get_or_create("t:batch-order")
+    await store.append(cid, Message(role="user", text="go"))
+    await store.append_many(
+        cid,
+        [
+            Message(role="assistant", tool_calls=[ToolCall(id="a", name="t", args={})]),
+            Message(role="tool", text="first", tool_call_id="a"),
+            Message(role="tool", text="second", tool_call_id="a"),
+        ],
+    )
+    msgs = await store.recent(cid)
+    assert [m.role for m in msgs] == ["user", "assistant", "tool", "tool"]
+    assert [m.text for m in msgs[2:]] == ["first", "second"]
+
+
+async def test_append_many_is_all_or_nothing(store: ConversationStore) -> None:
+    """A failure partway through the batch must leave ZERO rows from it --
+    that is the whole point of the primitive. Injected by making the second
+    message's to_dict() raise, after the first has already been added to the
+    session."""
+    cid = await store.get_or_create("t:batch-atomic")
+    before = len(await store.recent(cid))
+
+    class _Exploding(Message):
+        def to_dict(self):  # type: ignore[override]
+            raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await store.append_many(
+            cid,
+            [
+                Message(role="assistant", text="kept?"),
+                _Exploding(role="tool", text="never", tool_call_id="x"),
+            ],
+        )
+
+    assert len(await store.recent(cid)) == before
+
+
+async def test_append_many_empty_is_a_noop(store: ConversationStore) -> None:
+    cid = await store.get_or_create("t:batch-empty")
+    await store.append_many(cid, [])
+    assert await store.recent(cid) == []

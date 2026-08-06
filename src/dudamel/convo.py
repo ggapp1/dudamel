@@ -76,6 +76,44 @@ class ConversationStore:
             return False
         return True
 
+    async def append_many(self, conversation_id: int, messages: list[Message]) -> None:
+        """Append several messages in ONE transaction.
+
+        Exists for the assistant-plus-tool-results group: appended one at a
+        time, a crash between the assistant's tool_calls message and its
+        results leaves a persisted tool_call nothing ever answers. One
+        transaction makes the group all-or-nothing.
+
+        Deliberately does NOT take a `client_msg_id`: only the single-message
+        `append` above is ever handed one (the inbound user message), so
+        there is no dedupe path here to get subtly wrong. Equally deliberately,
+        this RAISES rather than returning a bool -- `append`'s blanket
+        `except IntegrityError: return False` is a dedupe signal, and every
+        caller of this method ignores return values, so swallowing a genuine
+        integrity failure here would lose messages in silence.
+
+        The per-message `flush()` is not about SQLite, where `add_all` plus a
+        single commit already emits one INSERT per row in list order. It is
+        about Postgres: `add_all` folds into a single multi-row INSERT via
+        insertmanyvalues, and while SQLAlchemy guarantees the returned primary
+        keys correlate to the right objects, nothing guarantees the sequence
+        assigns them in VALUES order -- and `recent()` orders by id, so a
+        reordered group would put tool results before the assistant message
+        that called them.
+        """
+        if not messages:
+            return
+        async with self._db.session() as s:
+            for message in messages:
+                s.add(
+                    MessageRow(
+                        conversation_id=conversation_id,
+                        role=message.role,
+                        content=message.to_dict(),
+                    )
+                )
+                await s.flush()
+
     async def recent(self, conversation_id: int, limit: int = 200) -> list[Message]:
         async with self._db.session() as s:
             rows = (
