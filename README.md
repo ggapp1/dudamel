@@ -28,7 +28,7 @@ Apps are code, not configuration:
 Safety is enforced in front of every tool call, not left to a system
 prompt: **confirm gates** stop and wait for explicit approval before
 running anything marked as needing it; the **taint rule** forces the same
-approval step onto native mutating tools once a turn has seen output from
+approval step onto mutating tools once a turn has seen output from
 a less-trusted source (currently: MCP); and per-tier **token budgets** are
 checked server-side before each model call, not just documented as a
 limit.
@@ -164,10 +164,10 @@ comments at the top of each file for the exact install steps.
   what the model asked for. The same user has to approve it explicitly.
 - **The taint rule**: tool output is treated as data, not instruction. Once
   a turn has seen a result from a less-trusted source (an MCP tool), any
-  native tool call in that turn that isn't marked `read_only=True` is
-  forced through a confirm gate too — even if it wasn't registered with
-  `confirm=True`. A tool with no safety annotation defaults to "mutating"
-  until proven otherwise.
+  further mutating tool call in that turn — native or MCP — that isn't
+  marked `read_only=True` is forced through a confirm gate too, even if it
+  wasn't registered with `confirm=True`. A tool with no safety annotation
+  defaults to "mutating" until proven otherwise.
 - **Token budgets**: `[llm.budget] daily_tokens` in `dudamel.toml` sets a
   hard per-day ceiling per tier, enforced before each call — a runaway
   loop or a misbehaving job can't spend past it.

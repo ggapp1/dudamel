@@ -151,10 +151,11 @@ async def test_native_mutation_gated_after_mounted_readonly_mcp_call(tmp_path: P
 
 async def test_unannotated_mcp_tool_call_succeeds_and_still_taints(tmp_path: Path) -> None:
     """fixture__mutate carries no annotations, so Tool.read_only is False --
-    but router semantics never confirm-gate an mcp-origin call itself (the
-    gate protects NATIVE mutations from data an mcp call introduced). Calling
-    it must succeed, AND still taint the turn so a following native mutation
-    is gated."""
+    it is treated as mutating. Calling it as the FIRST thing a clean turn
+    does must still succeed: nothing untrusted has been seen yet, so there
+    is nothing injected to act on, and gating here would confirm-prompt
+    every mcp write. It must also taint the turn, so a following mutation
+    -- native or mcp -- is gated."""
     mutated: list[str] = []
     app = App("notes", description="d")
 
