@@ -334,3 +334,33 @@ async def test_chat_default_channel_is_accepted(tmp_path: Path, token_env: str) 
             assert resp.json()["text"] == "hi"
     finally:
         await rt.stop()
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1", "127.0.0.5"])
+def test_loopback_hosts_are_recognised(host: str) -> None:
+    from dudamel.web.api import is_loopback_host
+
+    assert is_loopback_host(host)
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.10", "example.com", ""])
+def test_non_loopback_hosts_are_recognised(host: str) -> None:
+    from dudamel.web.api import is_loopback_host
+
+    assert not is_loopback_host(host)
+
+
+async def test_localhost_bind_without_token_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Binding to `localhost` is a loopback bind. Refusing to start without a
+    token there treated a safe configuration as an unsafe one."""
+    monkeypatch.delenv("DUDAMEL_WEB_TOKEN", raising=False)
+    orc = make_orc()
+    settings = make_settings(tmp_path, web=WebConfig(host="localhost"))
+    rt = Runtime(orc, settings, providers={"standard": FakeProvider([])})
+    await rt.start()
+    try:
+        create_api(rt, settings)  # must not raise
+    finally:
+        await rt.stop()

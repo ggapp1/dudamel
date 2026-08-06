@@ -5,6 +5,7 @@ zero LLM calls live here.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import secrets
 from typing import Any
@@ -26,7 +27,7 @@ from dudamel.web.auth import (
 
 logger = logging.getLogger("dudamel.web.api")
 
-__all__ = ["create_api"]
+__all__ = ["create_api", "is_loopback_host"]
 
 # Every channel this surface may write to. The channel selects the
 # conversation a message joins, and handling a message auto-declines that
@@ -51,17 +52,36 @@ class ConfirmRequest(BaseModel):
     approved: bool
 
 
+def is_loopback_host(host: str) -> bool:
+    """Whether binding to `host` keeps the surface on this machine.
+
+    A literal comparison against "127.0.0.1" gets both directions wrong:
+    "localhost" and "::1" are loopback binds that would be treated as
+    off-box exposure, while the check that matters -- catching "0.0.0.0" and
+    real interface addresses -- is unaffected by doing this properly.
+    """
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        # A hostname that isn't an address literal: not provably loopback,
+        # so treat it as exposed. Refusing to start without a token is the
+        # safe direction to be wrong in.
+        return False
+
+
 def create_api(runtime: Runtime, settings: Settings) -> FastAPI:
     """Build the FastAPI app. Raises RuntimeError at construction (never at
     request time) when the configured host is non-loopback and no web token
     is configured — refusing to expose an unauthenticated surface off-box."""
     token = resolve_token(settings)
-    if settings.web.host != "127.0.0.1" and token is None:
+    if not is_loopback_host(settings.web.host) and token is None:
         raise RuntimeError(
             f"refusing to start: binding to non-loopback host {settings.web.host!r} "
             f"requires a web token — set the {settings.web.token_env} environment variable"
         )
-    if settings.web.host == "127.0.0.1" and token is None:
+    if is_loopback_host(settings.web.host) and token is None:
         # Loopback-only is safe to start unauthenticated (the RuntimeError
         # above is what actually gates off-box exposure), but a dev who
         # forgets to set a token can't log into the dashboard at all — that's
