@@ -18,6 +18,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+import dudamel
 from dudamel import cli
 from dudamel.config import Settings
 from dudamel.llm.testing import FakeProvider
@@ -79,6 +80,7 @@ async def test_new_user_path_scaffold_migrate_serve_health_and_widgets(
             body = health.json()
             assert body["status"] == "ok"
             assert body["db"] is True
+            assert body["version"] == dudamel.__version__
 
             unauthed = await c.get("/api/widgets")
             assert unauthed.status_code == 401
@@ -116,12 +118,17 @@ def test_quickstart_runs_via_real_uv_run_subprocess_in_scaffolded_project(
     green even if the scaffold were missing that file entirely; this one
     shells out for real, exactly as a reader following the README would.
 
-    `dudamel` is not yet published to PyPI, so `--find-links` points `uv` at
-    a wheel built from THIS checkout instead -- every other dependency still
-    resolves from the real index. Slow (a wheel build plus two real `uv`
-    subprocess invocations, each spinning up a project venv) but must always
-    run, not be skipped, since it is the one test that would catch a
-    packaging regression the in-process tests structurally cannot see.
+    The scaffold declares an unbounded `dudamel` dependency and `--find-links`
+    is an ADDITIONAL source, not an override -- so `uv` resolves the highest
+    version it can see across the real index and the wheel built here. When
+    this checkout is behind the published version, the index wins and this
+    test would validate the PUBLISHED package rather than the one being
+    released. The final step below asserts the resolved version matches the
+    wheel built from this checkout, so that substitution can never pass
+    silently. Slow (a wheel build plus real `uv` subprocess invocations, each
+    spinning up a project venv) but must always run, not be skipped, since it
+    is the one test that would catch a packaging regression the in-process
+    tests structurally cannot see.
     """
     dist_dir = tmp_path / "dist"
     subprocess.run(
@@ -157,3 +164,31 @@ def test_quickstart_runs_via_real_uv_run_subprocess_in_scaffolded_project(
     assert migrate_proc.returncode == 0, migrate_proc.stderr
     revisions = list((target / "migrations" / "versions").glob("*.py"))
     assert len(revisions) == 1, revisions
+
+    # The wheel filename carries the version it was built from:
+    # dudamel-<version>-py3-none-any.whl
+    wheels = list(dist_dir.glob("dudamel-*.whl"))
+    assert len(wheels) == 1, wheels
+    built_version = wheels[0].name.split("-")[1]
+
+    resolved_proc = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--find-links",
+            str(dist_dir),
+            "python",
+            "-c",
+            "import dudamel; print(dudamel.__version__)",
+        ],
+        cwd=target,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert resolved_proc.returncode == 0, resolved_proc.stderr
+    assert resolved_proc.stdout.strip() == built_version, (
+        f"this test resolved dudamel {resolved_proc.stdout.strip()!r} but the wheel "
+        f"under test is {built_version!r} -- --find-links lost to the package index, "
+        "so the release candidate was never actually exercised"
+    )
