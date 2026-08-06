@@ -28,6 +28,14 @@ logger = logging.getLogger("dudamel.web.api")
 
 __all__ = ["create_api"]
 
+# Every channel this surface may write to. The channel selects the
+# conversation a message joins, and handling a message auto-declines that
+# conversation's pending confirmations -- so an unconstrained channel would
+# let a web caller reach into a Telegram user's conversation, decline the
+# action they were asked to approve, and append to their history. The
+# dashboard itself only ever uses "web:default".
+WEB_CHANNEL_PREFIX = "web:"
+
 
 class LoginRequest(BaseModel):
     token: str
@@ -104,6 +112,14 @@ def create_api(runtime: Runtime, settings: Settings) -> FastAPI:
     async def api_chat(
         payload: ChatRequest, auth: AuthVia = Depends(authenticate)
     ) -> dict[str, Any]:
+        if not payload.channel.startswith(WEB_CHANNEL_PREFIX):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"channel {payload.channel!r} is outside this API's namespace; "
+                    f"it must start with {WEB_CHANNEL_PREFIX!r}"
+                ),
+            )
         reply = await runtime.chat(
             payload.channel,
             payload.text,
