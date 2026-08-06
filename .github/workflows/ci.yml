@@ -25,7 +25,13 @@ jobs:
       - name: Install uv
         # Pinned exactly: setup-uv stopped publishing floating major tags at
         # v8, so `@v9` does not resolve and must never be used here.
+        # Caching stays off: setup-uv enables it by default from v5 on, but
+        # the matrix jobs share one cache key and race to reserve it, which
+        # fails the save and annotates the run. This workflow never cached
+        # before and does not need to.
         uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: false
 
       - name: Install dependencies
         run: uv sync
