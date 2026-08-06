@@ -9,6 +9,7 @@ excluded from the default run; they run every time with the rest of the suite.
 
 from __future__ import annotations
 
+import logging
 import shlex
 import sys
 from pathlib import Path
@@ -528,21 +529,50 @@ async def test_env_passthrough_absent_var_stays_absent_without_config(
         await rt.stop()
 
 
-# -- post-mount max_tools ceiling stays fail-loud -----------------------------
-# Deliberately NOT degraded to a warn-and-drop like the MCP-vs-MCP collision
-# policy above: too many tools breaks tool-selection quality for the
-# operator's WHOLE assistant (small models' routing collapses past a modest
-# tool count -- see RouterConfig.max_tools / Router.__init__), not just for
-# whichever MCP server happened to mount last. That's a capacity problem the
-# operator must consciously fix (raise max_tools or mount fewer servers), not
-# something dudamel should silently paper over by dropping tools the
-# operator explicitly configured.
+# -- post-mount max_tools ceiling drops mcp tools, never crashes -------------
+# The ceiling exists because small models' tool selection collapses past a
+# modest tool count. But a mounted server's tool count is not the operator's
+# to control -- it is whatever that server advertises today -- so enforcing
+# the ceiling by raising would let any server take the whole assistant down,
+# which is precisely what this module promises can never happen. Excess
+# mcp tools are therefore dropped with a warning. Native over-registration
+# still raises, in Router.__init__: that IS the operator's own code.
 
 
-async def test_mount_exceeding_max_tools_raises_out_of_start(tmp_path: Path) -> None:
+async def test_mount_exceeding_max_tools_drops_mcp_tools_instead_of_crashing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     orc = Orchestrator(apps=[], mcp=[FIXTURE_CMD])  # fixture mounts 3 tools
     settings = make_settings(tmp_path, router=RouterConfig(max_tools=1))
     rt = Runtime(orc, settings, providers={"standard": FakeProvider([fake_text("hi")])})
-    with pytest.raises(RegistryError, match="max_tools"):
+    with caplog.at_level(logging.WARNING, logger="dudamel.router"):
         await rt.start()
-    await rt.stop()  # cleanup must still succeed even though start() raised
+    try:
+        assert len(orc.registry.tools) == 1
+        assert all(t.origin == "mcp" for t in orc.registry.tools.values())
+        assert "max_tools" in caplog.text
+    finally:
+        await rt.stop()
+
+
+async def test_native_tools_are_never_dropped_for_mcp_tools(tmp_path: Path) -> None:
+    """The operator's own app is what they actually asked for; a mounted
+    server's tools are opportunistic. When the ceiling forces a choice, the
+    native ones survive."""
+    app = App("gym", description="d")
+
+    @app.tool
+    async def log_workout(exercise: str) -> str:
+        """Record a workout."""
+        return "ok"
+
+    orc = Orchestrator(apps=[app], mcp=[FIXTURE_CMD])
+    settings = make_settings(tmp_path, router=RouterConfig(max_tools=2))
+    rt = Runtime(orc, settings, providers={"standard": FakeProvider([fake_text("hi")])})
+    await rt.start()
+    try:
+        names = set(orc.registry.tools)
+        assert "log_workout" in names
+        assert len(names) == 2
+    finally:
+        await rt.stop()

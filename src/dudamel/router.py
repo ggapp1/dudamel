@@ -80,17 +80,40 @@ class Router:
 
     def refresh_tool_specs(self) -> None:
         """Rebuild the tool specs offered to the model from the registry's
-        current tool set. Tool registration is normally frozen at Router
-        construction, but MCP mounting adds tools to the (shared) Registry
-        object later, during `Runtime.start()` -- after this Router already
-        exists. `Runtime.start()` calls this once mounting is done so those
-        tools actually reach the LLM instead of silently existing only in
-        `registry.tools`."""
-        if len(self._registry.tools) > self._config.max_tools:
-            raise RegistryError(
-                f"{len(self._registry.tools)} tools registered but router max_tools is "
-                f"{self._config.max_tools} — small models' tool selection collapses beyond "
-                "this; raise [router].max_tools deliberately or split apps"
+        current tool set.
+
+        Tool registration is normally frozen at Router construction, but mcp
+        mounting adds tools to the (shared) Registry later, during
+        `Runtime.start()` -- after this Router already exists.
+        `Runtime.start()` calls this once mounting is done so those tools
+        actually reach the model instead of silently existing only in
+        `registry.tools`.
+
+        If mounting pushed the tool count past the ceiling, the excess
+        mcp-origin tools are DROPPED with a warning rather than raised over.
+        A mounted server's tool count is not something the operator controls,
+        and mcp mounting must never be able to take down startup. Native
+        over-registration still raises, in `__init__` -- that is the
+        operator's own code, and fixable.
+        """
+        excess = len(self._registry.tools) - self._config.max_tools
+        if excess > 0:
+            droppable = [
+                name for name, tool in self._registry.tools.items() if tool.origin == "mcp"
+            ]
+            # Most recently added first: earlier mounts already won every
+            # name collision, so they keep winning here too.
+            to_drop = droppable[-excess:] if excess <= len(droppable) else droppable
+            for name in to_drop:
+                del self._registry.tools[name]
+            logger.warning(
+                "%d tool(s) registered but router max_tools is %d — dropped %d mcp tool(s): "
+                "%s. Small models' tool selection collapses past this ceiling; raise "
+                "[router].max_tools deliberately or mount fewer servers.",
+                len(self._registry.tools) + len(to_drop),
+                self._config.max_tools,
+                len(to_drop),
+                ", ".join(sorted(to_drop)),
             )
         self._specs = [ToolSpec.from_tool(t) for t in self._registry.tools.values()]
 
