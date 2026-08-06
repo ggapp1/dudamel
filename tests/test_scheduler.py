@@ -298,3 +298,76 @@ async def test_start_then_shutdown_is_idempotent_safe(tmp_path) -> None:
     # shutdown() again (never started a second time) must not raise
     await sched.shutdown()
     await db.dispose()
+
+
+async def test_job_cancelled_at_shutdown_records_a_row(tmp_path) -> None:
+    """A job still running when the scheduler shuts down is cancelled by
+    APScheduler's executor. CancelledError is a BaseException, so the ordinary
+    error path never sees it -- without explicit handling the run vanishes
+    from job_runs entirely. The row must also be WRITTEN before shutdown()
+    returns: serve() disposes the database immediately afterwards."""
+    app = App("stats", description="d")
+    started = asyncio.Event()
+
+    @app.job(interval_seconds=0, timeout=30)
+    async def longrun() -> None:
+        started.set()
+        await asyncio.sleep(30)
+
+    orc = Orchestrator(apps=[app])
+    db = await make_db(tmp_path)
+    sched = JobScheduler(orc.registry, db)
+    await sched.start()
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5.0)
+        await sched.shutdown()
+
+        # No polling: the row must already exist the instant shutdown returns.
+        async with db.session() as s:
+            rows = (
+                (await s.execute(select(JobRun).where(JobRun.job_id == "stats.longrun")))
+                .scalars()
+                .all()
+            )
+        assert [r.status for r in rows] == ["cancelled"]
+        assert rows[0].finished_at is not None
+    finally:
+        await db.dispose()
+
+
+async def test_shutdown_drains_listener_recording_tasks(tmp_path) -> None:
+    """The misfire/max-instances listeners record their rows in fire-and-forget
+    tasks. Those have the same hole: a misfire detected during shutdown loses
+    its row unless shutdown drains them too."""
+    from apscheduler.events import EVENT_JOB_MISSED, JobExecutionEvent
+
+    app = App("stats", description="d")
+
+    @app.job(interval_seconds=60)
+    async def poll() -> None:
+        pass
+
+    orc = Orchestrator(apps=[app])
+    db = await make_db(tmp_path)
+    sched = JobScheduler(orc.registry, db)
+    await sched.start()
+    try:
+        sched._on_missed(
+            JobExecutionEvent(
+                code=EVENT_JOB_MISSED,
+                job_id="stats.poll",
+                jobstore="default",
+                scheduled_run_time=datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC),
+            )
+        )
+        await sched.shutdown()
+
+        async with db.session() as s:
+            rows = (
+                (await s.execute(select(JobRun).where(JobRun.job_id == "stats.poll")))
+                .scalars()
+                .all()
+            )
+        assert [r.status for r in rows] == ["misfired"]
+    finally:
+        await db.dispose()

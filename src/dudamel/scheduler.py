@@ -39,6 +39,12 @@ logger = logging.getLogger("dudamel.scheduler")
 # recursion, huge repr in a local) shouldn't be allowed to bloat one row.
 _DETAIL_CAP = 4000
 
+# Upper bound on how long shutdown() waits for in-flight work to record its
+# outcome. Bounded because SQLite serialises writers and db.py sets
+# busy_timeout=5000 -- an unbounded drain would let one contended write stall
+# the whole shutdown sequence.
+_DRAIN_TIMEOUT = 2.0
+
 
 def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
@@ -57,6 +63,11 @@ class JobScheduler:
         # finish (asyncio only holds a weak reference to a bare create_task()
         # result, so without this a task can be garbage-collected mid-flight).
         self._background_tasks: set[asyncio.Task[None]] = set()
+        # Job executions currently running. shutdown() waits on these: the
+        # cancelled-job row below is written from inside the cancellation
+        # handler, and the assembly disposes the database as soon as
+        # shutdown() returns.
+        self._inflight: set[asyncio.Task[None]] = set()
         # Exposed (privately) for introspection: APScheduler jobs added
         # before the scheduler is started are merely "pending" and are not
         # reachable via scheduler.get_job(), so callers/tests that need the
@@ -81,6 +92,10 @@ class JobScheduler:
         )
 
     async def _run_job(self, job: Job) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            self._inflight.add(task)
+            task.add_done_callback(self._inflight.discard)
         started = _utcnow()
         try:
             await asyncio.wait_for(job.fn(), timeout=job.timeout)
@@ -88,6 +103,20 @@ class JobScheduler:
             detail = f"job {job.id} timed out after {job.timeout}s"
             logger.warning(detail)
             await self._record(job.id, "timeout", started, detail)
+        except asyncio.CancelledError:
+            # The executor cancels in-flight jobs at shutdown. Record the
+            # outcome, then let the cancellation continue -- a run that was
+            # killed is still a run, and the contract is that every outcome
+            # lands in job_runs. The recording gets its own guard so that a
+            # failure to WRITE can never replace the cancellation with a
+            # different exception.
+            detail = f"job {job.id} was cancelled before it finished"
+            logger.info(detail)
+            try:
+                await self._record(job.id, "cancelled", started, detail)
+            except Exception as e:  # noqa: BLE001 — recording is best-effort
+                logger.warning("failed to record cancelled run for job %s: %s", job.id, e)
+            raise
         except Exception as e:  # job bugs must not kill the scheduler
             detail = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"[:_DETAIL_CAP]
             logger.warning("job %s raised: %s", job.id, e)
@@ -160,5 +189,41 @@ class JobScheduler:
         self._scheduler.start()
 
     async def shutdown(self) -> None:
-        if self._scheduler.running:
-            self._scheduler.shutdown()
+        """Stop the scheduler and wait for in-flight work to finish recording.
+
+        `AsyncIOScheduler.shutdown()` is synchronous: it cancels each running
+        job's future and returns without awaiting anything. Left there, this
+        coroutine would never yield, so a cancelled job's handler -- and the
+        `job_runs` row it writes -- would not run until some later suspension
+        point, which the single-process assembly reaches only inside
+        `Runtime.stop()`, after the database engine has been disposed. So the
+        drain below is what makes the recording real rather than a write
+        racing teardown.
+
+        Bounded and best-effort: shutdown must always complete.
+        """
+        # A cancelled job re-raises CancelledError so the cancellation stays
+        # honest; APScheduler's executor logs that at ERROR with a full
+        # traceback. During a clean shutdown that is noise, not a fault --
+        # suppressed for this call only, never for the process.
+        aps_logger = logging.getLogger("apscheduler.executors.default")
+        previous_level = aps_logger.level
+        aps_logger.setLevel(logging.CRITICAL)
+        try:
+            if self._scheduler.running:
+                self._scheduler.shutdown()
+            pending = [t for t in (*self._inflight, *self._background_tasks) if not t.done()]
+            if not pending:
+                return
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True), timeout=_DRAIN_TIMEOUT
+                )
+            except TimeoutError:
+                logger.warning(
+                    "%d job task(s) did not finish recording within %ss of shutdown",
+                    len(pending),
+                    _DRAIN_TIMEOUT,
+                )
+        finally:
+            aps_logger.setLevel(previous_level)
