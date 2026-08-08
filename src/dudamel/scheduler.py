@@ -1,6 +1,6 @@
 """APScheduler wiring: turns every registered Job into a running APScheduler
-job and records EVERY outcome (ok/error/timeout/misfired) as a `job_runs`
-row.
+job and records EVERY outcome (ok/error/timeout/skipped/misfired/cancelled)
+as a `job_runs` row.
 
 Thin wrapper — the scheduler calls only `job.fn()`. Job functions are
 command-plane (unlike widgets): they may use `app.llm`/`app.notify`, but
