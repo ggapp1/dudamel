@@ -45,7 +45,7 @@ dependencies = [
     # install resolves to 2.x and `import dudamel` fails outright -- the repo's
     # own test runs stay green because uv.lock pins the old version, so only a
     # from-scratch install (i.e. every new user) sees it.
-    "mcp>=1.28.1,<2",
+    "mcp>=1.28.1,<3",
     "python-dotenv>=1.2.2",
 ]
 
