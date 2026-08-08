@@ -183,7 +183,7 @@ def test_run_debug_flag_reraises_instead_of_swallowing(
 def test_run_configures_info_level_logging_by_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """M2: `dudamel run` is a fresh interpreter with no other logging setup,
+    """`dudamel run` is a fresh interpreter with no other logging setup,
     so it must call `logging.basicConfig` itself or serve()'s own INFO
     startup/shutdown logging would be silently dropped. Patches
     `logging.basicConfig` itself (never really reconfiguring the root

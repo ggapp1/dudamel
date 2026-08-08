@@ -98,10 +98,10 @@ async def cancel_and_await(task: asyncio.Task[None]) -> None:
 
 @pytest.fixture(autouse=True)
 def _no_telegram(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Every test here exercises the "no Telegram configured" path (Global
-    Constraints: web always on, Telegram only if a token is present) --
-    scrub any real token out of the environment so that stays true
-    regardless of what the host shell happens to have set."""
+    """Every test here exercises the "no Telegram configured" path (web
+    always on, Telegram only if a token is present) -- scrub any real
+    token out of the environment so that stays true regardless of what
+    the host shell happens to have set."""
     monkeypatch.delenv("DUDAMEL_TELEGRAM_TOKEN", raising=False)
 
 
@@ -139,7 +139,7 @@ async def test_health_and_widgets_respond_over_real_localhost_socket(
 async def test_serve_logs_dashboard_url_and_telegram_status_on_boot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """M2: a successful boot must be visible without reading source -- the
+    """A successful boot must be visible without reading source -- the
     dashboard URL/token env var and whether Telegram came up are the two
     facts an operator needs immediately after starting `dudamel run`."""
     monkeypatch.setenv("DUDAMEL_WEB_TOKEN", TOKEN)
