@@ -201,7 +201,7 @@ warning rather than blocking the rest of the assistant from starting.
 Only the stdio transport is supported; a mounted server asking dudamel for
 sampling, elicitation, or roots gets an explicit refusal rather than a
 hang or a silent no-op. If a mounted server pushes the tool count past
-`[router] max_tools`, the excess mcp tools — even ones you explicitly
+`[router] max_tools`, the excess MCP tools — even ones you explicitly
 configured — are dropped from the model's tool list with only a log line,
 rather than failing startup.
 
