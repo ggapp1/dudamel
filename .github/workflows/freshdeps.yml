@@ -63,7 +63,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          title="Fresh dependency resolve is failing (py${{ matrix.python-version }})"
+          title="Fresh dependency resolve is failing on py${{ matrix.python-version }}"
           # `// empty` is load-bearing: on no match the array is [], and a
           # bare `.[0].number` prints the string "null", which is non-empty
           # and would send the comment branch to `gh issue comment null`.
