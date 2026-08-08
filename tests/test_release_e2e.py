@@ -124,11 +124,13 @@ def test_quickstart_runs_via_real_uv_run_subprocess_in_scaffolded_project(
     this checkout is behind the published version, the index wins and this
     test would validate the PUBLISHED package rather than the one being
     released. The final step below asserts the resolved version matches the
-    wheel built from this checkout, so that substitution can never pass
-    silently. Slow (a wheel build plus real `uv` subprocess invocations, each
-    spinning up a project venv) but must always run, not be skipped, since it
-    is the one test that would catch a packaging regression the in-process
-    tests structurally cannot see.
+    wheel built from this checkout: that check binds -- and would catch the
+    substitution -- whenever the working tree's version differs from the
+    currently published one, and is inert (true either way, substitution or
+    not) when the two happen to match. Slow (a wheel build plus real `uv`
+    subprocess invocations, each spinning up a project venv) but must always
+    run, not be skipped, since it is the one test that would catch a
+    packaging regression the in-process tests structurally cannot see.
     """
     dist_dir = tmp_path / "dist"
     subprocess.run(
