@@ -18,3 +18,7 @@ model = "qwen3.5:1.5b"
 [web]
 host = "127.0.0.1"
 port = 8787
+# Uncomment if dudamel runs behind a reverse proxy (nginx, Caddy) on this
+# same host, so it trusts that proxy's X-Forwarded-For instead of treating
+# every request as coming from the proxy itself:
+# trusted_proxies = ["127.0.0.1"]

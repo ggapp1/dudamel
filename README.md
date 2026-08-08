@@ -138,6 +138,12 @@ public internet is not recommended — it puts the dashboard's auth layer
 directly in front of arbitrary internet traffic, which Tailscale and
 Telegram's outbound polling both avoid needing to do at all.
 
+Running a reverse proxy (nginx, Caddy) in front of the dashboard on the
+same host needs one more setting: list its address in `[web]
+trusted_proxies` in `dudamel.toml`, or dudamel ignores `X-Forwarded-For`
+entirely and every request looks like it came from the proxy itself
+instead of the real client.
+
 ### Running as a service
 
 A personal assistant is only useful if it's actually running. `dudamel new`
@@ -194,7 +200,10 @@ fails to start or doesn't speak the protocol correctly is skipped with a
 warning rather than blocking the rest of the assistant from starting.
 Only the stdio transport is supported; a mounted server asking dudamel for
 sampling, elicitation, or roots gets an explicit refusal rather than a
-hang or a silent no-op.
+hang or a silent no-op. If a mounted server pushes the tool count past
+`[router] max_tools`, the excess mcp tools — even ones you explicitly
+configured — are dropped from the model's tool list with only a log line,
+rather than failing startup.
 
 ## Testing your apps
 
