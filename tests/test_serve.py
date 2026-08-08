@@ -25,6 +25,7 @@ from dudamel.config import Settings, TierConfig, WebConfig
 from dudamel.db import Database
 from dudamel.llm.testing import FakeProvider
 from dudamel.models_core import JobRun
+from dudamel.scheduler import JobScheduler
 from dudamel.serve import _InstanceLock, _prepare_uvicorn, serve
 
 TOKEN = "s3cr3t-serve-token"  # noqa: S105 — test fixture, not a real credential
@@ -235,6 +236,59 @@ async def test_cancelling_serve_task_shuts_down_cleanly(
 
     assert not lockfile.exists()
     assert len(disposed) > disposed_before  # Runtime.stop() disposed its engine
+
+
+# --- clean shutdown: second cancellation during scheduler drain (regression) ---
+
+
+async def test_second_cancellation_during_scheduler_drain_still_runs_runtime_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: `scheduler.shutdown()` gained a real suspension point (a
+    bounded drain of in-flight job tasks) and is the only step in the
+    teardown sequence with no `CancelledError` guard. A second cancellation
+    landing while that drain is in progress must not skip
+    `_stop_quietly("runtime", runtime.stop())` -- which disposes the DB
+    engine and closes every mounted MCP subprocess -- the way it would if
+    the `CancelledError` were left to propagate out of `scheduler.shutdown()`
+    uncaught.
+
+    `JobScheduler.shutdown` is replaced so the hazard is reproduced
+    deterministically instead of raced against real job timing: the
+    replacement cancels the running `serve()` task itself, then awaits a
+    bare `asyncio.sleep(0)` -- asyncio delivers the now-pending cancellation
+    at that await, exactly like a real second SIGTERM/`task.cancel()`
+    landing mid-drain.
+    """
+    disposed: list[Database] = []
+    original_dispose = Database.dispose
+
+    async def spy_dispose(self: Database) -> None:
+        disposed.append(self)
+        await original_dispose(self)
+
+    monkeypatch.setattr(Database, "dispose", spy_dispose)
+
+    async def cancel_again_mid_drain(self: JobScheduler) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+        await asyncio.sleep(0)  # the pending cancellation is delivered here
+
+    monkeypatch.setattr(JobScheduler, "shutdown", cancel_again_mid_drain)
+
+    settings = make_settings(tmp_path)
+    lockfile = settings.data_dir / ".dudamel.lock"
+    orc = Orchestrator(apps=[])  # no jobs -- isolates the teardown path itself
+    task = asyncio.create_task(serve(orc, settings, providers={"standard": FakeProvider([])}))
+    await wait_for_port(settings)
+
+    disposed_before = len(disposed)
+    task.cancel()  # first cancellation: unblocks stop_event.wait(), enters teardown
+    await asyncio.wait_for(task, timeout=5.0)  # must COMPLETE, not raise
+
+    assert not lockfile.exists()
+    assert len(disposed) > disposed_before  # Runtime.stop() still ran despite the 2nd cancel
 
 
 # --- clean shutdown: SIGTERM ---------------------------------------------------
