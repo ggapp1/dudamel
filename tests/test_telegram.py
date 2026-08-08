@@ -77,8 +77,8 @@ class MarkdownRejectingBot(FakeBot):
 
 class ConfirmationRejectingBot(FakeBot):
     """Rejects the first `send_message` call unconditionally, then behaves
-    normally — exercises `_send_confirmation`'s BadRequest-degrade retry
-    (fix wave item 3), independent of message length."""
+    normally — exercises `_send_confirmation`'s BadRequest-degrade retry,
+    independent of message length."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -98,7 +98,7 @@ class ConfirmationRejectingBot(FakeBot):
 class EditRejectingBot(FakeBot):
     """Rejects the first `edit_message_text` call unconditionally, then
     behaves normally — exercises the confirmation callback's
-    BadRequest-degrade retry (fix wave item 3)."""
+    BadRequest-degrade retry."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -506,7 +506,7 @@ async def test_confirm_button_from_unauthorized_user_does_not_resolve(
     await rt.stop()
 
 
-# --- confirmation hardening (fix wave item 3) -------------------------------------
+# --- confirmation hardening ------------------------------------------------------
 
 
 async def test_confirmation_send_badrequest_degrades_to_plain_fallback(
