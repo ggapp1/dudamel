@@ -331,7 +331,8 @@ async def serve(
                         await _stop_quietly("uvicorn shutdown", server.shutdown())
                 with contextlib.suppress(asyncio.CancelledError):
                     await asyncio.sleep(_JOB_DRAIN_SECONDS)
-                await runtime.scheduler.shutdown()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await runtime.scheduler.shutdown()
                 await _stop_quietly("runtime", runtime.stop())
             finally:
                 _remove_signal_handlers(loop, signals_installed)
