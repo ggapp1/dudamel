@@ -471,8 +471,8 @@ async def test_no_telegram_interface_built_without_a_token(
 
 class _FakeTelegramThatFailsToStart(_FakeTelegram):
     """`start()` always raises -- proves a broken Telegram interface can
-    never take the web dashboard down with it (spec §9: "Telegram
-    unreachable -> core and dashboard unaffected")."""
+    never take the web dashboard down with it ("Telegram unreachable ->
+    core and dashboard unaffected")."""
 
     async def start(self) -> None:
         self.calls.append("start")

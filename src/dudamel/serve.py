@@ -273,7 +273,7 @@ async def serve(
                     await telegram.start()
                     runtime.bind_notify(telegram.notify)
                 except Exception as e:
-                    # Spec §9: "Telegram unreachable -> core and dashboard
+                    # "Telegram unreachable -> core and dashboard
                     # unaffected." A bad token, network failure, or any other
                     # construction/start blowup here must never take the web
                     # surface (already bound above) or the scheduler down
