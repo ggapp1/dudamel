@@ -204,7 +204,7 @@ class Router:
             )
             dropped = len(history) - (len(window) - 1)
             if dropped > 0:
-                # spec: truncation is surfaced, never silent
+                # truncation is surfaced, never silent
                 logger.info(
                     "conversation %s: context window dropped %d older messages",
                     conv_id,

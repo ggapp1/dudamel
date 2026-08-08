@@ -29,8 +29,8 @@ business logic, zero LLM calls. `serve()`:
      `bind_notify` call are wrapped in a single `try/except Exception` —
      Telegram being unreachable (bad token, network failure, anything) is
      logged and swallowed rather than taking the already-running web
-     surface and scheduler down with it (spec §9: "Telegram unreachable ->
-     core and dashboard unaffected"). `telegram` stays `None` on failure so
+     surface and scheduler down with it ("Telegram unreachable -> core and
+     dashboard unaffected"). `telegram` stays `None` on failure so
      step 6's shutdown skips it. Once this step resolves either way, an INFO
      log line reports the dashboard URL/token env var and whether Telegram
      ended up enabled — the two facts an operator needs right after startup,
