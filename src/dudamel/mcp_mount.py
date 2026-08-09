@@ -10,19 +10,19 @@ operator must fix, not environmental flakiness) -- see `Registry.add_mcp_tools`.
 Tool naming: each discovered tool becomes `{server}__{tool}`, both halves
 sanitized to `dudamel.contract.types.TOOL_NAME_RE`
 (`^[a-zA-Z0-9_-]{1,64}$`). `{server}` is the server's own self-reported
-`serverInfo.name` from MCP `initialize`, not the launch command -- the
+`server_info.name` from MCP `initialize`, not the launch command -- the
 protocol already gives us a stable identity, so we don't need to parse argv.
 
-`readOnlyHint` is honored; a tool with no annotations at all -- the MCP spec
-leaves annotations fully optional -- is treated as MUTATING. That
+`read_only_hint` is honored; a tool with no annotations at all -- the MCP
+spec leaves annotations fully optional -- is treated as MUTATING. That
 classification is load-bearing: once a turn has seen any mcp output, the
 router confirm-gates every mutating tool it is asked to run, mcp-origin ones
 included.
 
 Note what this does NOT defend against: annotations are self-reported by the
-server, so a hostile one can declare a destructive tool `readOnlyHint: true`
-and skip the gate. The real trust boundary is which servers the operator
-chooses to mount.
+server, so a hostile one can declare a destructive tool `read_only_hint:
+true` and skip the gate. The real trust boundary is which servers the
+operator chooses to mount.
 
 Server-initiated callbacks (sampling / elicitation / roots) are refused
 explicitly and immediately -- never left to the SDK default of hanging or
@@ -43,8 +43,8 @@ from typing import Any
 
 import mcp.types as types
 from mcp import ClientSession, StdioServerParameters
+from mcp.client.context import ClientRequestContext
 from mcp.client.stdio import stdio_client
-from mcp.shared.context import RequestContext
 
 from dudamel.contract.types import TOOL_NAME_RE, Tool
 from dudamel.exceptions import ToolValidationError
@@ -59,29 +59,39 @@ _REFUSAL = "MCP server-initiated callbacks are not supported in dudamel v1"
 
 # -- refused callbacks --------------------------------------------------------
 # Passed explicitly (rather than relying on the SDK's built-in defaults) so
-# the refusal text is ours and unambiguous. Trade-off, documented: because the
-# SDK ties capability advertisement to *which* callback object is passed
-# (default vs. any override), supplying our own callback means `initialize()`
-# advertises sampling/elicitation/roots as nominally available -- a
-# well-behaved server may still try one. That is safe (it gets an immediate
-# ErrorData refusal, never a hang); it is simply not the most minimal
-# handshake. Good enough for an experimental v1.
+# the refusal text is ours and unambiguous. Trade-off, documented: `_build_
+# capabilities` in the SDK's `ClientSession` still gates sampling/elicitation
+# /roots advertisement on an identity check -- whether the callback we passed
+# `is not` its own internal default sentinel -- so supplying our own refusal
+# callback means `initialize()` advertises all three as nominally available,
+# and a well-behaved server may still try one. The `sampling_capabilities`
+# constructor argument added in this SDK generation does not change that: it
+# only shapes the *content* of the `SamplingCapability` object once sampling
+# is already being advertised (e.g. which sampling features it claims), it
+# cannot suppress advertisement while a non-default callback is present, and
+# elicitation/roots have no equivalent parameter to shape at all. There is no
+# way to keep our own refusal callbacks and get a minimal handshake. That is
+# safe (a server that tries anyway gets an immediate ErrorData refusal, never
+# a hang); it is simply not the most minimal handshake. Good enough for an
+# experimental feature.
 
 
 async def _refuse_sampling(
-    context: RequestContext[ClientSession, Any], params: types.CreateMessageRequestParams
+    context: ClientRequestContext[ClientSession, Any],
+    params: types.CreateMessageRequestParams,
 ) -> types.ErrorData:
     return types.ErrorData(code=types.INVALID_REQUEST, message=_REFUSAL)
 
 
 async def _refuse_elicitation(
-    context: RequestContext[ClientSession, Any], params: types.ElicitRequestParams
+    context: ClientRequestContext[ClientSession, Any],
+    params: types.ElicitRequestParams,
 ) -> types.ErrorData:
     return types.ErrorData(code=types.INVALID_REQUEST, message=_REFUSAL)
 
 
 async def _refuse_list_roots(
-    context: RequestContext[ClientSession, Any],
+    context: ClientRequestContext[ClientSession, Any],
 ) -> types.ErrorData:
     return types.ErrorData(code=types.INVALID_REQUEST, message=_REFUSAL)
 
@@ -153,7 +163,7 @@ def _make_call_fn(
         text = "\n".join(
             block.text for block in result.content if isinstance(block, types.TextContent)
         )
-        if result.isError:
+        if result.is_error:
             # Raise rather than return: Router's execute path treats a raised
             # exception from tool.fn as an error tool-result (is_error=True,
             # text = "tool {name} raised RuntimeError: {detail}"). Returning
@@ -174,7 +184,7 @@ def _build_tool(
     read_only: bool,
 ) -> Tool:
     description = f"[experimental MCP] {mcp_tool.description or mcp_tool.name}"
-    input_schema = mcp_tool.inputSchema or {"type": "object", "properties": {}}
+    input_schema = mcp_tool.input_schema or {"type": "object", "properties": {}}
     return Tool(
         name=tool_name,
         app_name=f"mcp:{server_name}",
@@ -222,7 +232,7 @@ class _MountedServer:
         )
         init = await session.initialize()
         self.session = session
-        self.server_name = sanitize_mcp_name(init.serverInfo.name)
+        self.server_name = sanitize_mcp_name(init.server_info.name)
 
     async def close(self) -> None:
         # Best-effort: a server that's already dead/misbehaving must not make
@@ -299,7 +309,7 @@ def _collect_server_tools(
             )
             continue
         seen_names.add(name)
-        read_only = bool(mcp_tool.annotations and mcp_tool.annotations.readOnlyHint)
+        read_only = bool(mcp_tool.annotations and mcp_tool.annotations.read_only_hint)
         tools.append(
             _build_tool(
                 session,

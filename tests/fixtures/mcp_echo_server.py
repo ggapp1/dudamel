@@ -32,12 +32,12 @@ from __future__ import annotations
 import os
 import sys
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
 _NAME = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("MCP_FIXTURE_NAME", "fixture")
 
-mcp = FastMCP(_NAME)
+mcp = MCPServer(_NAME)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
