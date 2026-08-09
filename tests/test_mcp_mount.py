@@ -14,6 +14,7 @@ import shlex
 import sys
 from pathlib import Path
 
+import mcp.types as types
 import pytest
 
 from dudamel import App, Orchestrator, Runtime
@@ -576,3 +577,86 @@ async def test_native_tools_are_never_dropped_for_mcp_tools(tmp_path: Path) -> N
         assert len(names) == 2
     finally:
         await rt.stop()
+
+
+# -- advertised schema/description caps --------------------------------------
+# Both are embedded verbatim in every LLM request, so both are a token-budget
+# cost AND a prompt-injection channel that fires at advertise time, before any
+# tool call -- the taint gate that protects tool *results* never engages here.
+# A schema is dropped (a truncated JSON Schema is not a schema); a description
+# is truncated (a truncated description is still a description).
+
+
+def _mcp_tool(name: str, *, schema: dict | None = None, description: str = "d") -> types.Tool:
+    return types.Tool(
+        name=name,
+        description=description,
+        inputSchema=schema if schema is not None else {"type": "object", "properties": {}},
+    )
+
+
+def test_oversized_input_schema_drops_the_tool_and_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    huge = {"type": "object", "properties": {"x": {"description": "y" * 20000}}}
+    seen: set[str] = set()
+    with caplog.at_level(logging.WARNING):
+        tools = _collect_server_tools(
+            None,  # type: ignore[arg-type]
+            server_name="fixture",
+            command="cmd",
+            mcp_tools=[_mcp_tool("big", schema=huge), _mcp_tool("small")],
+            seen_names=seen,
+        )
+    assert [t.name for t in tools] == ["fixture__small"]
+    assert "big" in caplog.text
+
+
+def test_dropped_oversized_tool_does_not_burn_its_name(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A tool dropped for an oversized schema must not claim its name, so a
+    later same-named tool from another server can still mount."""
+    huge = {"type": "object", "properties": {"x": {"description": "y" * 20000}}}
+    seen: set[str] = set()
+    with caplog.at_level(logging.WARNING):
+        _collect_server_tools(
+            None,  # type: ignore[arg-type]
+            server_name="fixture",
+            command="cmd",
+            mcp_tools=[_mcp_tool("dup", schema=huge)],
+            seen_names=seen,
+        )
+    assert seen == set()
+
+
+def test_oversized_description_is_truncated_not_dropped() -> None:
+    seen: set[str] = set()
+    tools = _collect_server_tools(
+        None,  # type: ignore[arg-type]
+        server_name="fixture",
+        command="cmd",
+        mcp_tools=[_mcp_tool("chatty", description="z" * 5000)],
+        seen_names=seen,
+    )
+    assert len(tools) == 1
+    assert len(tools[0].description) < 1200
+    assert tools[0].description.startswith("[experimental MCP] zzz")
+
+
+def test_unserializable_schema_drops_the_tool_rather_than_crashing() -> None:
+    """A hostile deeply-nested schema must drop one tool, not kill the mount."""
+    nested: dict = {"type": "object"}
+    cursor = nested
+    for _ in range(5000):
+        cursor["items"] = {"type": "object"}
+        cursor = cursor["items"]
+    seen: set[str] = set()
+    tools = _collect_server_tools(
+        None,  # type: ignore[arg-type]
+        server_name="fixture",
+        command="cmd",
+        mcp_tools=[_mcp_tool("nested", schema=nested), _mcp_tool("fine")],
+        seen_names=seen,
+    )
+    assert [t.name for t in tools] == ["fixture__fine"]
