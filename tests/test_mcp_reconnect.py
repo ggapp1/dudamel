@@ -25,6 +25,25 @@ from dudamel.mcp_mount import MCPMount, MCPServerConfig
 FIXTURE = Path(__file__).parent / "fixtures" / "mcp_flaky_server.py"
 
 
+async def _wait_for_started_marker(state: Path, value: str, *, timeout: float = 5.0) -> None:
+    """Poll `state` for slow_mutate's `started:<value>` marker line -- proof
+    the handler is actually running in its thread, not just that the call
+    was fired. A fixed sleep here would be a race: real CI schedulers can
+    add multi-second latency between firing an async call and its handler
+    thread actually starting, and there's no other way to observe that from
+    outside the subprocess. Bounded: raises with a clear message instead of
+    hanging if the marker never shows up.
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    marker = f"started:{value}"
+    while loop.time() < deadline:
+        if state.exists() and marker in state.read_text().splitlines():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"timed out after {timeout}s waiting for {marker!r} to appear in {state}")
+
+
 def flaky_cmd(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -106,9 +125,11 @@ async def test_flaky_fixture_records_side_effects_across_restarts(
 async def test_flaky_fixture_records_side_effect_even_if_killed_before_reply(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The side effect is written before the sleep that a test can race a
-    `die()` against -- so state is on disk even if the reply never arrives.
-    This is the property the next task's mid-call-kill test depends on."""
+    """The side effect is written (and synced) before the sleep that a test
+    can race a `die()` against -- so state is on disk even if the reply
+    never arrives. This is the property the next task's mid-call-kill test
+    depends on. Killing is gated on the `started:` marker actually
+    appearing on disk, not a fixed sleep -- see `_wait_for_started_marker`."""
     state = tmp_path / "state"
     mount = MCPMount([flaky_cmd(tmp_path, monkeypatch, state=state, slow_seconds=10.0)])
     try:
@@ -116,11 +137,10 @@ async def test_flaky_fixture_records_side_effect_even_if_killed_before_reply(
         mutate = next(t for t in tools if t.name.endswith("__slow_mutate"))
         die = next(t for t in tools if t.name.endswith("__die"))
         # Fire the mutation but don't wait for its (slow) reply; instead
-        # kill the process right away. The write-then-sleep ordering inside
-        # slow_mutate means the side effect has already landed on disk by
-        # the time die() can run, even though the mutate call never returns.
+        # kill the process once we have proof (the started marker) that the
+        # side effect has landed, even though the mutate call never returns.
         mutate_call = asyncio.ensure_future(mutate.fn(value="y"))
-        await asyncio.sleep(0.2)
+        await _wait_for_started_marker(state, "y")
         with pytest.raises(BaseException):  # noqa: B017 -- type varies: MCPError, anyio errors, or CancelledError
             await die.fn()
         # The dying process breaks the still-pending mutate call's transport
@@ -131,7 +151,19 @@ async def test_flaky_fixture_records_side_effect_even_if_killed_before_reply(
             await mutate_call
     finally:
         await mount.close()
-    assert state.read_text().splitlines() == ["y"]
+    assert state.read_text().splitlines() == ["started:y", "y"]
+
+    # A restarted server must report exactly one COMPLETED mutation, not
+    # two -- if count() mistakenly counted the "started:" marker as well as
+    # the real line, it would silently report double execution that never
+    # happened, corrupting the very proof the next task depends on.
+    mount = MCPMount([flaky_cmd(tmp_path, monkeypatch, state=state)])
+    try:
+        tools = await mount.mount()
+        count = next(t for t in tools if t.name.endswith("__count"))
+        assert await count.fn() == "1"
+    finally:
+        await mount.close()
 
 
 async def test_flaky_fixture_can_drift_its_annotations(
