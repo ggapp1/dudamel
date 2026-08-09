@@ -1,9 +1,15 @@
-"""Experimental MCP (Model Context Protocol) stdio server mounting.
+"""Experimental MCP (Model Context Protocol) server mounting.
+
+Two transports are supported, chosen per server by `MCPServerConfig`: stdio
+(a subprocess command) and streamable HTTP (a URL, optionally with headers
+for auth). A plain string in `Orchestrator(mcp=[...])` is still shorthand for
+a stdio command -- `MCPServerConfig` is only needed for HTTP or for
+per-server environment passthrough.
 
 MCP support is EXPERIMENTAL. Everything here degrades gracefully: an
-unreachable command, a server that fails to speak the protocol, a tool call
-that raises or times out -- none of it may ever crash `Runtime.start()` or
-take down a chat turn. The one thing that is allowed to be a hard failure is
+unreachable command or URL, a server that fails to speak the protocol, a tool
+call that raises or times out -- none of it may ever crash `Runtime.start()`
+or take down a chat turn. The one thing that is allowed to be a hard failure is
 a *name collision* with a native tool (that is a configuration bug the
 operator must fix, not environmental flakiness) -- see `Registry.add_mcp_tools`.
 
@@ -53,12 +59,14 @@ import re
 import shlex
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import AsyncExitStack
+from dataclasses import dataclass
 from typing import Any
 
 import mcp.types as types
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.context import ClientRequestContext
 from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
 
 from dudamel.contract.types import TOOL_NAME_RE, Tool
 from dudamel.exceptions import ToolValidationError
@@ -77,6 +85,40 @@ MAX_SCHEMA_BYTES = 16384
 MAX_DESCRIPTION_CHARS = 1024
 
 _REFUSAL = "MCP server-initiated callbacks are not supported in dudamel v1"
+
+
+# -- server configuration -----------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MCPServerConfig:
+    """One configured MCP server: either a stdio `command` or an HTTP `url`.
+
+    `headers` exists because `streamable_http_client` accepts no headers and
+    no auth of its own -- a bare URL can never reach an authenticated server,
+    which is most real remote ones. The token rides here and reaches the
+    transport through mcp's own `create_mcp_http_client(headers=...)`, which
+    keeps the SDK's HTTP stack an implementation detail rather than a
+    dependency dudamel declares.
+
+    `env` names environment variables passed through to a stdio server's
+    subprocess -- per-server, replacing the single global passthrough list
+    that `MCPMount(env_passthrough=...)` applies to plain string entries.
+    """
+
+    command: str | None = None
+    url: str | None = None
+    headers: dict[str, str] | None = None
+    env: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if bool(self.command) == bool(self.url):
+            raise ValueError("MCPServerConfig needs exactly one of `command` or `url`")
+
+    @property
+    def label(self) -> str:
+        """Stable identifier for log messages, whichever transport this is."""
+        return self.command or self.url or "<unconfigured>"
 
 
 # -- refused callbacks --------------------------------------------------------
@@ -229,25 +271,41 @@ def _build_tool(
 
 
 class _MountedServer:
-    def __init__(self, command: str, *, env_passthrough: Sequence[str] = ()) -> None:
-        self.command = command
+    def __init__(self, config: MCPServerConfig) -> None:
+        self.config = config
         self.session: ClientSession | None = None
         self.server_name: str = ""
-        self._env_passthrough = list(env_passthrough)
         self._stack = AsyncExitStack()
 
-    async def connect(self) -> None:
-        argv = shlex.split(self.command)
+    async def _open_transport(self) -> tuple[Any, Any]:
+        if self.config.url is not None:
+            # mcp 2.0's streamable_http_client yields a 2-tuple (read,
+            # write); 1.x (where the same function lives under the same
+            # name) yields a 3-tuple with a get_session_id callable too.
+            # Entering the context manager performs no network I/O -- it's
+            # lazy, the connection attempt happens on the first real
+            # operation inside connect() (initialize(), below), so
+            # MOUNT_TIMEOUT wrapping connect() already covers it; no
+            # separate timeout is needed here.
+            http_client = create_mcp_http_client(headers=self.config.headers)
+            read, write = await self._stack.enter_async_context(
+                streamable_http_client(self.config.url, http_client=http_client)
+            )
+            return read, write
+        argv = shlex.split(self.config.command or "")
         if not argv:
-            raise ValueError(f"empty MCP command: {self.command!r}")
-        # Env passthrough is explicit config (design doc), never ambient: the
-        # SDK's own `stdio_client` already merges this dict OVER its safe
-        # default environment (PATH etc.) when `env` is not None, so an
-        # empty passthrough list behaves identically to omitting `env`
-        # entirely -- nothing here needs to duplicate that merge.
-        env = {var: os.environ[var] for var in self._env_passthrough if var in os.environ}
+            raise ValueError(f"empty MCP command: {self.config.command!r}")
+        # Env passthrough is explicit config, never ambient: the SDK's own
+        # `stdio_client` already merges this dict OVER its safe default
+        # environment (PATH etc.) when `env` is not None, so an empty
+        # passthrough list behaves identically to omitting `env` entirely --
+        # nothing here needs to duplicate that merge.
+        env = {var: os.environ[var] for var in self.config.env if var in os.environ}
         params = StdioServerParameters(command=argv[0], args=argv[1:], env=env)
-        read, write = await self._stack.enter_async_context(stdio_client(params))
+        return await self._stack.enter_async_context(stdio_client(params))
+
+    async def connect(self) -> None:
+        read, write = await self._open_transport()
         session = await self._stack.enter_async_context(
             ClientSession(
                 read,
@@ -281,7 +339,7 @@ class _MountedServer:
         except BaseException as e:
             logger.warning(
                 "mcp: error closing server %r during shutdown (%s: %s) -- ignoring, best-effort",
-                self.command,
+                self.config.label,
                 type(e).__name__,
                 e,
             )
@@ -383,10 +441,12 @@ def _collect_server_tools(
 
 
 class MCPMount:
-    """Spawns each configured MCP stdio server, discovers its tools, and
-    hands back dudamel `Tool` objects (`origin="mcp"`) ready for
-    `Registry.add_mcp_tools`. Each `commands[i]` is a shell-style command
-    string (split with `shlex.split`) that launches one stdio server.
+    """Spawns each configured MCP server (stdio subprocess or streamable
+    HTTP), discovers its tools, and hands back dudamel `Tool` objects
+    (`origin="mcp"`) ready for `Registry.add_mcp_tools`. Each entry in
+    `servers` is either a shell-style command string (split with
+    `shlex.split`, launched over stdio) or an `MCPServerConfig` (either
+    transport, plus HTTP headers and/or per-server env).
 
     A server that is unreachable, exits immediately, or fails the MCP
     handshake within `MOUNT_TIMEOUT` contributes zero tools and logs a
@@ -406,16 +466,26 @@ class MCPMount:
     something an external MCP server should be able to trigger.
     """
 
-    def __init__(self, commands: Sequence[str], *, env_passthrough: Sequence[str] = ()) -> None:
-        self._commands = list(commands)
-        self._env_passthrough = list(env_passthrough)
+    def __init__(
+        self,
+        servers: Sequence[str | MCPServerConfig],
+        *,
+        env_passthrough: Sequence[str] = (),
+    ) -> None:
+        # A plain string stays a stdio command, so existing configs keep
+        # working. The global env_passthrough applies to string entries
+        # only; an MCPServerConfig carries its own `env` instead.
+        self._configs: list[MCPServerConfig] = [
+            MCPServerConfig(command=s, env=tuple(env_passthrough)) if isinstance(s, str) else s
+            for s in servers
+        ]
         self._servers: list[_MountedServer] = []
 
     async def mount(self) -> list[Tool]:
         tools: list[Tool] = []
         seen_names: set[str] = set()
-        for command in self._commands:
-            server = _MountedServer(command, env_passthrough=self._env_passthrough)
+        for config in self._configs:
+            server = _MountedServer(config)
             try:
                 await asyncio.wait_for(server.connect(), timeout=MOUNT_TIMEOUT)
                 listed = await asyncio.wait_for(
@@ -426,14 +496,27 @@ class MCPMount:
                 collected = _collect_server_tools(
                     server.session,
                     server_name=server.server_name,
-                    command=command,
+                    command=config.label,
                     mcp_tools=listed.tools,
                     seen_names=seen_names,
                 )
-            except Exception as e:
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as e:
+                # Not just `except Exception`: measured on mcp 2.0.0, a
+                # ClientSession whose background task group has already
+                # failed (e.g. an HTTP transport that never connected)
+                # raises a bare CancelledError -- a BaseException -- on its
+                # NEXT operation, and this block calls session.initialize()
+                # and list_tools(). An unreachable URL's own connect failure
+                # is already Exception-derived (a native ExceptionGroup
+                # wrapping httpx2.ConnectError) and would be caught either
+                # way; this widening is for the session-level fallout, not
+                # the initial connect. Same discipline, same anyio reason,
+                # as close().
                 logger.warning(
                     "mcp: server %r failed to mount (%s: %s) -- skipping; core unaffected",
-                    command,
+                    config.label,
                     type(e).__name__,
                     e,
                 )
