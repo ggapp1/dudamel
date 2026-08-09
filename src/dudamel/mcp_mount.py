@@ -287,7 +287,17 @@ class _MountedServer:
             # operation inside connect() (initialize(), below), so
             # MOUNT_TIMEOUT wrapping connect() already covers it; no
             # separate timeout is needed here.
-            http_client = create_mcp_http_client(headers=self.config.headers)
+            #
+            # The client is entered into `self._stack` here, not just
+            # constructed: `streamable_http_client` only closes the
+            # httpx2.AsyncClient it manages when IT created one internally
+            # (`http_client=None`). Since we always pass one in explicitly,
+            # streamable_http_client never closes it -- entering it into our
+            # own stack, before the transport, is what makes it get closed
+            # at all, and LIFO order tears the transport down first.
+            http_client = await self._stack.enter_async_context(
+                create_mcp_http_client(headers=self.config.headers)
+            )
             read, write = await self._stack.enter_async_context(
                 streamable_http_client(self.config.url, http_client=http_client)
             )
@@ -472,21 +482,33 @@ class MCPMount:
         *,
         env_passthrough: Sequence[str] = (),
     ) -> None:
-        # A plain string stays a stdio command, so existing configs keep
-        # working. The global env_passthrough applies to string entries
-        # only; an MCPServerConfig carries its own `env` instead.
-        self._configs: list[MCPServerConfig] = [
-            MCPServerConfig(command=s, env=tuple(env_passthrough)) if isinstance(s, str) else s
-            for s in servers
-        ]
+        # Normalization (string -> MCPServerConfig) is deliberately NOT done
+        # here: MCPServerConfig("") -- e.g. from os.environ.get("VAR", "")
+        # -- fails __post_init__'s "exactly one of command/url" check, and
+        # raising out of __init__ would crash MCPMount(...) itself before
+        # any server is even attempted, taking Runtime.start() down with it.
+        # Normalizing per-entry inside mount()'s try (below) keeps a
+        # malformed string entry a warn-and-skip, like any other bad config.
+        self._entries: list[str | MCPServerConfig] = list(servers)
+        self._env_passthrough = tuple(env_passthrough)
         self._servers: list[_MountedServer] = []
 
     async def mount(self) -> list[Tool]:
         tools: list[Tool] = []
         seen_names: set[str] = set()
-        for config in self._configs:
-            server = _MountedServer(config)
+        for entry in self._entries:
+            label = entry if isinstance(entry, str) else entry.label
+            server: _MountedServer | None = None
             try:
+                # A plain string stays a stdio command, so existing configs
+                # keep working. The global env_passthrough applies to string
+                # entries only; an MCPServerConfig carries its own `env`.
+                config = (
+                    MCPServerConfig(command=entry, env=self._env_passthrough)
+                    if isinstance(entry, str)
+                    else entry
+                )
+                server = _MountedServer(config)
                 await asyncio.wait_for(server.connect(), timeout=MOUNT_TIMEOUT)
                 listed = await asyncio.wait_for(
                     server.session.list_tools(),  # type: ignore[union-attr]
@@ -513,14 +535,17 @@ class MCPMount:
                 # wrapping httpx2.ConnectError) and would be caught either
                 # way; this widening is for the session-level fallout, not
                 # the initial connect. Same discipline, same anyio reason,
-                # as close().
+                # as close(). It also covers MCPServerConfig(...)
+                # construction above raising ValueError on a malformed
+                # string entry, before any server object even exists.
                 logger.warning(
                     "mcp: server %r failed to mount (%s: %s) -- skipping; core unaffected",
-                    config.label,
+                    label,
                     type(e).__name__,
                     e,
                 )
-                await server.close()
+                if server is not None:
+                    await server.close()
                 continue
             self._servers.append(server)
             tools.extend(collected)
