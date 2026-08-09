@@ -64,10 +64,47 @@ def test_mcp_server_rejects_both_command_and_url() -> None:
         MCPServerConfig(command="x", url="http://localhost/mcp")
 
 
-async def test_unreachable_url_yields_no_tools_and_never_raises() -> None:
-    """Port 9 is the discard port -- reliably refuses."""
+async def test_unreachable_url_yields_no_tools_and_never_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Port 9 is the discard port -- reliably refuses. The caplog assertion
+    pins this to the real degrade-and-skip code path in mount()'s except
+    block, not just "no tools came back for some other reason"."""
     mount = MCPMount([MCPServerConfig(url="http://127.0.0.1:9/mcp")])
     assert await mount.mount() == []
+    await mount.close()
+    assert any(
+        "failed to mount" in r.message and "127.0.0.1:9" in r.message for r in caplog.records
+    )
+
+
+async def test_empty_string_entry_degrades_instead_of_crashing_construction(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A "" entry (e.g. os.environ.get("SOME_MCP_CMD", "")) must degrade to
+    zero tools like any other bad config, not raise out of MCPMount() /
+    mount() -- MCPServerConfig("") fails "exactly one of command/url", and
+    that construction now happens inside mount()'s per-server try, not in
+    __init__ where it would crash Runtime.start() before any server ran."""
+    mount = MCPMount([""])
+    assert await mount.mount() == []
+    await mount.close()
+    assert any("failed to mount" in r.message for r in caplog.records)
+
+
+async def test_dataclass_entry_does_not_inherit_global_env_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MCPServerConfig(command=...) with no `env` of its own must NOT pick up
+    MCPMount(env_passthrough=...) -- that global list applies only to plain
+    string entries; a dataclass entry's own (empty, here) `env` wins."""
+    monkeypatch.setenv("DUDAMEL_TEST_VAR", "leaked-value")
+    mount = MCPMount(
+        [MCPServerConfig(command=FIXTURE_COMMAND)], env_passthrough=("DUDAMEL_TEST_VAR",)
+    )
+    tools = await mount.mount()
+    read_env = next(t for t in tools if t.name.endswith("__read_env"))
+    assert await read_env.fn(name="DUDAMEL_TEST_VAR") == ""
     await mount.close()
 
 
