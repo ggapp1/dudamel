@@ -24,9 +24,11 @@ from dudamel.exceptions import RegistryError, ToolValidationError
 from dudamel.llm.testing import FakeProvider, fake_text, fake_tool_call
 from dudamel.mcp_mount import (
     MCPMount,
+    MCPServerConfig,
     McpToolSchema,
     _collect_server_tools,
     _make_call_fn,
+    _MountedServer,
     _refuse_elicitation,
     _refuse_list_roots,
     _refuse_sampling,
@@ -355,6 +357,41 @@ def test_mcp_tool_schema_validate_checks_required_and_dict_shape() -> None:
         schema.validate("not a dict")  # type: ignore[arg-type]
 
 
+# -- late-bound session resolution --------------------------------------------
+
+
+async def test_call_fn_resolves_the_session_at_call_time() -> None:
+    """Registry holds Tool objects permanently, so a reconnect that rebinds
+    the session must reach tools that were built before it. Binding the
+    session at build time instead of call time makes that impossible."""
+
+    class _FakeSession:
+        def __init__(self, reply: str) -> None:
+            self.reply = reply
+
+        async def call_tool(self, name: str, args: dict) -> types.CallToolResult:
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=self.reply)], isError=False
+            )
+
+    server = _MountedServer(MCPServerConfig(command="unused"))
+    server.session = _FakeSession("first")  # type: ignore[assignment]
+    fn = _make_call_fn(server, remote_name="t", local_name="s__t")
+    assert await fn() == "first"
+
+    server.session = _FakeSession("second")  # type: ignore[assignment]
+    assert await fn() == "second"
+
+
+async def test_call_fn_raises_runtime_error_when_session_is_none() -> None:
+    """A tool built before the server ever connected -- or one left over
+    after a dropped connection -- must fail the call, not crash the caller."""
+    server = _MountedServer(MCPServerConfig(command="unused"))
+    fn = _make_call_fn(server, remote_name="whatever", local_name="fixture__whatever")
+    with pytest.raises(RuntimeError, match="no live session"):
+        await fn()
+
+
 # -- server-side is_error -> raised so the router marks the result an error ---
 
 
@@ -367,7 +404,9 @@ async def test_call_fn_raises_runtime_error_on_server_side_is_error() -> None:
                 content=[types.TextContent(type="text", text="upstream boom")], isError=True
             )
 
-    fn = _make_call_fn(_FakeSession(), remote_name="whatever", local_name="fixture__whatever")  # type: ignore[arg-type]
+    server = _MountedServer(MCPServerConfig(command="unused"))
+    server.session = _FakeSession()  # type: ignore[assignment]
+    fn = _make_call_fn(server, remote_name="whatever", local_name="fixture__whatever")
     with pytest.raises(RuntimeError, match="upstream boom"):
         await fn()
 
@@ -385,7 +424,9 @@ async def test_call_fn_joins_multiple_text_blocks() -> None:
                 isError=False,
             )
 
-    fn = _make_call_fn(_FakeSession(), remote_name="whatever", local_name="local")  # type: ignore[arg-type]
+    server = _MountedServer(MCPServerConfig(command="unused"))
+    server.session = _FakeSession()  # type: ignore[assignment]
+    fn = _make_call_fn(server, remote_name="whatever", local_name="local")
     assert await fn() == "a\nb"
 
 
