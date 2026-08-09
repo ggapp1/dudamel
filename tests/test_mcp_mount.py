@@ -73,14 +73,45 @@ async def test_mount_discovers_fixture_tools_namespaced_and_annotated() -> None:
     finally:
         await mount.close()
     by_name = {t.name: t for t in tools}
-    assert set(by_name) == {"fixture__echo", "fixture__mutate", "fixture__read_env"}
+    assert set(by_name) == {
+        "fixture__echo",
+        "fixture__mutate",
+        "fixture__read_env",
+        "fixture__destroy",
+    }
     assert by_name["fixture__echo"].read_only is True
     assert by_name["fixture__mutate"].read_only is False  # unannotated -> mutating
     assert by_name["fixture__read_env"].read_only is True
     assert all(t.origin == "mcp" for t in by_name.values())
     assert all(t.description.startswith("[experimental MCP]") for t in by_name.values())
     assert all(t.timeout == 30.0 for t in by_name.values())
-    assert all(t.confirm is False for t in by_name.values())
+    assert by_name["fixture__destroy"].confirm is True
+    assert all(t.confirm is False for name, t in by_name.items() if name != "fixture__destroy")
+
+
+async def test_explicit_destructive_hint_forces_confirm() -> None:
+    mount = MCPMount([FIXTURE_CMD])
+    try:
+        tools = await mount.mount()
+    finally:
+        await mount.close()
+    by_name = {t.name: t for t in tools}
+    assert by_name["fixture__destroy"].confirm is True
+
+
+async def test_absent_annotations_do_not_force_confirm() -> None:
+    """The MCP spec defaults destructiveHint to true when absent; applying
+    that default would confirm-prompt every unannotated tool and make the
+    feature unusable, so only an explicit true forces confirm. The
+    compensating control is the taint gate over mutating mcp tools."""
+    mount = MCPMount([FIXTURE_CMD])
+    try:
+        tools = await mount.mount()
+    finally:
+        await mount.close()
+    by_name = {t.name: t for t in tools}
+    assert by_name["fixture__mutate"].confirm is False
+    assert by_name["fixture__echo"].confirm is False
 
 
 async def test_mounted_tool_fn_round_trips_through_the_server() -> None:
@@ -227,6 +258,7 @@ async def test_mixed_reachable_and_unreachable_servers(tmp_path: Path) -> None:
             "fixture__echo",
             "fixture__mutate",
             "fixture__read_env",
+            "fixture__destroy",
         }
     finally:
         await rt.stop()
@@ -409,9 +441,11 @@ async def test_runtime_start_stop_survives_two_mounted_servers_repeatedly(
             "alpha__echo",
             "alpha__mutate",
             "alpha__read_env",
+            "alpha__destroy",
             "beta__echo",
             "beta__mutate",
             "beta__read_env",
+            "beta__destroy",
         }
         await rt.stop()  # must not raise
 
@@ -467,7 +501,12 @@ async def test_spoofed_server_identity_drops_colliding_tool_and_start_succeeds(
     )
     await rt.start()  # must NOT raise
     try:
-        assert set(orc.registry.tools) == {"fixture__echo", "fixture__mutate", "fixture__read_env"}
+        assert set(orc.registry.tools) == {
+            "fixture__echo",
+            "fixture__mutate",
+            "fixture__read_env",
+            "fixture__destroy",
+        }
         assert any("dropping this one" in r.message for r in caplog.records)
     finally:
         await rt.stop()
@@ -543,7 +582,7 @@ async def test_env_passthrough_absent_var_stays_absent_without_config(
 async def test_mount_exceeding_max_tools_drops_mcp_tools_instead_of_crashing(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    orc = Orchestrator(apps=[], mcp=[FIXTURE_CMD])  # fixture mounts 3 tools
+    orc = Orchestrator(apps=[], mcp=[FIXTURE_CMD])  # fixture mounts 4 tools
     settings = make_settings(tmp_path, router=RouterConfig(max_tools=1))
     rt = Runtime(orc, settings, providers={"standard": FakeProvider([fake_text("hi")])})
     with caplog.at_level(logging.WARNING, logger="dudamel.router"):

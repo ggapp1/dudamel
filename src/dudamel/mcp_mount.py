@@ -19,6 +19,19 @@ classification is load-bearing: once a turn has seen any mcp output, the
 router confirm-gates every mutating tool it is asked to run, mcp-origin ones
 included.
 
+`destructive_hint` is honored too, but only in its EXPLICIT-true form: a
+tool whose server sets `destructive_hint: true` becomes `Tool(confirm=True)`,
+so the router stops and asks before running it. An absent or false
+`destructive_hint` does NOT force confirm. This is a deliberate departure
+from the MCP spec, which defaults `destructive_hint` to true when the
+annotation is missing -- applying that default here would confirm-prompt
+every unannotated mcp tool and make the whole feature unusable. The
+compensating control for the tools this leaves un-prompted is the
+`read_only_hint` taint gate described above: any mutating mcp tool (which is
+most of them, since unannotated defaults to mutating) is already
+confirm-gated once a turn has seen mcp output, regardless of
+`destructive_hint`.
+
 Note what this does NOT defend against: annotations are self-reported by the
 server, so a hostile one can declare a destructive tool `read_only_hint:
 true` and skip the gate. The real trust boundary is which servers the
@@ -191,6 +204,7 @@ def _build_tool(
     tool_name: str,
     mcp_tool: types.Tool,
     read_only: bool,
+    confirm: bool,
 ) -> Tool:
     raw_description = mcp_tool.description or mcp_tool.name
     # Truncate, not drop: a truncated description is still a description.
@@ -205,7 +219,7 @@ def _build_tool(
         fn=_make_call_fn(session, remote_name=mcp_tool.name, local_name=tool_name),
         schema=McpToolSchema(input_schema),
         read_only=read_only,
-        confirm=False,
+        confirm=confirm,
         timeout=CALL_TIMEOUT,
         origin="mcp",
     )
@@ -345,7 +359,13 @@ def _collect_server_tools(
             )
             continue
         seen_names.add(name)
-        read_only = bool(mcp_tool.annotations and mcp_tool.annotations.read_only_hint)
+        annotations = mcp_tool.annotations
+        read_only = bool(annotations and annotations.read_only_hint)
+        # Only an EXPLICIT true forces confirm. The MCP spec defaults
+        # destructive_hint to true when absent, but applying that default
+        # would confirm-prompt every unannotated tool and make mcp mounting
+        # unusable; mutating mcp tools are covered by the taint gate instead.
+        destructive = bool(annotations and annotations.destructive_hint is True)
         tools.append(
             _build_tool(
                 session,
@@ -353,6 +373,7 @@ def _collect_server_tools(
                 tool_name=name,
                 mcp_tool=mcp_tool,
                 read_only=read_only,
+                confirm=destructive,
             )
         )
     return tools
