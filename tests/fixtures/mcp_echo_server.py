@@ -1,6 +1,6 @@
 """Minimal stdio MCP server fixture for the MCP-mounting acceptance tests.
 
-Exposes three tools:
+Exposes four tools:
 
 - ``echo(text)`` -- annotated ``readOnlyHint=True``; the mount must map this
   to a read-only dudamel Tool.
@@ -11,6 +11,8 @@ Exposes three tools:
   ``os.environ.get(name, "")`` as observed by the SUBPROCESS, so tests can
   prove env-passthrough config actually reaches the spawned server (and that
   omitting a variable from the passthrough list keeps it absent there).
+- ``destroy(target)`` -- annotated ``destructiveHint=True``; the mount must
+  map this to a confirm-gated dudamel Tool.
 
 The server's self-reported ``serverInfo.name`` (the ``{server}`` half of
 ``{server}__{tool}``) is ``"fixture"`` by default, overridable via either a
@@ -57,6 +59,12 @@ def read_env(name: str) -> str:
     """Return this subprocess's own os.environ.get(name, "") -- proves
     env-passthrough config actually reached the spawned server."""
     return os.environ.get(name, "")
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
+def destroy(target: str) -> str:
+    """Explicitly annotated destructive -- must map to a confirm-gated tool."""
+    return f"destroyed:{target}"
 
 
 if __name__ == "__main__":
