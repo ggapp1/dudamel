@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import logging
 import os
 import re
@@ -53,6 +54,14 @@ logger = logging.getLogger("dudamel.mcp")
 
 CALL_TIMEOUT = 30.0  # per-tool-call timeout (Tool.timeout), enforced by Router
 MOUNT_TIMEOUT = 15.0  # connect + list_tools budget per server, at mount time
+
+# An MCP server's input_schema and description are embedded verbatim in every
+# LLM request, so both are a token-budget cost AND a prompt-injection channel
+# that fires at advertise time -- before any tool call, and therefore with no
+# taint at all. 16 KiB is ~4-5k tokens against a default window_tokens of
+# 8000, so a schema that wants a higher cap is already unusable here.
+MAX_SCHEMA_BYTES = 16384
+MAX_DESCRIPTION_CHARS = 1024
 
 _REFUSAL = "MCP server-initiated callbacks are not supported in dudamel v1"
 
@@ -183,7 +192,11 @@ def _build_tool(
     mcp_tool: types.Tool,
     read_only: bool,
 ) -> Tool:
-    description = f"[experimental MCP] {mcp_tool.description or mcp_tool.name}"
+    raw_description = mcp_tool.description or mcp_tool.name
+    # Truncate, not drop: a truncated description is still a description.
+    if len(raw_description) > MAX_DESCRIPTION_CHARS:
+        raw_description = raw_description[:MAX_DESCRIPTION_CHARS] + "..."
+    description = f"[experimental MCP] {raw_description}"
     input_schema = mcp_tool.input_schema or {"type": "object", "properties": {}}
     return Tool(
         name=tool_name,
@@ -308,6 +321,29 @@ def _collect_server_tools(
                 name,
             )
             continue
+        raw_schema = mcp_tool.input_schema or {"type": "object", "properties": {}}
+        try:
+            schema_bytes = len(json.dumps(raw_schema).encode("utf-8"))
+        except (RecursionError, ValueError, TypeError) as e:
+            logger.warning(
+                "mcp: tool %r from server %r has an input schema that cannot be "
+                "serialized (%s) -- dropping this tool; the mount continues",
+                mcp_tool.name,
+                command,
+                type(e).__name__,
+            )
+            continue
+        if schema_bytes > MAX_SCHEMA_BYTES:
+            # Drop, not truncate: a truncated JSON Schema is not a schema.
+            logger.warning(
+                "mcp: tool %r from server %r has a %d-byte input schema, over the "
+                "%d-byte cap -- dropping this tool; the mount continues",
+                mcp_tool.name,
+                command,
+                schema_bytes,
+                MAX_SCHEMA_BYTES,
+            )
+            continue
         seen_names.add(name)
         read_only = bool(mcp_tool.annotations and mcp_tool.annotations.read_only_hint)
         tools.append(
@@ -361,7 +397,18 @@ class MCPMount:
             server = _MountedServer(command, env_passthrough=self._env_passthrough)
             try:
                 await asyncio.wait_for(server.connect(), timeout=MOUNT_TIMEOUT)
-                listed = await asyncio.wait_for(server.session.list_tools(), timeout=MOUNT_TIMEOUT)  # type: ignore[union-attr]
+                listed = await asyncio.wait_for(
+                    server.session.list_tools(),  # type: ignore[union-attr]
+                    timeout=MOUNT_TIMEOUT,
+                )
+                assert server.session is not None
+                collected = _collect_server_tools(
+                    server.session,
+                    server_name=server.server_name,
+                    command=command,
+                    mcp_tools=listed.tools,
+                    seen_names=seen_names,
+                )
             except Exception as e:
                 logger.warning(
                     "mcp: server %r failed to mount (%s: %s) -- skipping; core unaffected",
@@ -372,16 +419,7 @@ class MCPMount:
                 await server.close()
                 continue
             self._servers.append(server)
-            assert server.session is not None
-            tools.extend(
-                _collect_server_tools(
-                    server.session,
-                    server_name=server.server_name,
-                    command=command,
-                    mcp_tools=listed.tools,
-                    seen_names=seen_names,
-                )
-            )
+            tools.extend(collected)
         return tools
 
     async def close(self) -> None:
