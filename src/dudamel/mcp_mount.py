@@ -220,9 +220,15 @@ class McpToolSchema:
 
 
 def _make_call_fn(
-    session: ClientSession, *, remote_name: str, local_name: str
+    server: _MountedServer, *, remote_name: str, local_name: str
 ) -> Callable[..., Awaitable[str]]:
     async def call(**kwargs: Any) -> str:
+        # Resolved per call, never captured: Registry stores these Tool
+        # objects permanently, so a session rebound by reconnect has to reach
+        # tools that were built against the previous one.
+        session = server.session
+        if session is None:
+            raise RuntimeError(f"mcp tool {local_name} has no live session")
         result = await session.call_tool(remote_name, kwargs)
         text = "\n".join(
             block.text for block in result.content if isinstance(block, types.TextContent)
@@ -240,7 +246,7 @@ def _make_call_fn(
 
 
 def _build_tool(
-    session: ClientSession,
+    server: _MountedServer,
     *,
     server_name: str,
     tool_name: str,
@@ -258,7 +264,7 @@ def _build_tool(
         name=tool_name,
         app_name=f"mcp:{server_name}",
         description=description,
-        fn=_make_call_fn(session, remote_name=mcp_tool.name, local_name=tool_name),
+        fn=_make_call_fn(server, remote_name=mcp_tool.name, local_name=tool_name),
         schema=McpToolSchema(input_schema),
         read_only=read_only,
         confirm=confirm,
@@ -359,7 +365,7 @@ class _MountedServer:
 
 
 def _collect_server_tools(
-    session: ClientSession,
+    server: _MountedServer,
     *,
     server_name: str,
     command: str,
@@ -436,7 +442,7 @@ def _collect_server_tools(
         destructive = bool(annotations and annotations.destructive_hint is True)
         tools.append(
             _build_tool(
-                session,
+                server,
                 server_name=server_name,
                 tool_name=name,
                 mcp_tool=mcp_tool,
@@ -516,7 +522,7 @@ class MCPMount:
                 )
                 assert server.session is not None
                 collected = _collect_server_tools(
-                    server.session,
+                    server,
                     server_name=server.server_name,
                     command=config.label,
                     mcp_tools=listed.tools,
