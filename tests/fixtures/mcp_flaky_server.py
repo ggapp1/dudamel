@@ -7,15 +7,18 @@ probe what happens across a real process death:
 - ``die()`` -- exits the process immediately (``os._exit``), killing the
   transport mid-session so a client sees a genuine connection failure
   (broken pipe / EOF) rather than a simulated error.
-- ``slow_mutate(value)`` -- records a side effect to disk, then sleeps for a
-  configurable delay before returning. Unannotated, so it is treated as
-  mutating. Because the side effect lands before the sleep, killing the
-  process during that sleep produces exactly the case a naive retry gets
-  wrong: the mutation already happened, but the caller never saw a reply.
+- ``slow_mutate(value)`` -- records a side effect to disk (a ``started:``
+  marker line a test can poll for, immediately followed by the real
+  side-effect line, both synced together), then sleeps for a configurable
+  delay before returning. Unannotated, so it is treated as mutating.
+  Because the side effect lands before the sleep, killing the process
+  during that sleep produces exactly the case a naive retry gets wrong: the
+  mutation already happened, but the caller never saw a reply.
 - ``count()`` -- annotated read-only; reports how many times ``slow_mutate``
-  has actually run, read back from the same on-disk record. Since that
-  record lives outside the process, a freshly restarted server can still
-  answer this correctly for mutations performed by a prior incarnation.
+  has actually completed, read back from the same on-disk record (marker
+  lines don't count). Since that record lives outside the process, a
+  freshly restarted server can still answer this correctly for mutations
+  performed by a prior incarnation.
 - ``echo(text)`` -- annotated read-only, so calling it again after a failure
   is provably safe -- there is no side effect to double up on.
 
@@ -72,8 +75,19 @@ def die() -> str:
 def slow_mutate(value: str) -> str:
     """Record a side effect immediately, then sleep -- long enough for a test
     to kill this process before the reply is delivered. Unannotated, so it
-    is treated as mutating."""
+    is treated as mutating.
+
+    Writes two lines in one atomic append: a ``started:<value>`` marker,
+    immediately followed by the real ``<value>`` side-effect line, both
+    flushed and fsynced together before the sleep even starts. A test that
+    wants to kill this process mid-call can poll the state file for the
+    marker instead of guessing with a fixed sleep -- since both lines are
+    written and synced as one unit, observing the marker on disk is proof
+    the side-effect line landed too, not just that the handler started.
+    ``count()`` below only counts the second kind of line.
+    """
     with _STATE.open("a") as fh:
+        fh.write(f"started:{value}\n")
         fh.write(f"{value}\n")
         fh.flush()
         os.fsync(fh.fileno())
@@ -83,10 +97,14 @@ def slow_mutate(value: str) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def count() -> str:
-    """How many times slow_mutate has actually run, across restarts."""
+    """How many times slow_mutate has actually completed its side effect,
+    across restarts. Ignores ``started:`` marker lines -- those record that
+    a call began, not that it finished, so counting them would let a
+    mid-call kill look like two completed mutations instead of one."""
     if not _STATE.exists():
         return "0"
-    return str(len([ln for ln in _STATE.read_text().splitlines() if ln]))
+    lines = [ln for ln in _STATE.read_text().splitlines() if ln and not ln.startswith("started:")]
+    return str(len(lines))
 
 
 if "echo" not in _DROPPED:
