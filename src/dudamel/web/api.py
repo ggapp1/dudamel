@@ -213,6 +213,34 @@ def create_api(runtime: Runtime, settings: Settings) -> FastAPI:
     async def api_pending(
         channel: str | None = None, auth: AuthVia = Depends(authenticate)
     ) -> list[dict[str, Any]]:
-        return await runtime.list_pending_confirmations(channel)
+        """Every pending confirmation, across channels — deliberately unscoped.
+
+        Reaching this endpoint already requires the web token, cookie auth is
+        SameSite=Strict and safe-method-only, and a cross-user resolve is
+        rejected by `resolve_confirmation` itself (it compares the resolving
+        caller's user_id against the confirmation's own, inside the
+        conversation lock). The activity view already exposes every
+        channel's tool calls and arguments to any authenticated operator, so
+        scoping this list would be inconsistent rather than safer.
+
+        `resolvable` mirrors that same check for this API surface, which
+        always resolves as user_id="web" (see api_confirm above): it marks
+        the entries this caller can actually act on, so the dashboard can
+        show the rest as read-only instead of offering a button that will
+        always be refused.
+        """
+        entries = await runtime.list_pending_confirmations(channel)
+        return [
+            {
+                "id": e["id"],
+                "tool": e["tool"],
+                "args": e["args"],
+                "created_at": e["created_at"],
+                "expires_at": e["expires_at"],
+                "channel": e["channel"],
+                "resolvable": e["user_id"] == "web",
+            }
+            for e in entries
+        ]
 
     return app
