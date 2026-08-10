@@ -131,6 +131,30 @@ async def test_start_succeeds_when_auto_migrate_is_false_and_schema_is_current(
     await rt2.stop()
 
 
+async def test_start_refuses_when_app_migration_is_pending(tmp_path: Path) -> None:
+    """auto_migrate=False must gate the app tier too, not just core -- an
+    app migration script generated but never applied is exactly what a
+    core-only check would miss."""
+    from dudamel.migrate import ensure_app_migrations, generate_app_migration, upgrade_core
+
+    app = App("blog", description="d")
+
+    class Post(app.Model):
+        title: str
+
+    settings = make_settings(tmp_path)
+    upgrade_core(settings.database_url)
+    ensure_app_migrations(tmp_path)
+    generate_app_migration(Orchestrator(apps=[app]), settings.database_url, "add posts", tmp_path)
+
+    settings.auto_migrate = False
+    rt = Runtime(Orchestrator(apps=[]), settings, providers={"standard": FakeProvider([])})
+    with pytest.raises(DudamelError) as exc:
+        await rt.start()
+    assert "dudamel db migrate" in str(exc.value)
+    assert "app" in str(exc.value)
+
+
 def test_openai_tier_requires_base_url(tmp_path) -> None:
     with pytest.raises(RegistryError, match="base_url"):
         Runtime(
