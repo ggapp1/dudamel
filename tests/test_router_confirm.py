@@ -14,7 +14,7 @@ from dudamel.llm.types import Completion, Message, ToolCall, Usage
 from dudamel.migrate import upgrade_core
 from dudamel.models_core import PendingConfirmation
 from dudamel.registry import Registry
-from dudamel.router import ChatReply, Router, _confirmed_error_text, _utcnow
+from dudamel.router import ChatReply, Router, _confirmed_error_text, _tool_error_text, _utcnow
 
 DELETED: list[str] = []
 MUTATED: list[str] = []
@@ -331,3 +331,23 @@ async def test_confirmed_indeterminate_outcome_reaches_the_model_unfailed(tmp_pa
     assert "failed" not in result.text
     assert "UNKNOWN" in result.text and "Do not retry" in result.text
     await db.dispose()
+
+
+def test_unconfirmed_tool_error_message_does_not_announce_an_unknown_outcome_as_a_raise() -> None:
+    """The unconfirmed path needs this MORE than the confirmed one, not less:
+    a call that reached execution without a confirm gate -- under
+    `taint_mode = "off"`, every mcp call -- has nothing but this wording
+    between an indeterminate mutation and the model retrying it."""
+    indeterminate = _tool_error_text(
+        "files__write",
+        UnknownToolOutcome(
+            "mcp tool files__write: the call timed out after 30s and the outcome is "
+            "UNKNOWN -- it may or may not have taken effect. Do not retry "
+            "automatically; check the server's state first."
+        ),
+    )
+    assert "failed" not in indeterminate and "raised" not in indeterminate
+    assert "UNKNOWN" in indeterminate and "Do not retry" in indeterminate
+    # Every other tool error keeps the wording it has always had.
+    ordinary = _tool_error_text("wipe_log", RuntimeError("disk is on fire"))
+    assert ordinary == "tool wipe_log raised RuntimeError: disk is on fire"

@@ -96,7 +96,11 @@ Annotations are re-read on every reconnect, because a restarted server is
 not required to be the same server. A tool whose `read_only_hint` or
 `destructive_hint` changed is force-gated to `confirm=True` (and loses its
 retry-safety) with a warning -- the classification it was registered under
-is no longer something this server can be trusted to have kept. A tool that
+is no longer something this server can be trusted to have kept. That
+includes the call that triggered the reconnect which discovered the drift:
+it is re-checked afterwards and gets the unknown-outcome error instead of
+its retry, because otherwise it would re-invoke, unapproved, a tool the
+server has just declared destructive. A tool that
 is no longer advertised at all returns an error on its next call.
 
 Server-initiated callbacks (sampling / elicitation / roots) are refused
@@ -582,8 +586,12 @@ def _make_call_fn(
                 # through is what lets `wait_for` report a TimeoutError.
                 raise
             # "Provably harmless to have happened twice, or not at all."
-            # Read-only is only half of it: a tool whose annotations drifted
-            # has forfeited the classification that justified trusting it.
+            # Read-only is only half of it: a tool whose annotations have
+            # ALREADY been seen to drift has forfeited the classification
+            # that justified trusting it. Drift that this failure's own
+            # reconnect is about to discover cannot be visible yet, so this
+            # answer is provisional and is re-checked after the rebuild
+            # below -- `_apply_reconnect_drift` runs inside `reconnect()`.
             harmless = read_only and server.is_retry_safe(remote_name)
             if not _is_connection_death(e):
                 # NOT a reconnect decision -- the transport is fine and
@@ -611,14 +619,25 @@ def _make_call_fn(
                 # branch above, which rebuilds before dispatching anything;
                 # that is the only place a mutating call is ever
                 # (re)dispatched by this code.
-                server.mark_connection_lost()
+                server.mark_connection_lost(generation)
                 raise unknown_outcome("the server connection died during the call") from None
-            # Only a harmless call reaches here, and only it pays for the
-            # rebuild inline -- it is about to reuse the new connection.
-            # Safe by construction: a read-only tool has no side effect to
-            # double up on, so it does not matter whether the request
-            # reached the server before the connection dropped.
+            # Only a provisionally-harmless call reaches here, and only it
+            # pays for the rebuild inline -- it is about to reuse the new
+            # connection. Safe by construction: a read-only tool has no side
+            # effect to double up on, so it does not matter whether the
+            # request reached the server before the connection dropped.
             await server.reconnect(generation)
+            if not server.is_retry_safe(remote_name):
+                # Re-checked AFTER the reconnect, and this is the only place
+                # it can be checked: the reconnect is what re-reads the
+                # server's annotations, so a tool that comes back declared
+                # MUTATING is first knowable here -- and it is precisely the
+                # tool this call is about to re-invoke. Retrying it would
+                # execute, with no confirm gate and no approval, a call the
+                # server has just declared destructive. The justification
+                # for the transparent retry is gone, so the outcome is
+                # exactly as indeterminate as any other mutating one.
+                raise unknown_outcome("the server connection died during the call") from None
             if server.is_vanished(remote_name):
                 raise vanished() from None
             retry_session = server.session
@@ -720,10 +739,17 @@ class _MountedServer:
     the supervisor task, which owns the `AsyncExitStack` from the moment it
     is created until it exits.
 
-    `session`, `server_name` and `alive` are rebound by the supervisor and
-    read (never written) by callers; `generation` counts successful
-    connections, and is how a caller says "I failed against connection N"
-    without having to hold a lock while it makes its tool call.
+    `session`, `server_name` and `alive` are rebound by the supervisor;
+    `generation` counts successful connections, and is how a caller says "I
+    failed against connection N" without having to hold a lock while it
+    makes its tool call.
+
+    Callers read those three and do not write them, with exactly one
+    exception: `mark_connection_lost`, which clears `session` and `alive`
+    for a caller that has diagnosed its own connection as dead. That is a
+    narrowing write, guarded by `generation`, and touches neither the stack
+    nor any cancel scope -- see its docstring. Nothing else about the
+    supervisor's ownership is negotiable.
     """
 
     def __init__(self, config: MCPServerConfig, *, mount_timeout: float = MOUNT_TIMEOUT) -> None:
@@ -778,9 +804,9 @@ class _MountedServer:
             tool=tool, read_only=read_only, destructive=destructive
         )
 
-    def mark_connection_lost(self) -> None:
-        """Record that a caller diagnosed this connection as dead, without
-        rebuilding it here.
+    def mark_connection_lost(self, seen_generation: int) -> None:
+        """Record that a caller diagnosed connection `seen_generation` as
+        dead, without rebuilding it here.
 
         The one thing a caller is allowed to write, and it only ever
         narrows: a session that has seen its connection die stays dead
@@ -790,10 +816,22 @@ class _MountedServer:
         immediately, instead of depending on whether the supervisor has yet
         been cancelled by its own transport and torn the stack down.
 
+        `seen_generation` is what keeps that from misfiring inside a batch.
+        Router tool calls in one batch run as concurrent tasks, and a batch
+        of simultaneously-failing calls is the case `reconnect()` coalesces:
+        a sibling can be *inside* `_rebuild` while this caller decides its
+        own, older connection is gone. Writing unconditionally could land
+        between that rebuild installing the fresh session and the sibling
+        reading it, and answer the sibling with "no live session" about a
+        connection that is up. A generation that has already moved on is
+        somebody else's connection, and is left alone.
+
         The stack itself is untouched and still owned by the supervisor,
         which releases it either on its stand-down or on the next
         `_rebuild`; nothing is leaked by forgetting the session here.
         """
+        if self.generation != seen_generation:
+            return
         self.alive = False
         self.session = None
 
