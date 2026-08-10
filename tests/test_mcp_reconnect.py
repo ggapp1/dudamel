@@ -42,6 +42,7 @@ from mcp.shared.exceptions import MCPError
 from dudamel import mcp_mount
 from dudamel.contract.types import Tool
 from dudamel.mcp_mount import (
+    ROUTER_TIMEOUT_MARGIN_SECONDS,
     MCPMount,
     MCPServerConfig,
     _is_connection_death,
@@ -616,6 +617,38 @@ async def test_router_timeout_still_surfaces_as_a_timeout(
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(_tool(tools, "slow_mutate").fn(value="slow"), 0.2)
         assert mount._servers[0].reconnect_count == 0
+    finally:
+        await mount.close()
+
+
+async def test_call_timeout_reaches_the_caller_as_the_coded_native_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point of enforcing call_timeout through the SDK's own
+    `read_timeout_seconds` instead of a Router-level `asyncio.wait_for`: a
+    genuinely slow tool call must surface a coded `MCPError(REQUEST_TIMEOUT)`
+    -- which `_is_connection_death` correctly reads as "not a dead
+    connection" -- rather than the Router's bare, uncoded `TimeoutError`.
+
+    Wrapped in `asyncio.wait_for(tool.fn(...), tool.timeout)`, exactly the
+    way `router.py` itself calls it, so this exercises the real race between
+    the two layers rather than asserting on a configured value in isolation.
+    It would fail if `Tool.timeout` were ever set equal to (rather than
+    materially larger than) the native call_timeout: the Router's outer
+    clock starts before `tool.fn` even runs, so an equal budget lets it
+    expire first and this test would see a bare `TimeoutError` instead.
+    """
+    mount = MCPMount(
+        [flaky_cmd(tmp_path, monkeypatch, name="native-timeout", slow_seconds=5.0)],
+        call_timeout=0.2,
+    )
+    try:
+        tools = await mount.mount()
+        slow = _tool(tools, "slow_mutate")
+        assert slow.timeout == pytest.approx(0.2 + ROUTER_TIMEOUT_MARGIN_SECONDS)
+        with pytest.raises(MCPError) as exc_info:
+            await asyncio.wait_for(slow.fn(value="v"), slow.timeout)
+        assert exc_info.value.code == types.REQUEST_TIMEOUT
     finally:
         await mount.close()
 

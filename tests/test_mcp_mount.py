@@ -24,6 +24,8 @@ from dudamel.contract.types import TOOL_NAME_RE, Tool
 from dudamel.exceptions import RegistryError, ToolValidationError
 from dudamel.llm.testing import FakeProvider, fake_text, fake_tool_call
 from dudamel.mcp_mount import (
+    CALL_TIMEOUT,
+    ROUTER_TIMEOUT_MARGIN_SECONDS,
     MCPMount,
     MCPServerConfig,
     McpToolSchema,
@@ -87,7 +89,12 @@ async def test_mount_discovers_fixture_tools_namespaced_and_annotated() -> None:
     assert by_name["fixture__read_env"].read_only is True
     assert all(t.origin == "mcp" for t in by_name.values())
     assert all(t.description.startswith("[experimental MCP]") for t in by_name.values())
-    assert all(t.timeout == 30.0 for t in by_name.values())
+    # Tool.timeout is the Router's own backstop, deliberately LARGER than the
+    # native call_timeout that actually enforces the call -- see
+    # ROUTER_TIMEOUT_MARGIN_SECONDS in mcp_mount.py for why equal values
+    # would let the Router's outer clock win the race and mask the coded
+    # native timeout with a bare TimeoutError.
+    assert all(t.timeout == CALL_TIMEOUT + ROUTER_TIMEOUT_MARGIN_SECONDS for t in by_name.values())
     assert by_name["fixture__destroy"].confirm is True
     assert all(t.confirm is False for name, t in by_name.items() if name != "fixture__destroy")
 
@@ -134,7 +141,7 @@ async def test_configured_call_timeout_reaches_the_mounted_tool() -> None:
     finally:
         await mount.close()
     assert tools
-    assert all(t.timeout == 2.5 for t in tools)
+    assert all(t.timeout == 2.5 + ROUTER_TIMEOUT_MARGIN_SECONDS for t in tools)
 
 
 async def test_configured_mount_timeout_bounds_a_hanging_server() -> None:
