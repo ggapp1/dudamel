@@ -73,6 +73,10 @@ class Settings(BaseSettings):
 
     database_url: str = "sqlite+aiosqlite:///dudamel.db"
     data_dir: Path = Path(".")
+    # When false, `Runtime.start()` refuses to start against a schema that is
+    # behind its migration scripts, instead of upgrading it in place. Set this
+    # in production: a process restart should never silently mutate a schema.
+    auto_migrate: bool = True
     llm_tiers: dict[str, TierConfig] = {}
     llm_budget: BudgetConfig = BudgetConfig()
     router: RouterConfig = RouterConfig()

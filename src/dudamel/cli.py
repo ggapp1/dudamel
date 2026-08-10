@@ -33,9 +33,6 @@ from pathlib import Path
 from types import ModuleType
 
 import httpx
-from alembic.config import Config as AlembicConfig
-from alembic.migration import MigrationContext
-from alembic.script import ScriptDirectory
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
@@ -43,8 +40,10 @@ from dudamel.config import Settings, TierConfig
 from dudamel.exceptions import DudamelError
 from dudamel.interfaces.telegram import resolve_token as resolve_telegram_token
 from dudamel.migrate import (
+    current_heads,
     ensure_app_migrations,
     generate_app_migration,
+    script_heads,
     sync_url,
     upgrade_apps,
     upgrade_core,
@@ -262,22 +261,6 @@ def _line(ok: bool, label: str, detail: str) -> str:
     return f"{'✓' if ok else '✗'} {label}: {detail}"
 
 
-def _script_heads(script_location: str) -> set[str]:
-    cfg = AlembicConfig()
-    cfg.set_main_option("script_location", script_location)
-    return set(ScriptDirectory.from_config(cfg).get_heads())
-
-
-def _current_heads(db_url: str, version_table: str) -> set[str]:
-    engine = create_engine(sync_url(db_url))
-    try:
-        with engine.connect() as conn:
-            mc = MigrationContext.configure(conn, opts={"version_table": version_table})
-            return set(mc.get_current_heads())
-    finally:
-        engine.dispose()
-
-
 def _check_db_connect(db_url: str) -> tuple[bool, str]:
     # For SQLite, check if the database file exists before trying to connect
     if db_url.startswith("sqlite"):
@@ -313,17 +296,17 @@ def _check_core_migrations(db_url: str) -> tuple[bool, str]:
                         "not yet applied — run `dudamel run` or `dudamel db migrate -m <msg>` once",
                     )
     try:
-        script_heads = _script_heads(str(files("dudamel") / "migrations"))
-        current = _current_heads(db_url, "alembic_version_core")
+        heads = script_heads(str(files("dudamel") / "migrations"))
+        current = current_heads(db_url, "alembic_version_core")
     except Exception as e:
         return False, f"could not read core migration state ({e})"
-    if not script_heads:
+    if not heads:
         return False, "no core migration scripts found (packaging problem)"
-    if current == script_heads:
+    if current == heads:
         return True, "at head"
     if not current:
         return False, "not yet applied — run `dudamel run` or `dudamel db migrate -m <msg>` once"
-    return False, f"behind head ({sorted(current)} != {sorted(script_heads)})"
+    return False, f"behind head ({sorted(current)} != {sorted(heads)})"
 
 
 def _check_app_migrations_dir(project_dir: Path) -> tuple[bool, str]:

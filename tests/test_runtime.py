@@ -7,7 +7,7 @@ import pytest
 
 from dudamel import App, Orchestrator, Runtime
 from dudamel.config import Settings, TierConfig
-from dudamel.exceptions import LLMError, RegistryError
+from dudamel.exceptions import DudamelError, LLMError, RegistryError
 from dudamel.llm.testing import FakeProvider, fake_text, fake_tool_call
 
 
@@ -97,6 +97,38 @@ async def test_start_applies_core_migrations(tmp_path) -> None:
     insp = inspect(create_engine(sync_url(settings.database_url)))
     assert "llm_calls" in insp.get_table_names()
     await rt.stop()
+
+
+async def test_start_auto_migrates_by_default(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    assert settings.auto_migrate is True
+    rt = Runtime(Orchestrator(apps=[]), settings, providers={"standard": FakeProvider([])})
+    await rt.start()  # must not raise; schema is created
+    await rt.stop()
+
+
+async def test_start_refuses_to_migrate_when_auto_migrate_is_false(tmp_path: Path) -> None:
+    """A production deployment opts out so a restart cannot mutate its schema;
+    startup fails loudly naming the command to run instead."""
+    settings = make_settings(tmp_path)
+    settings.auto_migrate = False
+    rt = Runtime(Orchestrator(apps=[]), settings, providers={"standard": FakeProvider([])})
+    with pytest.raises(DudamelError) as exc:
+        await rt.start()
+    assert "dudamel db migrate" in str(exc.value)
+
+
+async def test_start_succeeds_when_auto_migrate_is_false_and_schema_is_current(
+    tmp_path: Path,
+) -> None:
+    settings = make_settings(tmp_path)
+    rt = Runtime(Orchestrator(apps=[]), settings, providers={"standard": FakeProvider([])})
+    await rt.start()
+    await rt.stop()
+    settings.auto_migrate = False
+    rt2 = Runtime(Orchestrator(apps=[]), settings, providers={"standard": FakeProvider([])})
+    await rt2.start()  # already at head — nothing to do, must not raise
+    await rt2.stop()
 
 
 def test_openai_tier_requires_base_url(tmp_path) -> None:
