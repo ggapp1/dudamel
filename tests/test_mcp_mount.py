@@ -376,7 +376,7 @@ async def test_call_fn_resolves_the_session_at_call_time() -> None:
 
     server = _MountedServer(MCPServerConfig(command="unused"))
     server.session = _FakeSession("first")  # type: ignore[assignment]
-    fn = _make_call_fn(server, remote_name="t", local_name="s__t")
+    fn = _make_call_fn(server, remote_name="t", local_name="s__t", read_only=True)
     assert await fn() == "first"
 
     server.session = _FakeSession("second")  # type: ignore[assignment]
@@ -387,7 +387,9 @@ async def test_call_fn_raises_runtime_error_when_session_is_none() -> None:
     """A tool built before the server ever connected -- or one left over
     after a dropped connection -- must fail the call, not crash the caller."""
     server = _MountedServer(MCPServerConfig(command="unused"))
-    fn = _make_call_fn(server, remote_name="whatever", local_name="fixture__whatever")
+    fn = _make_call_fn(
+        server, remote_name="whatever", local_name="fixture__whatever", read_only=True
+    )
     with pytest.raises(RuntimeError, match="no live session"):
         await fn()
 
@@ -406,7 +408,9 @@ async def test_call_fn_raises_runtime_error_on_server_side_is_error() -> None:
 
     server = _MountedServer(MCPServerConfig(command="unused"))
     server.session = _FakeSession()  # type: ignore[assignment]
-    fn = _make_call_fn(server, remote_name="whatever", local_name="fixture__whatever")
+    fn = _make_call_fn(
+        server, remote_name="whatever", local_name="fixture__whatever", read_only=True
+    )
     with pytest.raises(RuntimeError, match="upstream boom"):
         await fn()
 
@@ -426,7 +430,7 @@ async def test_call_fn_joins_multiple_text_blocks() -> None:
 
     server = _MountedServer(MCPServerConfig(command="unused"))
     server.session = _FakeSession()  # type: ignore[assignment]
-    fn = _make_call_fn(server, remote_name="whatever", local_name="local")
+    fn = _make_call_fn(server, remote_name="whatever", local_name="local", read_only=True)
     assert await fn() == "a\nb"
 
 
@@ -516,7 +520,7 @@ async def test_truncation_collision_within_one_server_drops_second_and_warns(
     caplog.set_level("WARNING")
     seen: set[str] = set()
     tools = _collect_server_tools(
-        None,  # type: ignore[arg-type]  # never called: fn is a closure, not invoked here
+        _MountedServer(MCPServerConfig(command="unused")),
         server_name="fixture",
         command="fixture-cmd",
         mcp_tools=[tool_a, tool_b],
@@ -682,7 +686,7 @@ def test_oversized_input_schema_drops_the_tool_and_warns(
     seen: set[str] = set()
     with caplog.at_level(logging.WARNING):
         tools = _collect_server_tools(
-            None,  # type: ignore[arg-type]
+            _MountedServer(MCPServerConfig(command="unused")),
             server_name="fixture",
             command="cmd",
             mcp_tools=[_mcp_tool("big", schema=huge), _mcp_tool("small")],
@@ -701,7 +705,7 @@ def test_dropped_oversized_tool_does_not_burn_its_name(
     seen: set[str] = set()
     with caplog.at_level(logging.WARNING):
         _collect_server_tools(
-            None,  # type: ignore[arg-type]
+            _MountedServer(MCPServerConfig(command="unused")),
             server_name="fixture",
             command="cmd",
             mcp_tools=[_mcp_tool("dup", schema=huge)],
@@ -713,7 +717,7 @@ def test_dropped_oversized_tool_does_not_burn_its_name(
 def test_oversized_description_is_truncated_not_dropped() -> None:
     seen: set[str] = set()
     tools = _collect_server_tools(
-        None,  # type: ignore[arg-type]
+        _MountedServer(MCPServerConfig(command="unused")),
         server_name="fixture",
         command="cmd",
         mcp_tools=[_mcp_tool("chatty", description="z" * 5000)],
@@ -733,7 +737,7 @@ def test_unserializable_schema_drops_the_tool_rather_than_crashing() -> None:
         cursor = cursor["items"]
     seen: set[str] = set()
     tools = _collect_server_tools(
-        None,  # type: ignore[arg-type]
+        _MountedServer(MCPServerConfig(command="unused")),
         server_name="fixture",
         command="cmd",
         mcp_tools=[_mcp_tool("nested", schema=nested), _mcp_tool("fine")],

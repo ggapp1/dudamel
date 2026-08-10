@@ -43,6 +43,34 @@ server, so a hostile one can declare a destructive tool `read_only_hint:
 true` and skip the gate. The real trust boundary is which servers the
 operator chooses to mount.
 
+A server whose process dies is brought back automatically, but only within
+tight limits. Each mounted server owns one long-lived supervisor task that
+holds its `AsyncExitStack`; a failing tool call *signals* that task instead
+of touching the stack itself, because the transport and `ClientSession` open
+anyio cancel scopes that may only be exited by the task that entered them. A
+reconnect always discards the whole transport + session pair and builds a
+fresh one: once a session has seen its connection die, every later operation
+on it fails too, so reusing it can never work. Reconnects are bounded at
+`MAX_RECONNECT_ATTEMPTS` with exponential backoff and serialized per server,
+so a burst of failing calls produces exactly one rebuild; a server that
+exhausts its attempts -- or that never mounted successfully in the first
+place -- stays down for the rest of the process lifetime.
+
+What a reconnect deliberately does NOT do is re-run the call that failed,
+unless re-running it is provably harmless. A read-only tool is retried and
+the caller never learns anything happened. For a mutating tool the request
+may well have been executed before the connection dropped, so the call
+returns an error saying the outcome is UNKNOWN rather than saying it failed:
+reporting failure invites a retry that performs the side effect twice, and
+one confirmation from the user has to mean one execution.
+
+Annotations are re-read on every reconnect, because a restarted server is
+not required to be the same server. A tool whose `read_only_hint` or
+`destructive_hint` changed is force-gated to `confirm=True` (and loses its
+retry-safety) with a warning -- the classification it was registered under
+is no longer something this server can be trusted to have kept. A tool that
+is no longer advertised at all returns an error on its next call.
+
 Server-initiated callbacks (sampling / elicitation / roots) are refused
 explicitly and immediately -- never left to the SDK default of hanging or
 silently no-opping.
@@ -63,10 +91,16 @@ from dataclasses import dataclass
 from typing import Any
 
 import mcp.types as types
+
+# `mcp_types` is a separate top-level distribution that mcp 2.x pins exactly
+# (see the dependency comment in pyproject.toml); the JSON-RPC error codes
+# live there, NOT in `mcp.types`, which is the import that looks right.
+import mcp_types
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.context import ClientRequestContext
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
+from mcp.shared.exceptions import MCPError
 
 from dudamel.contract.types import TOOL_NAME_RE, Tool
 from dudamel.exceptions import ToolValidationError
@@ -75,6 +109,14 @@ logger = logging.getLogger("dudamel.mcp")
 
 CALL_TIMEOUT = 30.0  # per-tool-call timeout (Tool.timeout), enforced by Router
 MOUNT_TIMEOUT = 15.0  # connect + list_tools budget per server, at mount time
+CLOSE_TIMEOUT = 10.0  # how long to wait for a server's supervisor task to exit
+
+# How many times a dead server is rebuilt before it is retired for the rest
+# of the process lifetime, and the base delay between those attempts (which
+# doubles each time: 0s, 0.5s, 1.0s). Bounded on purpose -- a server that is
+# gone for good must not turn every tool call into a multi-second stall.
+MAX_RECONNECT_ATTEMPTS = 3
+RECONNECT_BACKOFF_SECONDS = 0.5
 
 # An MCP server's input_schema and description are embedded verbatim in every
 # LLM request, so both are a token-budget cost AND a prompt-injection channel
@@ -216,19 +258,71 @@ class McpToolSchema:
         return args
 
 
+# -- connection-death classification ---------------------------------------------
+
+
+def _is_self_cancellation() -> bool:
+    """True when THIS task has an outstanding `cancel()` request against it.
+
+    The Router runs every tool under `asyncio.wait_for`, which cancels the
+    task running the tool when the timeout expires. That cancellation must
+    be allowed through untouched, or `wait_for` never converts it into the
+    `TimeoutError` the Router reports -- a slow tool would be misreported as
+    a dead connection. A cancellation arriving from a dead MCP session, by
+    contrast, comes out of the SDK's own anyio scopes and leaves this task's
+    cancellation count at zero.
+    """
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
+
+
+def _is_connection_death(e: BaseException) -> bool:
+    """True if `e` says the transport is gone and only a fresh connection
+    could help; False for an ordinary tool-side failure, which a reconnect
+    would not fix and must not be allowed to trigger one.
+
+    Measured against this SDK generation rather than assumed:
+
+    - anyio's `ClosedResourceError`/`BrokenResourceError` never reach a
+      caller. The dispatcher converts them to `MCPError(CONNECTION_CLOSED)`,
+      which is what the call that was in flight when the server died sees.
+    - `MCPError(REQUEST_TIMEOUT)` is deliberately NOT death. A slow tool is
+      not a dead transport, and reconnecting on every timeout would turn
+      ordinary tool latency into connection churn.
+    - The *next* call issued on a session that has already seen a death
+      raises a bare `asyncio.CancelledError` instead -- a `BaseException`,
+      invisible to `except Exception`. Call sites must therefore catch
+      `BaseException`, and must rule out their own cancellation first (see
+      `_is_self_cancellation`), because the exception alone cannot say who
+      asked for it.
+    - A background failure that was deferred inside a task group surfaces as
+      an exception group, so groups are searched member by member.
+    """
+    if isinstance(e, MCPError):
+        return e.code == mcp_types.CONNECTION_CLOSED
+    if isinstance(e, asyncio.CancelledError):
+        return True
+    if isinstance(e, BaseExceptionGroup):
+        return any(_is_connection_death(sub) for sub in e.exceptions)
+    return False
+
+
 # -- tool call adapter -----------------------------------------------------------
 
 
 def _make_call_fn(
-    server: _MountedServer, *, remote_name: str, local_name: str
+    server: _MountedServer, *, remote_name: str, local_name: str, read_only: bool
 ) -> Callable[..., Awaitable[str]]:
-    async def call(**kwargs: Any) -> str:
-        # Resolved per call, never captured: Registry stores these Tool
-        # objects permanently, so a session rebound by reconnect has to reach
-        # tools that were built against the previous one.
-        session = server.session
-        if session is None:
-            raise RuntimeError(f"mcp tool {local_name} has no live session")
+    """Build the `Tool.fn` for one remote tool, including its reconnect and
+    retry policy.
+
+    `read_only` is the classification the tool was registered under. It is
+    only half the retry decision: `_MountedServer.is_retry_safe` can revoke
+    it later if the server comes back advertising different annotations, and
+    a revoked tool is never retried again.
+    """
+
+    async def invoke(session: ClientSession, **kwargs: Any) -> str:
         result = await session.call_tool(remote_name, kwargs)
         text = "\n".join(
             block.text for block in result.content if isinstance(block, types.TextContent)
@@ -241,6 +335,91 @@ def _make_call_fn(
             # the server's is_error signal entirely.
             raise RuntimeError(text or f"mcp tool {local_name} reported an error with no detail")
         return text
+
+    def vanished() -> RuntimeError:
+        return RuntimeError(
+            f"mcp tool {local_name}: the server no longer advertises this tool after "
+            f"reconnecting, so it cannot be called"
+        )
+
+    def no_session() -> RuntimeError:
+        return RuntimeError(
+            f"mcp tool {local_name} has no live session: the server is not connected and "
+            f"could not be reconnected"
+        )
+
+    def demote(e: BaseException) -> RuntimeError:
+        """Turn a `BaseException` into an ordinary error for the Router.
+
+        Letting one escape `Tool.fn` would tear down the Router's task
+        instead of producing an error tool-result the model can read.
+        """
+        return RuntimeError(f"mcp tool {local_name} failed: {type(e).__name__}: {e}")
+
+    async def call(**kwargs: Any) -> str:
+        # Resolved per call, never captured: Registry stores these Tool
+        # objects permanently, so a session rebound by reconnect has to reach
+        # tools that were built against the previous one.
+        if server.is_vanished(remote_name):
+            raise vanished()
+        generation = server.generation
+        session = server.session
+        if session is None or not server.alive:
+            # Provably pre-dispatch: nothing has been written to the server,
+            # so rebuilding and calling once cannot double anything up. This
+            # is the only case where a MUTATING tool is (re)dispatched by
+            # this code at all.
+            await server.reconnect(generation)
+            if server.is_vanished(remote_name):
+                raise vanished()
+            generation = server.generation
+            session = server.session
+            if session is None:
+                raise no_session()
+        try:
+            return await invoke(session, **kwargs)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as e:
+            if _is_self_cancellation():
+                # The Router's own timeout, not the server dying. Passing it
+                # through is what lets `wait_for` report a TimeoutError.
+                raise
+            if not _is_connection_death(e):
+                if isinstance(e, Exception):
+                    raise
+                raise demote(e) from None
+            await server.reconnect(generation)
+            if read_only and server.is_retry_safe(remote_name):
+                # Safe by construction: a read-only tool has no side effect
+                # to double up on, so it does not matter whether the request
+                # reached the server before the connection dropped.
+                if server.is_vanished(remote_name):
+                    raise vanished() from None
+                retry_session = server.session
+                if retry_session is None:
+                    raise no_session() from None
+                try:
+                    return await invoke(retry_session, **kwargs)
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException as retry_error:
+                    if _is_self_cancellation():
+                        raise
+                    if isinstance(retry_error, Exception):
+                        raise
+                    raise demote(retry_error) from None
+            # Anything mutating stops here, even though the failure looks
+            # like the session was already dead before this call: the call
+            # that is in flight when a server dies and the first call after
+            # it are NOT reliably distinguishable from the exception, so the
+            # only safe reading is that the side effect may have landed.
+            # Saying "failed" would invite a retry that performs it twice.
+            raise RuntimeError(
+                f"mcp tool {local_name}: the server connection died during the call and "
+                f"the outcome is UNKNOWN -- it may or may not have taken effect. Do not "
+                f"retry automatically; check the server's state first."
+            ) from None
 
     return call
 
@@ -260,30 +439,232 @@ def _build_tool(
         raw_description = raw_description[:MAX_DESCRIPTION_CHARS] + "..."
     description = f"[experimental MCP] {raw_description}"
     input_schema = mcp_tool.input_schema or {"type": "object", "properties": {}}
-    return Tool(
+    tool = Tool(
         name=tool_name,
         app_name=f"mcp:{server_name}",
         description=description,
-        fn=_make_call_fn(server, remote_name=mcp_tool.name, local_name=tool_name),
+        fn=_make_call_fn(
+            server,
+            remote_name=mcp_tool.name,
+            local_name=tool_name,
+            read_only=read_only,
+        ),
         schema=McpToolSchema(input_schema),
         read_only=read_only,
         confirm=confirm,
         timeout=CALL_TIMEOUT,
         origin="mcp",
     )
+    # The server keeps a handle on every tool it actually contributed, so a
+    # later reconnect can compare what comes back against what was
+    # registered -- and force-gate or disable the tool in place, since the
+    # Registry holds these exact objects for the process lifetime.
+    server.register(mcp_tool.name, tool, read_only=read_only, destructive=confirm)
+    return tool
 
 
 # -- one mounted server ----------------------------------------------------------
 
 
+@dataclass
+class _RegisteredTool:
+    """One dudamel `Tool` this server contributed, plus the safety
+    annotations it was contributed under, so drift can be detected."""
+
+    tool: Tool
+    read_only: bool
+    destructive: bool
+
+
 class _MountedServer:
+    """One MCP server's connection, owned by a single supervisor task.
+
+    The transport and `ClientSession` are async context managers that open
+    anyio cancel scopes, and anyio requires the task that entered a scope to
+    be the task that exits it. Tool calls arrive on Router tasks, and startup
+    and shutdown happen on the Runtime's task, so no caller may enter or
+    exit that stack directly. Instead every caller *submits* an operation to
+    the supervisor task, which owns the `AsyncExitStack` from the moment it
+    is created until it exits.
+
+    `session`, `server_name` and `alive` are rebound by the supervisor and
+    read (never written) by callers; `generation` counts successful
+    connections, and is how a caller says "I failed against connection N"
+    without having to hold a lock while it makes its tool call.
+    """
+
     def __init__(self, config: MCPServerConfig) -> None:
         self.config = config
         self.session: ClientSession | None = None
         self.server_name: str = ""
-        self._stack = AsyncExitStack()
+        # The self-reported name the tools were registered under, kept apart
+        # from `server_name` so a restarted server renaming itself is a
+        # warning rather than a silent divergence from the registered names.
+        self._registered_server_name: str = ""
+        self.listed_tools: list[types.Tool] = []
+        self.alive = False
+        # Bumped on every successful connection, including the first.
+        self.generation = 0
+        # Diagnostics, and what the tests assert coalescing against:
+        # `reconnect_count` counts rebuild *cycles* (one per burst of failing
+        # calls), `reconnect_attempts` counts individual connection attempts.
+        self.reconnect_count = 0
+        self.reconnect_attempts = 0
+        self._stack: AsyncExitStack | None = None
+        self._lock = asyncio.Lock()
+        self._requests: asyncio.Queue[tuple[str, asyncio.Future[BaseException | None]]] = (
+            asyncio.Queue()
+        )
+        self._supervisor: asyncio.Task[None] | None = None
+        self._registered: dict[str, _RegisteredTool] = {}
+        self._vanished: set[str] = set()
+        self._drifted: set[str] = set()
+        # `_mounted` gates reconnect on "this server worked at least once":
+        # one that failed at startup contributed no tools and must stay
+        # skipped for the process lifetime rather than being retried forever.
+        self._mounted = False
+        # Set when the attempt budget is spent, or when close() is called.
+        self._retired = False
 
-    async def _open_transport(self) -> tuple[Any, Any]:
+    # -- what callers read ----------------------------------------------------
+
+    def register(self, remote_name: str, tool: Tool, *, read_only: bool, destructive: bool) -> None:
+        self._registered[remote_name] = _RegisteredTool(
+            tool=tool, read_only=read_only, destructive=destructive
+        )
+
+    def is_vanished(self, remote_name: str) -> bool:
+        """True if the server stopped advertising this tool across a
+        reconnect. Calling it would be a request into the void."""
+        return remote_name in self._vanished
+
+    def is_retry_safe(self, remote_name: str) -> bool:
+        """False once a tool's safety annotations have changed underneath
+        us. Transparent retries are justified by a read-only classification;
+        a server that has already contradicted its own classification has
+        forfeited that justification."""
+        return remote_name not in self._drifted
+
+    # -- the supervisor task --------------------------------------------------
+
+    async def _submit(self, op: str) -> BaseException | None:
+        """Ask the supervisor to run `op` and wait for the outcome.
+
+        Returns the failure instead of raising it: this is called from tool
+        calls and from shutdown, and neither may be handed a `BaseException`
+        it did not ask for.
+        """
+        supervisor = self._supervisor
+        if supervisor is None:
+            return RuntimeError("mcp: server supervisor is not running")
+        return await self._submit_to(supervisor, op)
+
+    async def _submit_to(self, supervisor: asyncio.Task[None], op: str) -> BaseException | None:
+        if supervisor.done():
+            return RuntimeError("mcp: server supervisor is not running")
+        fut: asyncio.Future[BaseException | None] = asyncio.get_running_loop().create_future()
+        await self._requests.put((op, fut))
+        # Wait on the supervisor too: if it ever dies mid-operation, its
+        # future would never resolve and this would hang the caller forever.
+        await asyncio.wait([fut, supervisor], return_when=asyncio.FIRST_COMPLETED)
+        if fut.done():
+            return fut.result()
+        fut.cancel()
+        return RuntimeError("mcp: server supervisor exited without answering")
+
+    @staticmethod
+    def _resolve(fut: asyncio.Future[BaseException | None], value: BaseException | None) -> None:
+        if not fut.done():
+            fut.set_result(value)
+
+    async def _supervise(self) -> None:
+        """Own this server's `AsyncExitStack` for its whole lifetime.
+
+        Operations are serialized here by construction -- one task, one
+        queue -- so a connect can never overlap a teardown, and every cancel
+        scope is entered and exited by this task and no other.
+        """
+        pending: asyncio.Future[BaseException | None] | None = None
+        try:
+            while True:
+                op, fut = await self._requests.get()
+                pending = fut
+                if op == "stop":
+                    await self._teardown()
+                    self._resolve(fut, None)
+                    return
+                self._resolve(fut, await self._rebuild())
+                pending = None
+        except (KeyboardInterrupt, SystemExit) as e:
+            # Resolve before re-raising, or whoever is waiting on this
+            # operation waits for a task that is never coming back.
+            if pending is not None:
+                self._resolve(pending, e)
+            raise
+        finally:
+            # Anything still queued behind a failed supervisor gets an
+            # answer rather than a hang.
+            if pending is not None:
+                self._resolve(pending, RuntimeError("mcp: server supervisor stopped"))
+            while not self._requests.empty():
+                _, queued = self._requests.get_nowait()
+                self._resolve(queued, RuntimeError("mcp: server supervisor stopped"))
+
+    async def _rebuild(self) -> BaseException | None:
+        """Discard whatever connection exists and build a brand-new one.
+
+        Never a partial rebuild. A session that has seen its connection die
+        stays dead: every subsequent operation on it fails, including ones
+        that have nothing to do with the failure, so rebinding a fresh
+        transport onto the old session (or retrying against it) cannot work.
+        """
+        await self._teardown()
+        stack = AsyncExitStack()
+        self._stack = stack
+        try:
+            await asyncio.wait_for(self._connect(stack), timeout=MOUNT_TIMEOUT)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as e:
+            # `wait_for` has already absorbed its own timeout cancellation by
+            # this point, so an outstanding one means the supervisor task
+            # itself is being torn down -- let that through rather than
+            # reporting it as a connection failure and looping.
+            if _is_self_cancellation():
+                raise
+            await self._teardown()
+            return e
+        self.alive = True
+        self.generation += 1
+        return None
+
+    async def _teardown(self) -> None:
+        stack, self._stack = self._stack, None
+        self.session = None
+        self.alive = False
+        if stack is None:
+            return
+        # Best-effort: a server that's already dead/misbehaving must not make
+        # shutdown -- or the next reconnect -- fail. Such misuse surfaces as
+        # `CancelledError`, a `BaseException` that a plain `except Exception`
+        # would NOT catch: it's connection plumbing, not a real cancellation,
+        # so catch broadly here but still let a genuine
+        # KeyboardInterrupt/SystemExit through.
+        try:
+            await stack.aclose()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as e:
+            if _is_self_cancellation():
+                raise
+            logger.warning(
+                "mcp: error closing server %r (%s: %s) -- ignoring, best-effort",
+                self.config.label,
+                type(e).__name__,
+                e,
+            )
+
+    async def _open_transport(self, stack: AsyncExitStack) -> tuple[Any, Any]:
         if self.config.url is not None:
             # mcp 2.0's streamable_http_client yields a 2-tuple (read,
             # write); 1.x (where the same function lives under the same
@@ -294,17 +675,17 @@ class _MountedServer:
             # MOUNT_TIMEOUT wrapping connect() already covers it; no
             # separate timeout is needed here.
             #
-            # The client is entered into `self._stack` here, not just
-            # constructed: `streamable_http_client` only closes the
-            # httpx2.AsyncClient it manages when IT created one internally
-            # (`http_client=None`). Since we always pass one in explicitly,
-            # streamable_http_client never closes it -- entering it into our
-            # own stack, before the transport, is what makes it get closed
-            # at all, and LIFO order tears the transport down first.
-            http_client = await self._stack.enter_async_context(
+            # The client is entered into `stack` here, not just constructed:
+            # `streamable_http_client` only closes the httpx2.AsyncClient it
+            # manages when IT created one internally (`http_client=None`).
+            # Since we always pass one in explicitly, streamable_http_client
+            # never closes it -- entering it into our own stack, before the
+            # transport, is what makes it get closed at all, and LIFO order
+            # tears the transport down first.
+            http_client = await stack.enter_async_context(
                 create_mcp_http_client(headers=self.config.headers)
             )
-            read, write = await self._stack.enter_async_context(
+            read, write = await stack.enter_async_context(
                 streamable_http_client(self.config.url, http_client=http_client)
             )
             return read, write
@@ -318,11 +699,18 @@ class _MountedServer:
         # nothing here needs to duplicate that merge.
         env = {var: os.environ[var] for var in self.config.env if var in os.environ}
         params = StdioServerParameters(command=argv[0], args=argv[1:], env=env)
-        return await self._stack.enter_async_context(stdio_client(params))
+        return await stack.enter_async_context(stdio_client(params))
 
-    async def connect(self) -> None:
-        read, write = await self._open_transport()
-        session = await self._stack.enter_async_context(
+    async def _connect(self, stack: AsyncExitStack) -> None:
+        """Handshake and discovery, always as one unit.
+
+        `list_tools()` runs here rather than at the call site so a session
+        whose connection died between `initialize()` and discovery fails the
+        whole connection attempt, inside the supervisor, instead of raising
+        a bare `CancelledError` at whoever asked for it.
+        """
+        read, write = await self._open_transport(stack)
+        session = await stack.enter_async_context(
             ClientSession(
                 read,
                 write,
@@ -332,33 +720,175 @@ class _MountedServer:
             )
         )
         init = await session.initialize()
+        listed = await session.list_tools()
         self.session = session
         self.server_name = sanitize_mcp_name(init.server_info.name)
+        self.listed_tools = list(listed.tools)
+
+    # -- lifecycle ------------------------------------------------------------
+
+    async def start(self) -> None:
+        """Launch the supervisor and perform the first connection.
+
+        Raises on failure so `MCPMount.mount()`'s per-server handler can log
+        and skip the server, exactly as it did when connecting inline.
+        """
+        self._supervisor = asyncio.create_task(
+            self._supervise(), name=f"mcp-supervisor:{self.config.label}"
+        )
+        error = await self._submit("connect")
+        if error is not None:
+            if isinstance(error, Exception):
+                raise error
+            # Never re-raise a BaseException at a caller that only asked for
+            # a connection -- describe it instead.
+            raise RuntimeError(f"{type(error).__name__}: {error}")
+        self._registered_server_name = self.server_name
+        self._mounted = True
+
+    async def reconnect(self, seen_generation: int) -> bool:
+        """Rebuild this connection, or report that it cannot be rebuilt.
+
+        `seen_generation` is the `generation` the caller was working against
+        when it failed. If the connection has already been rebuilt since
+        then, some other caller in the same burst of failures did the work
+        and this one returns immediately -- that, plus the lock, is what
+        makes a batch of simultaneously-failing calls produce exactly one
+        reconnect instead of one per call.
+
+        Never raises, and never enters or exits a context itself: it only
+        signals the supervisor task that owns them.
+        """
+        if not self._mounted or self._retired:
+            # Either it never worked at all, or its attempt budget is spent.
+            # Both stay down for the rest of the process lifetime.
+            return False
+        async with self._lock:
+            if self._retired:
+                return False
+            if self.generation != seen_generation and self.alive:
+                return True
+            self.reconnect_count += 1
+            delay = 0.0
+            for attempt in range(MAX_RECONNECT_ATTEMPTS):
+                if delay:
+                    await asyncio.sleep(delay)
+                if self._retired:  # close() landed while we were backing off
+                    return False
+                self.reconnect_attempts += 1
+                error = await self._submit("connect")
+                if error is None:
+                    logger.info(
+                        "mcp: reconnected to server %r (attempt %d)",
+                        self.config.label,
+                        attempt + 1,
+                    )
+                    self._apply_reconnect_drift()
+                    return True
+                logger.warning(
+                    "mcp: reconnect attempt %d/%d for server %r failed (%s: %s)",
+                    attempt + 1,
+                    MAX_RECONNECT_ATTEMPTS,
+                    self.config.label,
+                    type(error).__name__,
+                    error,
+                )
+                delay = RECONNECT_BACKOFF_SECONDS * (2**attempt)
+            self._retired = True
+            logger.warning(
+                "mcp: server %r could not be reconnected in %d attempts -- its tools stay "
+                "unavailable for the rest of this process; core unaffected",
+                self.config.label,
+                MAX_RECONNECT_ATTEMPTS,
+            )
+            return False
+
+    def _apply_reconnect_drift(self) -> None:
+        """Reconcile the freshly discovered tool list with what was
+        registered. A restarted server is not obliged to be the same server,
+        and the `Tool` objects the Registry holds were built from promises
+        the old one made."""
+        if self.server_name != self._registered_server_name:
+            logger.warning(
+                "mcp: server %r now reports itself as %r instead of %r after reconnecting; "
+                "its tools keep the names they were registered under",
+                self.config.label,
+                self.server_name,
+                self._registered_server_name,
+            )
+            self._registered_server_name = self.server_name
+        fresh = {tool.name: tool for tool in self.listed_tools}
+        for remote_name, registered in self._registered.items():
+            advertised = fresh.get(remote_name)
+            if advertised is None:
+                if remote_name not in self._vanished:
+                    logger.warning(
+                        "mcp: tool %r is no longer advertised by server %r after reconnecting "
+                        "-- calls to %r will return an error until it comes back",
+                        remote_name,
+                        self.config.label,
+                        registered.tool.name,
+                    )
+                self._vanished.add(remote_name)
+                continue
+            self._vanished.discard(remote_name)
+            annotations = advertised.annotations
+            read_only = bool(annotations and annotations.read_only_hint)
+            destructive = bool(annotations and annotations.destructive_hint is True)
+            if read_only == registered.read_only and destructive == registered.destructive:
+                continue
+            logger.warning(
+                "mcp: tool %r on server %r came back from a reconnect with different safety "
+                "annotations (read_only %s -> %s, destructive %s -> %s) -- forcing "
+                "confirmation on %r and disabling its automatic retry",
+                remote_name,
+                self.config.label,
+                registered.read_only,
+                read_only,
+                registered.destructive,
+                destructive,
+                registered.tool.name,
+            )
+            # One-way: a tool that has contradicted its own classification
+            # once is never quietly trusted again, even if a later reconnect
+            # restores the original annotations.
+            registered.tool.confirm = True
+            registered.tool.read_only = False
+            registered.read_only = read_only
+            registered.destructive = destructive
+            self._drifted.add(remote_name)
 
     async def close(self) -> None:
-        # Best-effort: a server that's already dead/misbehaving must not make
-        # shutdown itself fail. Primary defense against cross-server
-        # cancel-scope corruption is `MCPMount.close()` closing servers in
-        # reverse (LIFO) mount order, matching anyio's per-task cancel-scope
-        # stack discipline -- but this is defense in depth for whatever stray
-        # cancel-scope misuse still slips through (this SDK's stdio transport
-        # and ClientSession both open anyio task groups / cancel scopes via
-        # `_stack`'s context managers). Such misuse surfaces as
-        # `CancelledError`, a `BaseException` that a plain `except Exception`
-        # would NOT catch -- it's shutdown plumbing, not a real cancellation,
-        # so catch broadly here but still let a genuine
-        # KeyboardInterrupt/SystemExit through.
-        try:
-            await self._stack.aclose()
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except BaseException as e:
+        """Stop the supervisor and let it tear its own stack down.
+
+        Safe to call more than once, and safe to call on a server that never
+        started. Never raises: shutdown must not be able to fail because a
+        server is misbehaving.
+        """
+        self._retired = True
+        supervisor, self._supervisor = self._supervisor, None
+        if supervisor is None:
+            return
+        error = await self._submit_to(supervisor, "stop")
+        if error is not None:
             logger.warning(
-                "mcp: error closing server %r during shutdown (%s: %s) -- ignoring, best-effort",
+                "mcp: server %r did not shut down cleanly (%s: %s) -- ignoring, best-effort",
                 self.config.label,
-                type(e).__name__,
-                e,
+                type(error).__name__,
+                error,
             )
+        if not supervisor.done():
+            # It answered "stop" but has not finished unwinding. Give it a
+            # bounded grace period, then stop waiting -- a wedged server may
+            # not hold up the rest of shutdown.
+            await asyncio.wait([supervisor], timeout=CLOSE_TIMEOUT)
+            if not supervisor.done():
+                logger.warning(
+                    "mcp: server %r did not finish shutting down within %.0fs -- abandoning it",
+                    self.config.label,
+                    CLOSE_TIMEOUT,
+                )
+                supervisor.cancel()
 
 
 # -- per-server tool collection + MCP-vs-MCP dedupe ----------------------------
@@ -515,17 +1045,15 @@ class MCPMount:
                     else entry
                 )
                 server = _MountedServer(config)
-                await asyncio.wait_for(server.connect(), timeout=MOUNT_TIMEOUT)
-                listed = await asyncio.wait_for(
-                    server.session.list_tools(),  # type: ignore[union-attr]
-                    timeout=MOUNT_TIMEOUT,
-                )
-                assert server.session is not None
+                # Connect + discovery happen inside the server's supervisor
+                # task, under MOUNT_TIMEOUT; `start()` re-raises whatever
+                # went wrong for the handler below.
+                await server.start()
                 collected = _collect_server_tools(
                     server,
                     server_name=server.server_name,
                     command=config.label,
-                    mcp_tools=listed.tools,
+                    mcp_tools=server.listed_tools,
                     seen_names=seen_names,
                 )
             except (KeyboardInterrupt, SystemExit):
@@ -558,12 +1086,11 @@ class MCPMount:
         return tools
 
     async def close(self) -> None:
-        # Reverse (LIFO) mount order: anyio cancel scopes are stacked
-        # per-task, in the order they were entered, across ALL mounted
-        # servers (each server's own AsyncExitStack only guarantees LIFO
-        # *within itself*) -- closing server 1 before server 2 tries to
-        # exit a scope that isn't innermost anymore and anyio raises
-        # `CancelledError` (a BaseException), which `contextlib.suppress`
-        # calls used to let straight through the whole rest of shutdown.
+        # Reverse (LIFO) mount order. Each server now enters and exits its
+        # own cancel scopes inside its own supervisor task, so scopes are no
+        # longer stacked across servers in one task and this ordering is no
+        # longer what keeps anyio happy -- but shutting down in the reverse
+        # of startup order is still the right default when servers depend on
+        # each other, and it costs nothing to keep.
         for server in reversed(self._servers):
             await server.close()
