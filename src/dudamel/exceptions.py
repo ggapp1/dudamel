@@ -6,6 +6,22 @@ class ToolValidationError(DudamelError):
     """Tool arguments failed validation/coercion. Message is written for the model."""
 
 
+class UnknownToolOutcome(DudamelError, RuntimeError):
+    """A tool call whose side effect may or may not have taken effect.
+
+    Raised instead of an ordinary error when a call was already dispatched
+    but its result never came back, so nothing downstream can tell whether
+    the mutation landed. The distinct type is what lets a caller phrase the
+    result as indeterminate instead of as a failure without matching on the
+    prose of the message; the message itself is written for the model.
+
+    Also a `RuntimeError`, because that is what a tool function raising an
+    ordinary error already produces, and every existing handler around
+    `Tool.fn` -- including the ones that only guarantee "no `BaseException`
+    escapes" -- must keep treating this the same way.
+    """
+
+
 class RegistryError(DudamelError):
     """App/tool/widget/job registration problem."""
 

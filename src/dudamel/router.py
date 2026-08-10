@@ -23,6 +23,7 @@ from dudamel.exceptions import (
     LLMError,
     RegistryError,
     ToolValidationError,
+    UnknownToolOutcome,
 )
 from dudamel.llm.client import LLMClient
 from dudamel.llm.provider import ToolSpec
@@ -37,6 +38,27 @@ logger = logging.getLogger("dudamel.router")
 
 def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
+
+
+def _confirmed_error_text(name: str, e: Exception) -> str:
+    """How a raise from a tool the user has just approved is described to
+    the model.
+
+    An `UnknownToolOutcome` means the call was dispatched and no answer came
+    back, so the side effect may already have landed. Prefixing that with
+    "failed" -- on the one path where the user has spent an approval --
+    tells the model the exact thing the tool's own text was written to
+    avoid, and a model that reads "failed" reasonably tries again, spending
+    one approval on two executions. It is recognized by TYPE, not by
+    matching on its prose: the wording belongs to whoever raised it and must
+    stay free to change.
+
+    Anything else keeps the plain failure wording. Blurring a genuine error
+    into "indeterminate" would be the same mistake pointed the other way.
+    """
+    if isinstance(e, UnknownToolOutcome):
+        return f"confirmed tool {name} did not report a definite outcome: {e}"
+    return f"confirmed tool {name} failed: {type(e).__name__}: {e}"
 
 
 @dataclass
@@ -620,7 +642,7 @@ class Router:
             kwargs = tool.schema.validate(call.args)
             result = await asyncio.wait_for(tool.fn(**kwargs), tool.timeout)
         except Exception as e:  # noqa: BLE001 — surfaced to the model, never fatal
-            detail = f"confirmed tool {call.name} failed: {type(e).__name__}: {e}"
+            detail = _confirmed_error_text(call.name, e)
             await log_activity(
                 self._db,
                 tool=call.name,

@@ -71,9 +71,26 @@ What a reconnect deliberately does NOT do is re-run the call that failed,
 unless re-running it is provably harmless. A read-only tool is retried and
 the caller never learns anything happened. For a mutating tool the request
 may well have been executed before the connection dropped, so the call
-returns an error saying the outcome is UNKNOWN rather than saying it failed:
-reporting failure invites a retry that performs the side effect twice, and
-one confirmation from the user has to mean one execution.
+raises `UnknownToolOutcome` saying the outcome is UNKNOWN rather than saying
+it failed: reporting failure invites a retry that performs the side effect
+twice, and one confirmation from the user has to mean one execution. The
+same wording covers a mutating call that hits the native `call_timeout` --
+that request was dispatched too, and the server may well finish it a second
+later. What makes an outcome indeterminate is that the call left and no
+answer came back, not which of the two ways that happened.
+
+That raise happens BEFORE any reconnect: the rebuild can only help later
+calls, and a burst of failing attempts can outlast the Router's own
+`Tool.timeout`, which would cancel this task and hand the model a bare
+timeout instead of the wording above -- on the one path it exists for. The
+connection is marked lost instead, so the next call takes the pre-dispatch
+rebuild branch in `_make_call_fn`'s `call()`.
+
+None of this is what stops a *user*-visible double execution on its own:
+that is the router's confirm gate, and the wording only matters because the
+model is the thing that would ask for the retry. With `[router] taint_mode
+= "off"`, or on the first mcp call of an untainted turn, an unannotated mcp
+tool runs without a confirm gate at all -- see README's security section.
 
 Annotations are re-read on every reconnect, because a restarted server is
 not required to be the same server. A tool whose `read_only_hint` or
@@ -109,7 +126,7 @@ from mcp.client.streamable_http import create_mcp_http_client, streamable_http_c
 from mcp.shared.exceptions import MCPError
 
 from dudamel.contract.types import TOOL_NAME_RE, Tool
-from dudamel.exceptions import ToolValidationError
+from dudamel.exceptions import ToolValidationError, UnknownToolOutcome
 
 logger = logging.getLogger("dudamel.mcp")
 
@@ -176,15 +193,24 @@ RECONNECT_COOLDOWN_SECONDS = 60.0
 # failed burst.
 MAX_SCOPE_RECOVERIES = 2 * MAX_RECONNECT_ATTEMPTS
 
-# Sizing note, not a defect: a full burst against a server that accepts
-# connections but never finishes `initialize()` costs up to
-# MAX_RECONNECT_ATTEMPTS * MOUNT_TIMEOUT plus backoff (~46s), which exceeds
-# CALL_TIMEOUT. The Router's own timeout fires first, so the tool call
-# reports a TimeoutError rather than the reconnect's diagnosis -- and that
-# timeout cancels the tool-call task, which cancels the rest of the burst
-# too. Only the attempt already handed to the supervisor runs to completion;
-# the remaining attempts are abandoned and no cooldown is recorded, so the
-# next tool call simply starts a fresh burst.
+# Sizing note: a full burst against a server that accepts connections but
+# never finishes `initialize()` costs up to MAX_RECONNECT_ATTEMPTS *
+# MOUNT_TIMEOUT plus backoff (~46s), which exceeds CALL_TIMEOUT. A caller
+# waiting behind that burst therefore gets the Router's TimeoutError rather
+# than the reconnect's diagnosis -- and that timeout cancels the tool-call
+# task, which cancels the rest of the burst too. Only the attempt already
+# handed to the supervisor runs to completion; the remaining attempts are
+# abandoned and no cooldown is recorded, so the next tool call simply starts
+# a fresh burst.
+#
+# For a READ-ONLY call that is merely a slow, honest failure. For a MUTATING
+# one it was a consent bug, which is why nothing mutating waits behind a
+# burst any more: `_make_call_fn`'s death path marks the connection lost and
+# raises the unknown-outcome error immediately, leaving the rebuild to the
+# next call's pre-dispatch branch. Overrunning the Router's timeout there
+# would have replaced "the outcome is UNKNOWN, do not retry" with a bare
+# timeout -- a message shaped exactly like the retry invitation the whole
+# path exists to avoid.
 
 # An MCP server's input_schema and description are embedded verbatim in every
 # LLM request, so both are a token-budget cost AND a prompt-injection channel
@@ -419,6 +445,30 @@ def _is_connection_death(e: BaseException) -> bool:
     return False
 
 
+def _is_native_timeout(e: BaseException) -> bool:
+    """True for the coded `MCPError(REQUEST_TIMEOUT)` that `invoke()`'s
+    `read_timeout_seconds` produces when a call outlives `call_timeout`.
+
+    Deliberately a SEPARATE question from `_is_connection_death`, and the
+    separation is the point. Two independent decisions were being made by
+    one predicate:
+
+    - Should this reconnect? No. A slow tool is not a dead transport, and
+      reconnecting on every timeout would turn ordinary tool latency into
+      connection churn. `_is_connection_death` answers False for a timeout
+      and must keep doing so.
+    - Is the outcome indeterminate? For a mutating tool, YES -- the request
+      was already dispatched and the server may complete it after the client
+      stopped waiting, which is exactly the ambiguity a mid-call death has.
+
+    Conflating them is what left a mutating timeout reported to the model as
+    a plain failure, which is an invitation to retry a side effect that may
+    already have landed. Anything that changes one of these two must leave
+    the other alone.
+    """
+    return isinstance(e, MCPError) and e.code == types.REQUEST_TIMEOUT
+
+
 # -- tool call adapter -----------------------------------------------------------
 
 
@@ -443,7 +493,9 @@ def _make_call_fn(
     generation: a native timeout raises `MCPError(code=REQUEST_TIMEOUT,
     -32001)`, a coded exception `_is_connection_death` reads and deliberately
     excludes from "the connection is dead" (a slow tool is not a dead
-    transport -- see that function's docstring). `asyncio.wait_for` instead
+    transport -- see that function's docstring). `call()` therefore never
+    reconnects on a timeout, while still re-wording one on a mutating tool
+    as an unknown outcome. `asyncio.wait_for` instead
     raises a bare `TimeoutError` with no `.code`, indistinguishable from any
     other timeout by anything downstream, AND it works by cancelling this
     task -- which is exactly the `CancelledError` hazard `invoke()`'s callers
@@ -480,6 +532,16 @@ def _make_call_fn(
         return RuntimeError(
             f"mcp tool {local_name} has no live session: the server is not connected and "
             f"could not be reconnected"
+        )
+
+    def unknown_outcome(what_happened: str) -> UnknownToolOutcome:
+        """The one wording for "this call was dispatched and no answer came
+        back". Deliberately identical across the ways that can happen: the
+        model's next move must not depend on which of them it was."""
+        return UnknownToolOutcome(
+            f"mcp tool {local_name}: {what_happened} and the outcome is UNKNOWN -- it "
+            f"may or may not have taken effect. Do not retry automatically; check the "
+            f"server's state first."
         )
 
     def demote(e: BaseException) -> RuntimeError:
@@ -519,41 +581,59 @@ def _make_call_fn(
                 # The Router's own timeout, not the server dying. Passing it
                 # through is what lets `wait_for` report a TimeoutError.
                 raise
+            # "Provably harmless to have happened twice, or not at all."
+            # Read-only is only half of it: a tool whose annotations drifted
+            # has forfeited the classification that justified trusting it.
+            harmless = read_only and server.is_retry_safe(remote_name)
             if not _is_connection_death(e):
+                # NOT a reconnect decision -- the transport is fine and
+                # nothing here rebuilds it. Only the wording changes: a
+                # mutating call that outlived `call_timeout` was dispatched,
+                # and the server may finish it after we stopped listening.
+                # See `_is_native_timeout` for why these two stay separate.
+                if _is_native_timeout(e) and not harmless:
+                    raise unknown_outcome(f"the call timed out after {call_timeout:g}s") from e
                 if isinstance(e, Exception):
                     raise
                 raise demote(e) from None
+            if not harmless:
+                # Stop here, and do NOT pay for the rebuild first, even
+                # though the failure looks like the session was already dead
+                # before this call: the call that is in flight when a server
+                # dies and the first call after it are NOT reliably
+                # distinguishable from the exception, so the only safe
+                # reading is that the side effect may have landed. Saying
+                # "failed" would invite a retry that performs it twice --
+                # and so would a bare timeout, which is what the caller gets
+                # if a reconnect burst outlasts the Router's `Tool.timeout`
+                # while this raise waits behind it. Marking the connection
+                # lost sends the NEXT call through `call()`'s pre-dispatch
+                # branch above, which rebuilds before dispatching anything;
+                # that is the only place a mutating call is ever
+                # (re)dispatched by this code.
+                server.mark_connection_lost()
+                raise unknown_outcome("the server connection died during the call") from None
+            # Only a harmless call reaches here, and only it pays for the
+            # rebuild inline -- it is about to reuse the new connection.
+            # Safe by construction: a read-only tool has no side effect to
+            # double up on, so it does not matter whether the request
+            # reached the server before the connection dropped.
             await server.reconnect(generation)
-            if read_only and server.is_retry_safe(remote_name):
-                # Safe by construction: a read-only tool has no side effect
-                # to double up on, so it does not matter whether the request
-                # reached the server before the connection dropped.
-                if server.is_vanished(remote_name):
-                    raise vanished() from None
-                retry_session = server.session
-                if retry_session is None:
-                    raise no_session() from None
-                try:
-                    return await invoke(retry_session, **kwargs)
-                except (KeyboardInterrupt, SystemExit):
+            if server.is_vanished(remote_name):
+                raise vanished() from None
+            retry_session = server.session
+            if retry_session is None:
+                raise no_session() from None
+            try:
+                return await invoke(retry_session, **kwargs)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as retry_error:
+                if _cancellation_was_requested():
                     raise
-                except BaseException as retry_error:
-                    if _cancellation_was_requested():
-                        raise
-                    if isinstance(retry_error, Exception):
-                        raise
-                    raise demote(retry_error) from None
-            # Anything mutating stops here, even though the failure looks
-            # like the session was already dead before this call: the call
-            # that is in flight when a server dies and the first call after
-            # it are NOT reliably distinguishable from the exception, so the
-            # only safe reading is that the side effect may have landed.
-            # Saying "failed" would invite a retry that performs it twice.
-            raise RuntimeError(
-                f"mcp tool {local_name}: the server connection died during the call and "
-                f"the outcome is UNKNOWN -- it may or may not have taken effect. Do not "
-                f"retry automatically; check the server's state first."
-            ) from None
+                if isinstance(retry_error, Exception):
+                    raise
+                raise demote(retry_error) from None
 
     return call
 
@@ -697,6 +777,25 @@ class _MountedServer:
         self._registered[remote_name] = _RegisteredTool(
             tool=tool, read_only=read_only, destructive=destructive
         )
+
+    def mark_connection_lost(self) -> None:
+        """Record that a caller diagnosed this connection as dead, without
+        rebuilding it here.
+
+        The one thing a caller is allowed to write, and it only ever
+        narrows: a session that has seen its connection die stays dead
+        anyway (see `_rebuild`), so dropping the reference costs at most one
+        reconnect that was already inevitable. What it buys is determinism
+        -- the next call takes `call()`'s pre-dispatch rebuild branch
+        immediately, instead of depending on whether the supervisor has yet
+        been cancelled by its own transport and torn the stack down.
+
+        The stack itself is untouched and still owned by the supervisor,
+        which releases it either on its stand-down or on the next
+        `_rebuild`; nothing is leaked by forgetting the session here.
+        """
+        self.alive = False
+        self.session = None
 
     def is_vanished(self, remote_name: str) -> bool:
         """True if the server stopped advertising this tool across a

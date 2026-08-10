@@ -41,6 +41,7 @@ from mcp.shared.exceptions import MCPError
 
 from dudamel import mcp_mount
 from dudamel.contract.types import Tool
+from dudamel.exceptions import UnknownToolOutcome
 from dudamel.mcp_mount import (
     ROUTER_TIMEOUT_MARGIN_SECONDS,
     MCPMount,
@@ -233,14 +234,14 @@ async def test_flaky_fixture_can_drop_a_tool_entirely(
         await mount.close()
 
 
-async def test_flaky_fixture_advertises_all_four_tools_by_default(
+async def test_flaky_fixture_advertises_all_five_tools_by_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     mount = MCPMount([flaky_cmd(tmp_path, monkeypatch)])
     try:
         tools = await mount.mount()
         suffixes = {t.name.rsplit("__", 1)[-1] for t in tools}
-        assert suffixes == {"die", "slow_mutate", "count", "echo"}
+        assert suffixes == {"die", "slow_mutate", "slow_read", "count", "echo"}
     finally:
         await mount.close()
 
@@ -344,9 +345,50 @@ async def test_mutating_tool_reports_unknown_outcome_rather_than_failure(
         message = str(excinfo.value)
         assert "UNKNOWN" in message
         assert "Do not retry" in message
-        # The server itself is back up even though this call was not retried.
-        assert mount._servers[0].alive is True
+        # The connection is dropped rather than rebuilt here: the rebuild
+        # would only benefit later calls, and this raise must not wait for
+        # it (see `test_mutating_death_raises_unknown_before_paying_for_the_
+        # reconnect`). What matters is that the next call still gets a
+        # working server, through the pre-dispatch branch.
+        server = mount._servers[0]
+        assert server.alive is False
+        assert server.reconnect_count == 0
         assert await _tool(tools, "echo").fn(text="ok") == "ok"
+        assert server.alive is True
+        assert server.reconnect_count == 1
+    finally:
+        await mount.close()
+
+
+async def test_mutating_death_raises_unknown_before_paying_for_the_reconnect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reconnect burst can outlast the router's own timeout, in which case
+    the caller sees a timeout instead of the unknown-outcome message -- on the
+    exact path that message exists for. The rebuild benefits only later calls,
+    so the raise must not wait for it."""
+    name = "raise-first"
+    script = tmp_path / "flaky_copy.py"
+    script.write_text(FIXTURE.read_text())
+    # A burst that is guaranteed to be slow: the command is broken below so
+    # every attempt fails, and the backoff between them is real time (this
+    # opts back out of the module's zero-backoff fixture).
+    monkeypatch.setattr(mcp_mount, "RECONNECT_BACKOFF_SECONDS", 5.0)
+    mount = MCPMount([flaky_cmd(tmp_path, monkeypatch, name=name, script=script)])
+    try:
+        tools = await mount.mount()
+        mutate = _tool(tools, "slow_mutate")
+        script.write_text("import sys\n\nsys.exit(1)\n")
+        await _kill_and_wait(await _wait_for_pid(f"flaky_copy.py {name}"))
+        # Stands in for the Router's own `asyncio.wait_for(tool.fn(...),
+        # tool.timeout)` backstop, and is deliberately far shorter than the
+        # burst above: if the raise waited for the rebuild, this budget would
+        # expire first and the caller would get a bare TimeoutError -- which
+        # is not a RuntimeError, so this would fail rather than pass quietly.
+        with pytest.raises(RuntimeError) as excinfo:
+            await asyncio.wait_for(mutate.fn(value="v"), 2.0)
+        assert "UNKNOWN" in str(excinfo.value)
+        assert mount._servers[0].reconnect_count == 0
     finally:
         await mount.close()
 
@@ -594,7 +636,9 @@ async def test_cancelled_error_never_escapes_a_tool_call(
         server.session = _PoisonedSession()  # type: ignore[assignment]
         with pytest.raises(RuntimeError) as excinfo:
             await _tool(tools, "slow_mutate").fn(value="v")
-        assert type(excinfo.value) is RuntimeError
+        # An ordinary Exception, whatever its exact class -- what must not
+        # come out is anything that only `except BaseException` would catch.
+        assert isinstance(excinfo.value, Exception)
         assert not isinstance(excinfo.value, asyncio.CancelledError)
     finally:
         await mount.close()
@@ -635,6 +679,13 @@ async def test_call_timeout_reaches_the_caller_as_the_coded_native_error(
     materially larger than) the native call_timeout: the Router's outer
     clock starts before `tool.fn` even runs, so an equal budget lets it
     expire first and this test would see a bare `TimeoutError` instead.
+
+    Driven through the READ-ONLY `slow_read`, because that is the tool whose
+    timeout still reaches the caller as the raw `MCPError`. On a mutating
+    tool the same coded error is re-raised as an unknown outcome before it
+    gets out (see `test_mutating_timeout_reports_an_unknown_outcome`, which
+    asserts the same code on the `__cause__`); the race between the two
+    clocks is identical either way.
     """
     mount = MCPMount(
         [flaky_cmd(tmp_path, monkeypatch, name="native-timeout", slow_seconds=5.0)],
@@ -642,11 +693,68 @@ async def test_call_timeout_reaches_the_caller_as_the_coded_native_error(
     )
     try:
         tools = await mount.mount()
-        slow = _tool(tools, "slow_mutate")
+        slow = _tool(tools, "slow_read")
         assert slow.timeout == pytest.approx(0.2 + ROUTER_TIMEOUT_MARGIN_SECONDS)
         with pytest.raises(MCPError) as exc_info:
-            await asyncio.wait_for(slow.fn(value="v"), slow.timeout)
+            await asyncio.wait_for(slow.fn(), slow.timeout)
         assert exc_info.value.code == types.REQUEST_TIMEOUT
+    finally:
+        await mount.close()
+
+
+async def test_mutating_timeout_reports_an_unknown_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mutating call that times out was already dispatched -- the server may
+    complete it a second later. That is the same indeterminacy as a mid-call
+    connection death, and it needs the same wording: reporting it as a plain
+    failure invites a retry that performs the side effect twice."""
+    mount = MCPMount(
+        [flaky_cmd(tmp_path, monkeypatch, name="mutating-timeout", slow_seconds=5.0)],
+        call_timeout=0.2,
+    )
+    try:
+        tools = await mount.mount()
+        slow = _tool(tools, "slow_mutate")
+        # Called exactly the way router.py calls it, so the native timeout
+        # and the Router's backstop race for real.
+        with pytest.raises(RuntimeError) as exc_info:
+            await asyncio.wait_for(slow.fn(value="v"), slow.timeout)
+        message = str(exc_info.value)
+        assert "UNKNOWN" in message
+        assert "Do not retry" in message
+        # Only the wording changed: underneath it is still the coded native
+        # timeout, and a timeout is still not a dead transport.
+        cause = exc_info.value.__cause__
+        assert isinstance(cause, MCPError) and cause.code == types.REQUEST_TIMEOUT
+        assert mount._servers[0].reconnect_count == 0
+        assert mount._servers[0].alive is True
+    finally:
+        await mount.close()
+
+
+async def test_read_only_timeout_is_still_reported_as_a_plain_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read-only call has no side effect to be ambiguous about, so it must
+    not inherit the unknown-outcome wording -- that would train the model to
+    treat every slow read as dangerous."""
+    mount = MCPMount(
+        [flaky_cmd(tmp_path, monkeypatch, name="read-only-timeout", slow_seconds=5.0)],
+        call_timeout=0.2,
+    )
+    try:
+        tools = await mount.mount()
+        slow = _tool(tools, "slow_read")
+        with pytest.raises(Exception) as exc_info:  # noqa: B017 -- the type IS the assertion
+            await asyncio.wait_for(slow.fn(), slow.timeout)
+        assert isinstance(exc_info.value, MCPError)
+        assert not isinstance(exc_info.value, UnknownToolOutcome)
+        message = str(exc_info.value)
+        assert "timed out" in message.lower()
+        assert "UNKNOWN" not in message
+        assert "Do not retry" not in message
+        assert mount._servers[0].reconnect_count == 0
     finally:
         await mount.close()
 
@@ -768,6 +876,9 @@ async def test_http_background_failure_does_not_strand_the_server(
     port = _free_port()
     state = tmp_path / "state"
     log = tmp_path / "server.log"
+    # Belt and braces: the asserted path below spends no reconnect budget at
+    # all, but a burst from anywhere else must not park this test behind a
+    # 60-second cooldown.
     monkeypatch.setattr(mcp_mount, "RECONNECT_COOLDOWN_SECONDS", 0.2)
     server_proc = _start_http_fixture(port, state, slow_seconds=30.0, log=log)
     mount = MCPMount([MCPServerConfig(url=f"http://127.0.0.1:{port}/mcp")])
@@ -787,12 +898,16 @@ async def test_http_background_failure_does_not_strand_the_server(
         with pytest.raises(RuntimeError, match="UNKNOWN"):
             await call
         assert server.session is None
+        # No reconnect burst was started for it, and so no cooldown was
+        # spent: a mutating call reports the unknown outcome and leaves the
+        # rebuild to whoever calls next.
+        assert server.reconnect_count == 0
 
         # The server comes back, as a restarted one eventually does. Nothing
-        # is stranded: the connection rebuilds and the tools work again.
+        # is stranded: the connection rebuilds -- inside the read-only call's
+        # own pre-dispatch branch -- and the tools work again.
         server_proc = _start_http_fixture(port, state, slow_seconds=0.05, log=log)
         await _wait_for_port(port, listening=True, log=log)
-        await asyncio.sleep(0.25)  # let the failed burst's cooldown lapse
         assert await _tool(tools, "echo").fn(text="recovered") == "recovered"
         assert server.alive is True
     finally:
