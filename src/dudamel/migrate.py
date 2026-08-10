@@ -26,6 +26,22 @@ def sync_url(db_url: str) -> str:
     return db_url.replace("+aiosqlite", "").replace("+asyncpg", "+psycopg")
 
 
+def script_heads(script_location: str) -> set[str]:
+    cfg = Config()
+    cfg.set_main_option("script_location", script_location)
+    return set(ScriptDirectory.from_config(cfg).get_heads())
+
+
+def current_heads(db_url: str, version_table: str) -> set[str]:
+    engine = create_engine(sync_url(db_url))
+    try:
+        with engine.connect() as conn:
+            mc = MigrationContext.configure(conn, opts={"version_table": version_table})
+            return set(mc.get_current_heads())
+    finally:
+        engine.dispose()
+
+
 def _sanitize_message(message: str) -> str:
     """Sanitize an arbitrary migration message for safe use in a filename and
     in a generated Python triple-quoted docstring: lowercase, collapse every
@@ -240,3 +256,28 @@ def upgrade_apps(db_url: str, project_dir: Path) -> None:
     """Apply the project's app migrations (version table alembic_version_apps)."""
     _backup_sqlite(db_url)
     command.upgrade(_app_config(db_url, project_dir), "head")
+
+
+def pending_migrations(db_url: str, project_dir: Path) -> list[str]:
+    """Which migration tiers are behind their scripts' heads.
+
+    Empty means the schema is current and starting up will not change it.
+    Used both by `dudamel doctor` and by the startup gate, so the two can
+    never disagree about what "up to date" means.
+    """
+    pending: list[str] = []
+
+    core_scripts = script_heads(str(files("dudamel") / "migrations"))
+    if core_scripts and current_heads(db_url, "alembic_version_core") != core_scripts:
+        pending.append("core schema is behind head")
+
+    migrations_dir = project_dir / "migrations"
+    if migrations_dir.exists():
+        app_scripts = script_heads(str(migrations_dir))
+        # Version table matches migrations_app_template/env.py's
+        # context.configure(version_table="alembic_version_apps"), the same
+        # table upgrade_apps() writes to via _app_config -> command.upgrade.
+        if app_scripts and current_heads(db_url, "alembic_version_apps") != app_scripts:
+            pending.append("app schema is behind head")
+
+    return pending

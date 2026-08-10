@@ -15,14 +15,14 @@ from sqlalchemy import select
 from dudamel.config import Settings
 from dudamel.convo import ConversationStore
 from dudamel.db import Database
-from dudamel.exceptions import LLMError, RegistryError
+from dudamel.exceptions import DudamelError, LLMError, RegistryError
 from dudamel.llm.anthropic import AnthropicProvider
 from dudamel.llm.client import LLMClient, Tier
 from dudamel.llm.openai_compat import OpenAICompatProvider
 from dudamel.llm.provider import Provider
 from dudamel.llm.types import Message
 from dudamel.mcp_mount import MCPMount
-from dudamel.migrate import upgrade_apps, upgrade_core
+from dudamel.migrate import pending_migrations, upgrade_apps, upgrade_core
 from dudamel.models_core import Activity, Conversation, JobRun, PendingConfirmation
 from dudamel.orchestrator import Orchestrator
 from dudamel.router import ChatReply, Router
@@ -125,10 +125,20 @@ class Runtime:
 
     async def start(self) -> None:
         url = self._settings.database_url
-        await asyncio.to_thread(upgrade_core, url)
-        migrations_dir = self._settings.data_dir / "migrations"
-        if migrations_dir.exists():
-            await asyncio.to_thread(upgrade_apps, url, self._settings.data_dir)
+        if self._settings.auto_migrate:
+            await asyncio.to_thread(upgrade_core, url)
+            migrations_dir = self._settings.data_dir / "migrations"
+            if migrations_dir.exists():
+                await asyncio.to_thread(upgrade_apps, url, self._settings.data_dir)
+        else:
+            pending = await asyncio.to_thread(pending_migrations, url, self._settings.data_dir)
+            if pending:
+                raise DudamelError(
+                    "refusing to start: "
+                    + "; ".join(pending)
+                    + " — auto_migrate is off, so run `dudamel db migrate -m <message>` "
+                    "and restart"
+                )
         if self._mcp_commands:
             # EXPERIMENTAL: a broken/unreachable MCP server degrades to a
             # warning and zero tools from it (MCPMount.mount()'s job) — it
