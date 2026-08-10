@@ -102,6 +102,11 @@ class Authenticator:
             # sidesteps a TypeError on a non-ASCII header degrading auth to a
             # 500 instead of the intended 401.
             if token is not None and secrets.compare_digest(provided.encode(), token.encode()):
+                # Clear, not just skip-recording: a legitimate API client
+                # that occasionally sends a stale token would otherwise
+                # accumulate toward the throttle with no way for its own
+                # successes to reset it, only the window's self-heal.
+                self._throttle.clear(self._client_key(request))
                 return "bearer"
             # The bearer path is not throttled itself (a bad bearer header on
             # every /api/* route just 401s), but a failure here feeds the
