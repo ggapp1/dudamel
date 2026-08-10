@@ -130,6 +130,10 @@ async def test_bearer_widgets_and_pending(tmp_path: Path, token_env: str) -> Non
         pending = await c.get("/api/pending", headers=headers)
         assert pending.status_code == 200
         assert [p["id"] for p in pending.json()] == [confirmation_id]
+        # This confirmation was raised by api_chat, which always resolves as
+        # user_id="web" -- the same identity api_confirm resolves as, so
+        # resolve_confirmation's requester check accepts it.
+        assert pending.json()[0]["resolvable"] is True
 
         confirm = await c.post(
             f"/api/confirm/{confirmation_id}", json={"approved": False}, headers=headers
