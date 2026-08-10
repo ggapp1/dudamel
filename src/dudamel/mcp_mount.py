@@ -129,21 +129,26 @@ MAX_RECONNECT_ATTEMPTS = 3
 RECONNECT_BACKOFF_SECONDS = 0.5
 RECONNECT_COOLDOWN_SECONDS = 60.0
 
-# How many times in a row a server's supervisor may be cancelled by its own
-# transport, with no working connection in between, before that server is
-# abandoned. Guards against a cancel source stuck in a loop. Sized above
-# MAX_RECONNECT_ATTEMPTS on purpose: every attempt in a burst can end in a
-# cancellation from the connection it was building, so a budget at or below
-# one burst's worth would retire a server for a single failed burst and
-# undo the cooldown's whole point.
+# How many times a server's supervisor may be cancelled by its own transport
+# WITHIN ONE RECONNECT BURST before that server is abandoned. Guards against
+# a cancel source stuck in a tight loop. The count is reset when a burst
+# begins and when a connection succeeds, so it never accumulates across
+# bursts -- what bounds the long run is the cooldown, not this. Sized above
+# MAX_RECONNECT_ATTEMPTS because, measured, every attempt in a burst against
+# a fully-down HTTP server ends in a cancellation from the connection it was
+# building; a budget at one burst's worth would retire a server for a single
+# failed burst.
 MAX_SCOPE_RECOVERIES = 2 * MAX_RECONNECT_ATTEMPTS
 
 # Sizing note, not a defect: a full burst against a server that accepts
 # connections but never finishes `initialize()` costs up to
 # MAX_RECONNECT_ATTEMPTS * MOUNT_TIMEOUT plus backoff (~46s), which exceeds
-# CALL_TIMEOUT. The tool call the Router is holding open therefore reports
-# its own timeout rather than the reconnect's diagnosis; the reconnect still
-# finishes in the background and the next call sees the result.
+# CALL_TIMEOUT. The Router's own timeout fires first, so the tool call
+# reports a TimeoutError rather than the reconnect's diagnosis -- and that
+# timeout cancels the tool-call task, which cancels the rest of the burst
+# too. Only the attempt already handed to the supervisor runs to completion;
+# the remaining attempts are abandoned and no cooldown is recorded, so the
+# next tool call simply starts a fresh burst.
 
 # An MCP server's input_schema and description are embedded verbatim in every
 # LLM request, so both are a token-budget cost AND a prompt-injection channel
@@ -537,6 +542,12 @@ def _build_tool(
 # -- one mounted server ----------------------------------------------------------
 
 
+class _SupervisorGone(RuntimeError):
+    """A submitted operation was never run, because the supervisor holding
+    it stopped first. Distinct from an operation that ran and failed: a lost
+    one can be resubmitted, a failed one is an answer."""
+
+
 @dataclass
 class _RegisteredTool:
     """One dudamel `Tool` this server contributed, plus the safety
@@ -639,12 +650,27 @@ class _MountedServer:
         Respawns the supervisor if a previous one stood down after absorbing
         a cancellation. A stood-down supervisor has already released its
         stack, so there is nothing to inherit and a fresh one starts clean.
+
+        Tried at most twice. A supervisor can stand down while already
+        holding this request, which answers it without ever running it --
+        measured against a fully-down HTTP server, that was two of every
+        three reconnect attempts, each reported as a failed attempt that in
+        truth was never made. A lost request is not a failed operation, so
+        it is resubmitted once to a fresh supervisor. Safe to repeat: the
+        only ops are "connect", which rebuilds from scratch and is
+        idempotent, and "stop", which `close()` submits directly.
         """
+        error = await self._submit_once(op)
+        if isinstance(error, _SupervisorGone):
+            error = await self._submit_once(op)
+        return error
+
+    async def _submit_once(self, op: str) -> BaseException | None:
         if self._closed or self._supervisor_failed:
-            return RuntimeError("mcp: server supervisor is not running")
+            return _SupervisorGone("mcp: server supervisor is not running")
         supervisor = self._supervisor
         if supervisor is None:
-            return RuntimeError("mcp: server supervisor is not running")
+            return _SupervisorGone("mcp: server supervisor is not running")
         if supervisor.done():
             supervisor = self._spawn_supervisor()
         return await self._submit_to(supervisor, op)
@@ -658,7 +684,7 @@ class _MountedServer:
 
     async def _submit_to(self, supervisor: asyncio.Task[None], op: str) -> BaseException | None:
         if supervisor.done():
-            return RuntimeError("mcp: server supervisor is not running")
+            return _SupervisorGone("mcp: server supervisor is not running")
         fut: asyncio.Future[BaseException | None] = asyncio.get_running_loop().create_future()
         await self._requests.put((op, fut))
         # Wait on the supervisor too: if it ever dies mid-operation, its
@@ -667,7 +693,7 @@ class _MountedServer:
         if fut.done():
             return fut.result()
         fut.cancel()
-        return RuntimeError("mcp: server supervisor exited without answering")
+        return _SupervisorGone("mcp: server supervisor exited without answering")
 
     @staticmethod
     def _resolve(fut: asyncio.Future[BaseException | None], value: BaseException | None) -> None:
@@ -748,10 +774,10 @@ class _MountedServer:
             # Anything still queued behind a failed supervisor gets an
             # answer rather than a hang.
             if pending is not None:
-                self._resolve(pending, RuntimeError("mcp: server supervisor stopped"))
+                self._resolve(pending, _SupervisorGone("mcp: server supervisor stopped"))
             while not self._requests.empty():
                 _, queued = self._requests.get_nowait()
-                self._resolve(queued, RuntimeError("mcp: server supervisor stopped"))
+                self._resolve(queued, _SupervisorGone("mcp: server supervisor stopped"))
 
     async def _stand_down(self, *, final: bool) -> None:
         """Absorb a cancellation delivered by one of this server's own anyio
@@ -983,6 +1009,17 @@ class _MountedServer:
                 # making every tool call pay for three more attempts.
                 return False
             self.reconnect_count += 1
+            # A new burst starts with a fresh stand-down budget. Measured
+            # against a fully-down HTTP server, every attempt in a burst ends
+            # in a scope cancellation and so costs a stand-down; letting
+            # those accumulate across bursts would spend the budget after
+            # two or three cooldowns and retire the server permanently --
+            # reintroducing, by a slower route, exactly the write-off the
+            # cooldown exists to prevent. `MAX_SCOPE_RECOVERIES` is meant to
+            # stop a supervisor being cancelled in a tight loop *within* one
+            # burst; what bounds the long run is the cooldown, which already
+            # caps a permanently dead server at one burst per minute forever.
+            self._standdowns = 0
             delay = 0.0
             for attempt in range(MAX_RECONNECT_ATTEMPTS):
                 if delay:
