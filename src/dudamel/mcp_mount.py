@@ -113,9 +113,35 @@ from dudamel.exceptions import ToolValidationError
 
 logger = logging.getLogger("dudamel.mcp")
 
-CALL_TIMEOUT = 30.0  # per-tool-call timeout (Tool.timeout), enforced by Router
+CALL_TIMEOUT = 30.0  # per-tool-call timeout, enforced natively -- see `_make_call_fn`
 MOUNT_TIMEOUT = 15.0  # connect + list_tools budget per server, at mount time
 CLOSE_TIMEOUT = 10.0  # how long to wait for a server's supervisor task to exit
+
+# Trap for a future test: `MCPMount`/`_MountedServer`'s `call_timeout`/
+# `mount_timeout` keyword defaults are bound to these two constants at
+# IMPORT time, an ordinary Python default-argument gotcha. A test that does
+# `monkeypatch.setattr(mcp_mount, "MOUNT_TIMEOUT", ...)` and then constructs
+# `MCPMount(...)` WITHOUT passing `mount_timeout` explicitly will NOT see the
+# patched value -- the default was already resolved when this module was
+# first imported. Pass the value explicitly instead of relying on a
+# monkeypatched module constant to reach a default.
+
+# `Tool.timeout` -- and so the Router's OWN `asyncio.wait_for(tool.fn(...),
+# tool.timeout)` in router.py -- is deliberately set to call_timeout PLUS
+# this margin, never to call_timeout itself. The two clocks do not start at
+# the same instant: the Router's starts before `tool.fn` is even entered,
+# while the SDK's `read_timeout_seconds` clock (passed into
+# `session.call_tool`) only starts once the request has actually been
+# serialized and dispatched. Setting them equal would therefore make the
+# Router's outer timer expire FIRST, deterministically, on every genuinely
+# slow call -- which cancels the task, and `call()`'s own cancellation
+# handling (see `_cancellation_was_requested`) correctly treats that as "not
+# a connection death" and re-raises it, so `wait_for` reports the bare,
+# uncoded `TimeoutError` this whole design exists to move away from. This
+# margin is what actually gives the native, coded `MCPError(REQUEST_TIMEOUT)`
+# path room to fire first; without it, the Router layer isn't a backstop,
+# it's the layer that wins.
+ROUTER_TIMEOUT_MARGIN_SECONDS = 5.0
 
 # How many times a dead server is rebuilt in one burst, and the base delay
 # between those attempts (which doubles each time: 0s, 0.5s, 1.0s). Bounded
@@ -552,13 +578,18 @@ def _build_tool(
         schema=McpToolSchema(input_schema),
         read_only=read_only,
         confirm=confirm,
-        # Enforcement itself happens on the transport-native path in
-        # `invoke()` below (see `_make_call_fn`), not here. This is kept in
-        # sync with it anyway as a backstop: if a future change to `invoke()`
-        # ever forgets to pass a per-call timeout, the Router's own
-        # `asyncio.wait_for(tool.fn(...), timeout=tool.timeout)` still bounds
-        # the call, just without the coded MCPError the native path gives.
-        timeout=call_timeout,
+        # Primary enforcement is the transport-native path inside `invoke()`
+        # (see `_make_call_fn`), not this. This is a true backstop, not a
+        # duplicate: call_timeout + ROUTER_TIMEOUT_MARGIN_SECONDS, strictly
+        # LARGER than call_timeout, so the Router's own
+        # `asyncio.wait_for(tool.fn(...), timeout=tool.timeout)` in
+        # router.py has no chance to win the race and pre-empt the native
+        # timeout with an uncoded `TimeoutError` -- see the comment on
+        # ROUTER_TIMEOUT_MARGIN_SECONDS for why an equal value would do
+        # exactly that. If a future change to `invoke()` ever forgets to
+        # pass a per-call timeout at all, this still bounds the call, just
+        # later and without the coded MCPError the native path gives.
+        timeout=call_timeout + ROUTER_TIMEOUT_MARGIN_SECONDS,
         origin="mcp",
     )
     # The server keeps a handle on every tool it actually contributed, so a
