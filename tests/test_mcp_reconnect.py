@@ -25,6 +25,7 @@ pytest in teardown (see `tests/fixtures/mcp_flaky_server.py`'s sibling
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import shlex
 import signal
@@ -881,8 +882,14 @@ def _run_shutdown_script(script: Path, body: str) -> None:
 
     A subprocess because the thing under test is `asyncio.run`'s own
     shutdown sequence, which cannot be exercised from inside a running event
-    loop. A hang surfaces as `subprocess.TimeoutExpired`, failing the test
-    instead of wedging the suite.
+    loop. A hang shows up as a timeout, failing the test instead of wedging
+    the suite.
+
+    Started in its own session and torn down with a process-GROUP kill. When
+    this test fails it fails by hanging, and the hung interpreter is itself
+    the parent of an MCP server subprocess; killing only the direct child
+    would orphan that grandchild to linger for the length of its own sleep.
+    A red run must not leave strays behind on the machine.
     """
     script.write_text(
         "import asyncio, sys\n"
@@ -893,14 +900,32 @@ def _run_shutdown_script(script: Path, body: str) -> None:
         "asyncio.run(main())\n"
         "print('EXITED CLEANLY')\n"
     )
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         [sys.executable, str(script)],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=60,
+        start_new_session=True,  # makes `proc` a process-group leader
     )
-    assert "EXITED CLEANLY" in proc.stdout, f"stdout={proc.stdout!r} stderr={proc.stderr[-2000:]!r}"
-    assert proc.returncode == 0, f"stderr={proc.stderr[-2000:]!r}"
+    try:
+        try:
+            stdout, stderr = proc.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            raise AssertionError(
+                f"{script.name} did not exit within 60s -- loop shutdown hung"
+            ) from None
+        assert "EXITED CLEANLY" in stdout, f"stdout={stdout!r} stderr={stderr[-2000:]!r}"
+        assert proc.returncode == 0, f"stderr={stderr[-2000:]!r}"
+    finally:
+        # Unconditionally, not just on a hang. Even a clean exit can leave
+        # the MCP server subprocess behind -- the interpreter is shutting
+        # down mid-handshake, so the transport does not always get to reap
+        # its child -- and an orphan would then idle for as long as its own
+        # sleep. Signalling the whole group catches those; ProcessLookupError
+        # just means there was nothing left to kill.
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
 
 
 def test_an_unclosed_mount_does_not_hang_loop_shutdown(tmp_path: Path) -> None:
@@ -923,19 +948,33 @@ def test_an_unclosed_mount_does_not_hang_with_a_connect_in_flight(tmp_path: Path
     """The same shutdown, but with the supervisor inside a connection attempt
     rather than idle.
 
-    This is the harder half. The command below starts and then says nothing,
-    so the handshake never completes and the supervisor sits in `_rebuild`
-    until `MOUNT_TIMEOUT`. A `CancelledError` swallowed there -- returned as
-    a failed attempt instead of re-raised -- puts the supervisor back on its
-    idle await holding a cancellation meant to stop it, and the process never
-    exits. Unlike the idle case there is no second cancellation to rescue it.
+    This is the harder half. A `CancelledError` swallowed inside `_rebuild`
+    -- returned as a failed attempt instead of re-raised -- puts the
+    supervisor back on its idle await holding a cancellation that was meant
+    to stop it, and the process never exits. Unlike the idle case there is
+    no second cancellation to rescue it.
+
+    The script mounts successfully first and then hangs a *reconnect*,
+    rather than hanging the initial mount. That is deliberate: a hung
+    initial mount ends up in `mount()`'s own `except BaseException`, which
+    calls `close()` and stops the supervisor as a side effect -- so the
+    process exits for a reason that has nothing to do with the line under
+    test, and the test silently stops testing it. `reconnect()` has no such
+    handler, so nothing but the supervisor's own stand-down can end it.
     """
-    mute = shlex.join([sys.executable, "-c", "import time; time.sleep(3600)"])
     _run_shutdown_script(
         tmp_path / "unclosed_connecting.py",
-        f"    mount = MCPMount([{mute!r}])\n"
-        "    asyncio.create_task(mount.mount())\n"
-        "    await asyncio.sleep(1.5)  # let the handshake block\n"
+        f"    mount = MCPMount([{shlex.join([sys.executable, str(FIXTURE)])!r}])\n"
+        "    assert await mount.mount()\n"
+        "    server = mount._servers[0]\n"
+        "    async def never_finishes(stack):\n"
+        "        await asyncio.sleep(3600)\n"
+        "    server._connect = never_finishes\n"
+        "    server.alive = False\n"
+        "    server.session = None\n"
+        "    reconnecting = asyncio.create_task(server.reconnect(server.generation))\n"
+        "    await asyncio.sleep(0.5)  # let the supervisor park inside _rebuild\n"
+        "    assert not reconnecting.done()\n"
         "    # deliberately never closed, with a connect still in flight\n",
     )
 
@@ -982,5 +1021,51 @@ async def test_reconnect_budget_rearms_after_the_cooldown(
         assert await echo.fn(text="back") == "back"
         assert server.alive is True
         assert server.reconnect_attempts == mcp_mount.MAX_RECONNECT_ATTEMPTS + 1
+    finally:
+        await mount.close()
+
+
+async def test_cancelling_connect_attempts_do_not_retire_a_server_across_bursts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A server that stays down for several bursts must still come back.
+
+    Measured against a fully-down HTTP server: every attempt in a burst ends
+    in a cancellation from the connection it was building, which stands the
+    supervisor down. That is reproduced here by making the connect itself
+    raise, because it is the accounting that matters, not the transport. If
+    those stand-downs accumulated across bursts they would exhaust
+    `MAX_SCOPE_RECOVERIES` after two or three cooldowns and write the server
+    off permanently -- which is precisely what the cooldown exists to
+    prevent, arrived at by a slower route.
+    """
+    monkeypatch.setattr(mcp_mount, "RECONNECT_COOLDOWN_SECONDS", 0.05)
+    mount = MCPMount([flaky_cmd(tmp_path, monkeypatch, name="across-bursts")])
+    try:
+        tools = await mount.mount()
+        echo = _tool(tools, "echo")
+        server = mount._servers[0]
+        healthy_connect = server._connect
+
+        async def cancelled_connect(stack: Any) -> None:
+            raise asyncio.CancelledError("Cancelled via cancel scope")
+
+        monkeypatch.setattr(server, "_connect", cancelled_connect)
+        server.alive = False
+        server.session = None
+
+        # Four full bursts' worth of downtime -- more than the budget could
+        # absorb if it carried over.
+        for _ in range(4):
+            with pytest.raises(RuntimeError):
+                await echo.fn(text="down")
+            assert server._standdowns <= mcp_mount.MAX_SCOPE_RECOVERIES
+            await asyncio.sleep(0.06)  # let the cooldown lapse
+        assert server._supervisor_failed is False
+
+        # The server comes back after all that, and so do its tools.
+        monkeypatch.setattr(server, "_connect", healthy_connect)
+        assert await echo.fn(text="back") == "back"
+        assert server.alive is True
     finally:
         await mount.close()
