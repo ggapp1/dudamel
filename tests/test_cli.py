@@ -401,6 +401,51 @@ def test_doctor_in_non_project_dir_does_not_create_database(
     assert len(db_files) == 0, f"doctor should not create .db file, but found: {db_files}"
 
 
+def test_doctor_without_probe_tools_does_not_call_the_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The probe spends real tokens, so it must stay opt-in."""
+    target = scaffold(tmp_path)
+    monkeypatch.chdir(target)
+
+    def _fail_if_called(name: str, cfg: object) -> tuple[bool, str]:
+        raise AssertionError("tool-calling probe ran without --probe-tools")
+
+    monkeypatch.setattr(cli, "_probe_tier_tool_calling", _fail_if_called)
+    capsys.readouterr()  # drain `new`'s output
+
+    # main() catches any exception the handler raises, so if the probe ran
+    # (and _fail_if_called's AssertionError propagated), this would come
+    # back nonzero rather than 0.
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "no usable native tool calling" not in out
+    assert "native tool calling works" not in out
+
+
+def test_doctor_probe_tools_runs_probe_per_tier_and_reports_the_remedy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--probe-tools runs the probe for every configured tier and, on
+    failure, the output names the remedy -- the entire point of the check."""
+    target = scaffold(tmp_path)
+    monkeypatch.chdir(target)
+
+    calls: list[str] = []
+
+    def _fake_probe(name: str, cfg: object) -> tuple[bool, str]:
+        calls.append(name)
+        return False, 'no usable native tool calling — set tool_calling = "prompted"'
+
+    monkeypatch.setattr(cli, "_probe_tier_tool_calling", _fake_probe)
+
+    assert cli.main(["doctor", "--probe-tools"]) == 0
+    out = capsys.readouterr().out
+    assert sorted(calls) == ["fast", "standard"]
+    assert "tier 'standard': no usable native tool calling — set tool_calling = \"prompted\"" in out
+    assert "tier 'fast': no usable native tool calling — set tool_calling = \"prompted\"" in out
+
+
 # --- token rotate --------------------------------------------------------
 
 

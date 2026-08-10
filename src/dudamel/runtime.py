@@ -12,7 +12,7 @@ from typing import Any
 
 from sqlalchemy import select
 
-from dudamel.config import Settings
+from dudamel.config import Settings, TierConfig
 from dudamel.convo import ConversationStore
 from dudamel.db import Database
 from dudamel.exceptions import DudamelError, LLMError, RegistryError
@@ -30,6 +30,28 @@ from dudamel.scheduler import JobScheduler
 from dudamel.widgets import run_widget
 
 logger = logging.getLogger("dudamel.runtime")
+
+
+def build_provider(name: str, cfg: TierConfig) -> Provider:
+    """Construct the Provider a tier's config names -- shared by
+    Runtime._build_tiers (real runs) and `dudamel doctor --probe-tools`
+    (which needs a live Provider without standing up a whole Runtime)."""
+    if cfg.provider == "openai-compatible":
+        if not cfg.base_url:
+            raise RegistryError(f"tier {name!r}: openai-compatible provider needs base_url")
+        key = os.environ.get(cfg.api_key_env, "unused") if cfg.api_key_env else "unused"
+        return OpenAICompatProvider(base_url=cfg.base_url, api_key=key)
+    if cfg.provider == "anthropic":
+        env = cfg.api_key_env or "ANTHROPIC_API_KEY"
+        key = os.environ.get(env)
+        if not key:
+            raise RegistryError(f"tier {name!r}: environment variable {env} is not set")
+        return AnthropicProvider(api_key=key)
+    # "fake"
+    raise RegistryError(
+        f"tier {name!r}: provider 'fake' requires a providers= override "
+        "(dudamel.llm.testing.FakeProvider)"
+    )
 
 
 class Runtime:
@@ -71,22 +93,8 @@ class Runtime:
         for name, cfg in self._settings.llm_tiers.items():
             if name in overrides:
                 provider: Provider = overrides[name]
-            elif cfg.provider == "openai-compatible":
-                if not cfg.base_url:
-                    raise RegistryError(f"tier {name!r}: openai-compatible provider needs base_url")
-                key = os.environ.get(cfg.api_key_env, "unused") if cfg.api_key_env else "unused"
-                provider = OpenAICompatProvider(base_url=cfg.base_url, api_key=key)
-            elif cfg.provider == "anthropic":
-                env = cfg.api_key_env or "ANTHROPIC_API_KEY"
-                key = os.environ.get(env)
-                if not key:
-                    raise RegistryError(f"tier {name!r}: environment variable {env} is not set")
-                provider = AnthropicProvider(api_key=key)
-            else:  # "fake"
-                raise RegistryError(
-                    f"tier {name!r}: provider 'fake' requires a providers= override "
-                    "(dudamel.llm.testing.FakeProvider)"
-                )
+            else:
+                provider = build_provider(name, cfg)
             tiers[name] = Tier(
                 name=name, provider=provider, model=cfg.model, max_tokens=cfg.max_tokens
             )
