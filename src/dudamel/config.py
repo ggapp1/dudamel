@@ -11,6 +11,8 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
+from dudamel.mcp_mount import CALL_TIMEOUT, MOUNT_TIMEOUT
+
 
 class TierConfig(BaseModel):
     provider: Literal["openai-compatible", "anthropic", "fake"]
@@ -58,6 +60,12 @@ class McpConfig(BaseModel):
     # environment beyond the SDK's own safe default set (PATH etc.) --
     # see `MCPMount`/`_MountedServer` in mcp_mount.py.
     env_passthrough: list[str] = []
+    # How long a single tool call may run, and how long connect() +
+    # list_tools() may run at mount time. Defaulted from mcp_mount's own
+    # module constants so there is exactly one source of each default value
+    # -- see `MCPMount.__init__` for how each is actually enforced.
+    call_timeout: float = CALL_TIMEOUT
+    mount_timeout: float = MOUNT_TIMEOUT
 
 
 class Settings(BaseSettings):

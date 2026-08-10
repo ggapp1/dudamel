@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import shlex
 import sys
+import time
 from pathlib import Path
 
 import mcp.types as types
@@ -124,6 +125,30 @@ async def test_mounted_tool_fn_round_trips_through_the_server() -> None:
         assert await echo.fn(text="hello") == "hello"
     finally:
         await mount.close()
+
+
+async def test_configured_call_timeout_reaches_the_mounted_tool() -> None:
+    mount = MCPMount([fixture_cmd("alpha")], call_timeout=2.5)
+    try:
+        tools = await mount.mount()
+    finally:
+        await mount.close()
+    assert tools
+    assert all(t.timeout == 2.5 for t in tools)
+
+
+async def test_configured_mount_timeout_bounds_a_hanging_server() -> None:
+    """A server whose subprocess never speaks MCP at all -- it just sleeps --
+    must not stall `mount()` for the default MOUNT_TIMEOUT; a small
+    configured value bounds the wait instead."""
+    hang_cmd = shlex.join([sys.executable, "-c", "import time; time.sleep(3600)"])
+    mount = MCPMount([hang_cmd], mount_timeout=0.5)
+    start = time.monotonic()
+    tools = await mount.mount()
+    elapsed = time.monotonic() - start
+    await mount.close()
+    assert tools == []
+    assert elapsed < 5.0
 
 
 # -- e2e chat via FakeProvider through the mounted tool ------------------------
@@ -369,7 +394,9 @@ async def test_call_fn_resolves_the_session_at_call_time() -> None:
         def __init__(self, reply: str) -> None:
             self.reply = reply
 
-        async def call_tool(self, name: str, args: dict) -> types.CallToolResult:
+        async def call_tool(
+            self, name: str, args: dict, read_timeout_seconds: float | None = None
+        ) -> types.CallToolResult:
             return types.CallToolResult(
                 content=[types.TextContent(type="text", text=self.reply)], isError=False
             )
@@ -401,7 +428,9 @@ async def test_call_fn_raises_runtime_error_on_server_side_is_error() -> None:
     import mcp.types as types
 
     class _FakeSession:
-        async def call_tool(self, name: str, args: dict) -> types.CallToolResult:
+        async def call_tool(
+            self, name: str, args: dict, read_timeout_seconds: float | None = None
+        ) -> types.CallToolResult:
             return types.CallToolResult(
                 content=[types.TextContent(type="text", text="upstream boom")], isError=True
             )
@@ -419,7 +448,9 @@ async def test_call_fn_joins_multiple_text_blocks() -> None:
     import mcp.types as types
 
     class _FakeSession:
-        async def call_tool(self, name: str, args: dict) -> types.CallToolResult:
+        async def call_tool(
+            self, name: str, args: dict, read_timeout_seconds: float | None = None
+        ) -> types.CallToolResult:
             return types.CallToolResult(
                 content=[
                     types.TextContent(type="text", text="a"),

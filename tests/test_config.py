@@ -1,12 +1,20 @@
 from pathlib import Path
 
-from dudamel.config import Settings
+from dudamel.config import McpConfig, Settings
+from dudamel.mcp_mount import CALL_TIMEOUT, MOUNT_TIMEOUT
 
 
 def test_defaults(tmp_path: Path) -> None:
     s = Settings.load(tmp_path)  # no dudamel.toml present
     assert s.database_url == "sqlite+aiosqlite:///dudamel.db"
     assert s.data_dir == Path(".")
+
+
+def test_mcp_timeouts_are_configurable_and_default_to_the_module_constants() -> None:
+    assert McpConfig().call_timeout == CALL_TIMEOUT
+    assert McpConfig().mount_timeout == MOUNT_TIMEOUT
+    assert McpConfig(call_timeout=2.5, mount_timeout=5.0).call_timeout == 2.5
+    assert McpConfig(call_timeout=2.5, mount_timeout=5.0).mount_timeout == 5.0
 
 
 def test_toml_overrides_defaults(tmp_path: Path) -> None:
