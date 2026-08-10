@@ -28,6 +28,7 @@ import asyncio
 import os
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -427,20 +428,26 @@ async def test_backoff_grows_between_attempts(
     server._mounted = True
     server.alive = False
     delays: list[float] = []
-    real_sleep = asyncio.sleep
 
     async def fake_sleep(seconds: float, *args: Any, **kwargs: Any) -> Any:
         delays.append(seconds)
-        return await real_sleep(0, *args, **kwargs)
+        return await asyncio.sleep(0, *args, **kwargs)
 
     async def always_fails(op: str) -> BaseException | None:
         return RuntimeError("nope")
 
-    # Records the requested delay and yields immediately instead of waiting.
-    # This replaces `asyncio.sleep` itself, so it still yields to the loop
-    # for any other caller -- nothing else runs during this test, and
-    # monkeypatch puts the real one back afterwards.
-    monkeypatch.setattr(mcp_mount.asyncio, "sleep", fake_sleep)
+    class _AsyncioProxy:
+        """Everything `asyncio` has, except `sleep` records its argument and
+        returns immediately. Swapped in for the module's OWN `asyncio` name
+        rather than patching `asyncio.sleep` itself, so no other code in the
+        process sees a stubbed clock."""
+
+        sleep = staticmethod(fake_sleep)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(asyncio, name)
+
+    monkeypatch.setattr(mcp_mount, "asyncio", _AsyncioProxy())
     monkeypatch.setattr(server, "_submit", always_fails)
     assert await server.reconnect(server.generation) is False
     # Three attempts, two gaps between them, each double the last.
@@ -544,10 +551,12 @@ class _PoisonedSession:
     transport death: its cancel scope is cancelled, so every operation on it
     raises a bare `CancelledError` rather than an `MCPError`.
 
-    Injected rather than provoked. A real stdio death can surface either
-    exception depending on whether the session's reader noticed EOF before
-    the next request was written, so provoking this specific branch from a
-    real subprocess would be a race; the branch itself is what matters.
+    Injected rather than provoked, because provoking it reliably from a real
+    subprocess death is not something these tests can arrange: which of the
+    two exceptions a caller sees depends on internal SDK timing rather than
+    on anything the test controls. The branch is what matters here, so it is
+    driven directly -- everything around the injection (the mount, the
+    `Tool.fn`, the reconnect it triggers) is real.
     """
 
     def __init__(self) -> None:
@@ -601,3 +610,124 @@ async def test_router_timeout_still_surfaces_as_a_timeout(
         assert mount._servers[0].reconnect_count == 0
     finally:
         await mount.close()
+
+
+# -- HTTP transport ------------------------------------------------------------
+#
+# The stdio tests above cannot reach one whole class of failure: over stdio the
+# client library owns the server process, so "the connection died" and "the
+# process is being respawned" are the same event. An HTTP server is a separate
+# thing that can be absent for a while and then come back, which is what these
+# two cover. They are marked `slow` because each one starts a real ASGI server.
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _start_http_fixture(port: int, state: Path, *, slow_seconds: float) -> subprocess.Popen[bytes]:
+    env = dict(
+        os.environ,
+        MCP_FLAKY_HTTP_PORT=str(port),
+        MCP_FLAKY_STATE=str(state),
+        MCP_FLAKY_SLOW_SECONDS=str(slow_seconds),
+    )
+    return subprocess.Popen(
+        [sys.executable, str(FIXTURE), "httpflaky"],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+async def _wait_for_port(port: int, *, listening: bool, timeout: float = 20.0) -> None:
+    """Block until the port is (or is no longer) accepting connections.
+
+    Polled rather than slept: an ASGI server's startup time is not something
+    a test can assume, and guessing would make these race.
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        with socket.socket() as sock:
+            sock.settimeout(0.2)
+            open_now = sock.connect_ex(("127.0.0.1", port)) == 0
+        if open_now == listening:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"timed out waiting for port {port} listening={listening}")
+
+
+@pytest.mark.slow
+async def test_http_server_restart_reconnects_transparently(tmp_path: Path) -> None:
+    """An HTTP server that goes away and comes back is still reachable.
+
+    The restarted server is perfectly healthy -- it simply has no memory of
+    the session id this client holds, and rejects it. That has to count as a
+    dead connection, or every restart of a remote MCP server would silently
+    disable its tools until dudamel itself was restarted.
+    """
+    port = _free_port()
+    state = tmp_path / "state"
+    server_proc = _start_http_fixture(port, state, slow_seconds=0.05)
+    mount = MCPMount([MCPServerConfig(url=f"http://127.0.0.1:{port}/mcp")])
+    try:
+        await _wait_for_port(port, listening=True)
+        tools = await mount.mount()
+        echo = _tool(tools, "echo")
+        assert await echo.fn(text="before") == "before"
+
+        server_proc.kill()
+        server_proc.wait()
+        await _wait_for_port(port, listening=False)
+        server_proc = _start_http_fixture(port, state, slow_seconds=0.05)
+        await _wait_for_port(port, listening=True)
+
+        # No error surfaces: the stale session is recognized, rebuilt, and
+        # the read-only call retried against the new one.
+        assert await echo.fn(text="after") == "after"
+        assert mount._servers[0].reconnect_count == 1
+    finally:
+        await mount.close()
+        server_proc.kill()
+        server_proc.wait()
+
+
+@pytest.mark.slow
+async def test_http_background_failure_does_not_strand_the_supervisor(tmp_path: Path) -> None:
+    """A transport that fails in the background cancels the task that hosts
+    its scopes -- the supervisor. That must not kill it.
+
+    If it did, nothing would ever release the connection's stack and every
+    later request would find no supervisor to talk to, so the server would be
+    unreachable for the rest of the process with no way back.
+    """
+    port = _free_port()
+    state = tmp_path / "state"
+    server_proc = _start_http_fixture(port, state, slow_seconds=30.0)
+    mount = MCPMount([MCPServerConfig(url=f"http://127.0.0.1:{port}/mcp")])
+    try:
+        await _wait_for_port(port, listening=True)
+        tools = await mount.mount()
+        server = mount._servers[0]
+        call = asyncio.ensure_future(_tool(tools, "slow_mutate").fn(value="inflight"))
+        await _wait_for_started_marker(state, "inflight", timeout=20.0)
+
+        server_proc.kill()
+        server_proc.wait()
+        await _wait_for_port(port, listening=False)
+
+        # Mutating, and the request was in flight, so the outcome is unknown.
+        with pytest.raises(RuntimeError, match="UNKNOWN"):
+            await call
+        # The point of the test: the supervisor absorbed its own scope's
+        # cancellation instead of dying with it.
+        assert server._supervisor is not None
+        assert server._supervisor.done() is False
+        assert server.session is None
+    finally:
+        await mount.close()
+        server_proc.kill()
+        server_proc.wait()

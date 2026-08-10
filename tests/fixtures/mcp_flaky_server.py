@@ -40,9 +40,15 @@ Both are read once at import time, so a server restarted with different
 values presents a genuinely different tool surface than the one a client
 discovered before -- annotations flipped, or a tool that has vanished.
 
-Not meant to be run interactively: tests spawn it as
-``[sys.executable, <this file>]`` and speak MCP over its stdio, the same way
-``mcp_echo_server.py`` is spawned.
+Normally spawned over stdio as ``[sys.executable, <this file>]``, the same
+way ``mcp_echo_server.py`` is. Setting ``MCP_FLAKY_HTTP_PORT`` instead makes
+it serve streamable HTTP on that port of ``127.0.0.1``, so the same tools can
+be reached through the other transport. That mode exists for reconnect tests:
+over stdio the client library respawns the server process itself, so only the
+HTTP mode can exercise a connection that fails in the background while the
+server is genuinely absent, and is then restored out-of-band.
+
+Not meant to be run interactively.
 """
 
 from __future__ import annotations
@@ -116,4 +122,8 @@ if "echo" not in _DROPPED:
 
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    _HTTP_PORT = os.environ.get("MCP_FLAKY_HTTP_PORT")
+    if _HTTP_PORT:
+        mcp.run(transport="streamable-http", host="127.0.0.1", port=int(_HTTP_PORT))
+    else:
+        mcp.run(transport="stdio")
