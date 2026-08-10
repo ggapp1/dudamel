@@ -115,7 +115,17 @@ logger = logging.getLogger("dudamel.mcp")
 
 CALL_TIMEOUT = 30.0  # per-tool-call timeout, enforced natively -- see `_make_call_fn`
 MOUNT_TIMEOUT = 15.0  # connect + list_tools budget per server, at mount time
-CLOSE_TIMEOUT = 10.0  # how long to wait for a server's supervisor task to exit
+
+# `close()`'s own bound, and only that: once the supervisor has ACKed the
+# "stop" op, this is how long to wait for it to finish unwinding its stack
+# before giving up and cancelling it. It does NOT bound the wait for the ACK
+# itself -- `close()` first does an untimed `_submit_to(supervisor, "stop")`,
+# and if a connect is in flight when shutdown starts, that op sits in the
+# supervisor's queue behind `_rebuild`'s own `wait_for(..., mount_timeout)`.
+# So the worst case per server is close to mount_timeout (default 15s), not
+# CLOSE_TIMEOUT, and `MCPMount.close()` awaits each server's `close()` in
+# turn, so that worst case is serialized across servers, not just paid once.
+CLOSE_TIMEOUT = 10.0
 
 # Trap for a future test: `MCPMount`/`_MountedServer`'s `call_timeout`/
 # `mount_timeout` keyword defaults are bound to these two constants at
