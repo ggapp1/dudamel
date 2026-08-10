@@ -442,8 +442,9 @@ def test_doctor_probe_tools_runs_probe_per_tier_and_reports_the_remedy(
     assert cli.main(["doctor", "--probe-tools"]) == 0
     out = capsys.readouterr().out
     assert sorted(calls) == ["fast", "standard"]
-    assert "tier 'standard': no usable native tool calling — set tool_calling = \"prompted\"" in out
-    assert "tier 'fast': no usable native tool calling — set tool_calling = \"prompted\"" in out
+    remedy = 'no usable native tool calling — set tool_calling = "prompted"'
+    assert f"llm tier 'standard' tool calling: {remedy}" in out
+    assert f"llm tier 'fast' tool calling: {remedy}" in out
 
 
 # --- token rotate --------------------------------------------------------

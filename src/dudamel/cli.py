@@ -428,7 +428,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         if args.probe_tools:
             for name, cfg in settings.llm_tiers.items():
                 ok, detail = _probe_tier_tool_calling(name, cfg)
-                lines.append(_line(ok, f"tier {name!r}", detail))
+                lines.append(_line(ok, f"llm tier {name!r} tool calling", detail))
     else:
         lines.append(_line(False, "llm tiers", "none configured in dudamel.toml"))
 
