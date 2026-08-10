@@ -190,6 +190,70 @@ async def test_cookie_get_does_not_require_csrf(tmp_path: Path, token_env: str) 
     await rt.stop()
 
 
+# --- cookie Secure / __Host- / Max-Age ----------------------------------------
+
+
+async def test_cookie_is_insecure_and_plainly_named_on_loopback(
+    tmp_path: Path, token_env: str
+) -> None:
+    rt, transport = await build(tmp_path, [], web=WebConfig())  # default host: loopback
+    async with client(transport) as c:
+        resp = await c.post("/login", json={"token": token_env})
+    cookie = resp.headers["set-cookie"]
+    assert "dudamel_session=" in cookie
+    assert "__Host-" not in cookie
+    assert "Secure" not in cookie
+    assert "Max-Age=86400" in cookie
+    await rt.stop()
+
+
+async def test_cookie_is_secure_and_host_prefixed_off_box(tmp_path: Path, token_env: str) -> None:
+    """Auto-derives from the bind host: a static insecure default would be
+    silent in exactly the deployment that needs it."""
+    rt, transport = await build(tmp_path, [], web=WebConfig(host="0.0.0.0"))
+    async with client(transport) as c:
+        resp = await c.post("/login", json={"token": token_env})
+    cookie = resp.headers["set-cookie"]
+    assert "__Host-dudamel_session=" in cookie
+    assert "Secure" in cookie
+    assert "Path=/" in cookie
+    assert "Domain=" not in cookie
+    await rt.stop()
+
+
+async def test_explicit_cookie_secure_overrides_the_host_derivation(
+    tmp_path: Path, token_env: str
+) -> None:
+    rt, transport = await build(tmp_path, [], web=WebConfig(cookie_secure=True))
+    async with client(transport) as c:
+        resp = await c.post("/login", json={"token": token_env})
+    assert "Secure" in resp.headers["set-cookie"]
+    await rt.stop()
+
+
+async def test_a_secure_session_cookie_still_authenticates(tmp_path: Path, token_env: str) -> None:
+    """The rename must not break the round trip -- the authenticator has to
+    read whichever name was issued. httpx's cookie jar won't replay a Secure
+    cookie over the http:// test transport, so the cookie header is passed
+    through explicitly here to exercise the actual read side."""
+    rt, transport = await build(tmp_path, [fake_text("hi")], web=WebConfig(host="0.0.0.0"))
+    async with client(transport) as c:
+        login = await c.post("/login", json={"token": token_env})
+        csrf = login.json()["csrf_token"]
+        cookie_header = login.headers["set-cookie"].split(";")[0]
+
+        pending = await c.get("/api/pending", headers={"Cookie": cookie_header})
+        assert pending.status_code == 200
+
+        chat = await c.post(
+            "/api/chat",
+            json={"text": "hi"},
+            headers={"Cookie": cookie_header, CSRF_HEADER: csrf},
+        )
+        assert chat.status_code == 200
+    await rt.stop()
+
+
 # --- login throttling ---------------------------------------------------------
 
 

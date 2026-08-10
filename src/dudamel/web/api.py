@@ -18,11 +18,12 @@ from dudamel._version import __version__
 from dudamel.config import Settings
 from dudamel.runtime import Runtime
 from dudamel.web.auth import (
-    SESSION_COOKIE,
+    SESSION_TTL,
     Authenticator,
     AuthVia,
     SessionStore,
     resolve_token,
+    session_cookie_name,
 )
 from dudamel.web.throttle import FailedAuthThrottle
 
@@ -107,9 +108,18 @@ def create_api(runtime: Runtime, settings: Settings) -> FastAPI:
         # easy to miss silently, so flag it loudly at startup instead.
         logger.warning("dashboard login impossible until %s is set", settings.web.token_env)
 
+    # Resolved once, and shared by /login's cookie name/flags and the
+    # Authenticator's read side, so they can never disagree about which
+    # cookie name is in play.
+    cookie_secure = (
+        settings.web.cookie_secure
+        if settings.web.cookie_secure is not None
+        else not is_loopback_host(settings.web.host)
+    )
+
     sessions = SessionStore()
     throttle = FailedAuthThrottle()
-    authenticate = Authenticator(settings, sessions, throttle, _client_key)
+    authenticate = Authenticator(settings, sessions, throttle, _client_key, cookie_secure)
 
     app = FastAPI(title="dudamel", version=__version__)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.web.allowed_hosts)
@@ -146,10 +156,13 @@ def create_api(runtime: Runtime, settings: Settings) -> FastAPI:
             throttle.clear(key)
             session_id, csrf_token = sessions.create()
             response.set_cookie(
-                SESSION_COOKIE,
+                session_cookie_name(cookie_secure),
                 session_id,
                 httponly=True,
                 samesite="strict",
+                secure=cookie_secure,
+                path="/",
+                max_age=int(SESSION_TTL.total_seconds()),
             )
             return {"csrf_token": csrf_token}
         if throttle.is_throttled(key):
