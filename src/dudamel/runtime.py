@@ -137,7 +137,10 @@ class Runtime:
             # (Registry.add_mcp_tools): that's a configuration bug, not
             # environmental flakiness.
             self._mcp_mount = MCPMount(
-                self._mcp_commands, env_passthrough=self._settings.mcp.env_passthrough
+                self._mcp_commands,
+                env_passthrough=self._settings.mcp.env_passthrough,
+                call_timeout=self._settings.mcp.call_timeout,
+                mount_timeout=self._settings.mcp.mount_timeout,
             )
             tools = await self._mcp_mount.mount()
             if tools:

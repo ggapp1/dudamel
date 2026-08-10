@@ -387,7 +387,12 @@ def _is_connection_death(e: BaseException) -> bool:
 
 
 def _make_call_fn(
-    server: _MountedServer, *, remote_name: str, local_name: str, read_only: bool
+    server: _MountedServer,
+    *,
+    remote_name: str,
+    local_name: str,
+    read_only: bool,
+    call_timeout: float = CALL_TIMEOUT,
 ) -> Callable[..., Awaitable[str]]:
     """Build the `Tool.fn` for one remote tool, including its reconnect and
     retry policy.
@@ -396,10 +401,27 @@ def _make_call_fn(
     only half the retry decision: `_MountedServer.is_retry_safe` can revoke
     it later if the server comes back advertising different annotations, and
     a revoked tool is never retried again.
+
+    `call_timeout` bounds the call through the SDK's own
+    `read_timeout_seconds`, NOT `asyncio.wait_for`. Measured against this SDK
+    generation: a native timeout raises `MCPError(code=REQUEST_TIMEOUT,
+    -32001)`, a coded exception `_is_connection_death` reads and deliberately
+    excludes from "the connection is dead" (a slow tool is not a dead
+    transport -- see that function's docstring). `asyncio.wait_for` instead
+    raises a bare `TimeoutError` with no `.code`, indistinguishable from any
+    other timeout by anything downstream, AND it works by cancelling this
+    task -- which is exactly the `CancelledError` hazard `invoke()`'s callers
+    already have to disentangle from a real connection death via
+    `_cancellation_was_requested()`. The native path avoids manufacturing
+    that ambiguity in the first place. (The Router's OWN `asyncio.wait_for`
+    around `tool.fn` is unaffected by this and still applies -- see
+    `Tool.timeout` on the built `Tool` -- it is a generic backstop for every
+    tool, mcp-origin or not, and this local, coded timeout is expected to
+    fire first.)
     """
 
     async def invoke(session: ClientSession, **kwargs: Any) -> str:
-        result = await session.call_tool(remote_name, kwargs)
+        result = await session.call_tool(remote_name, kwargs, read_timeout_seconds=call_timeout)
         text = "\n".join(
             block.text for block in result.content if isinstance(block, types.TextContent)
         )
@@ -508,6 +530,7 @@ def _build_tool(
     mcp_tool: types.Tool,
     read_only: bool,
     confirm: bool,
+    call_timeout: float,
 ) -> Tool:
     raw_description = mcp_tool.description or mcp_tool.name
     # Truncate, not drop: a truncated description is still a description.
@@ -524,11 +547,18 @@ def _build_tool(
             remote_name=mcp_tool.name,
             local_name=tool_name,
             read_only=read_only,
+            call_timeout=call_timeout,
         ),
         schema=McpToolSchema(input_schema),
         read_only=read_only,
         confirm=confirm,
-        timeout=CALL_TIMEOUT,
+        # Enforcement itself happens on the transport-native path in
+        # `invoke()` below (see `_make_call_fn`), not here. This is kept in
+        # sync with it anyway as a backstop: if a future change to `invoke()`
+        # ever forgets to pass a per-call timeout, the Router's own
+        # `asyncio.wait_for(tool.fn(...), timeout=tool.timeout)` still bounds
+        # the call, just without the coded MCPError the native path gives.
+        timeout=call_timeout,
         origin="mcp",
     )
     # The server keeps a handle on every tool it actually contributed, so a
@@ -575,8 +605,9 @@ class _MountedServer:
     without having to hold a lock while it makes its tool call.
     """
 
-    def __init__(self, config: MCPServerConfig) -> None:
+    def __init__(self, config: MCPServerConfig, *, mount_timeout: float = MOUNT_TIMEOUT) -> None:
         self.config = config
+        self.mount_timeout = mount_timeout
         self.session: ClientSession | None = None
         self.server_name: str = ""
         # The self-reported name the tools were registered under, kept apart
@@ -828,7 +859,7 @@ class _MountedServer:
         stack = AsyncExitStack()
         self._stack = stack
         try:
-            await asyncio.wait_for(self._connect(stack), timeout=MOUNT_TIMEOUT)
+            await asyncio.wait_for(self._connect(stack), timeout=self.mount_timeout)
         except (KeyboardInterrupt, SystemExit):
             raise
         except asyncio.CancelledError:
@@ -1157,6 +1188,7 @@ def _collect_server_tools(
     command: str,
     mcp_tools: Sequence[types.Tool],
     seen_names: set[str],
+    call_timeout: float = CALL_TIMEOUT,
 ) -> list[Tool]:
     """Build dudamel `Tool`s from one server's `list_tools()` result,
     applying the MCP-vs-MCP collision policy inline: a tool whose
@@ -1234,6 +1266,7 @@ def _collect_server_tools(
                 mcp_tool=mcp_tool,
                 read_only=read_only,
                 confirm=destructive,
+                call_timeout=call_timeout,
             )
         )
     return tools
@@ -1273,6 +1306,8 @@ class MCPMount:
         servers: Sequence[str | MCPServerConfig],
         *,
         env_passthrough: Sequence[str] = (),
+        call_timeout: float = CALL_TIMEOUT,
+        mount_timeout: float = MOUNT_TIMEOUT,
     ) -> None:
         # Normalization (string -> MCPServerConfig) is deliberately NOT done
         # here: MCPServerConfig("") -- e.g. from os.environ.get("VAR", "")
@@ -1283,6 +1318,8 @@ class MCPMount:
         # malformed string entry a warn-and-skip, like any other bad config.
         self._entries: list[str | MCPServerConfig] = list(servers)
         self._env_passthrough = tuple(env_passthrough)
+        self._call_timeout = call_timeout
+        self._mount_timeout = mount_timeout
         self._servers: list[_MountedServer] = []
 
     async def mount(self) -> list[Tool]:
@@ -1300,10 +1337,11 @@ class MCPMount:
                     if isinstance(entry, str)
                     else entry
                 )
-                server = _MountedServer(config)
+                server = _MountedServer(config, mount_timeout=self._mount_timeout)
                 # Connect + discovery happen inside the server's supervisor
-                # task, under MOUNT_TIMEOUT; `start()` re-raises whatever
-                # went wrong for the handler below.
+                # task, under this mount's configured mount_timeout;
+                # `start()` re-raises whatever went wrong for the handler
+                # below.
                 await server.start()
                 collected = _collect_server_tools(
                     server,
@@ -1311,6 +1349,7 @@ class MCPMount:
                     command=config.label,
                     mcp_tools=server.listed_tools,
                     seen_names=seen_names,
+                    call_timeout=self._call_timeout,
                 )
             except (KeyboardInterrupt, SystemExit):
                 raise
