@@ -131,8 +131,19 @@ RECONNECT_COOLDOWN_SECONDS = 60.0
 
 # How many times in a row a server's supervisor may be cancelled by its own
 # transport, with no working connection in between, before that server is
-# abandoned. Guards against a cancel source stuck in a loop.
-MAX_SCOPE_RECOVERIES = 3
+# abandoned. Guards against a cancel source stuck in a loop. Sized above
+# MAX_RECONNECT_ATTEMPTS on purpose: every attempt in a burst can end in a
+# cancellation from the connection it was building, so a budget at or below
+# one burst's worth would retire a server for a single failed burst and
+# undo the cooldown's whole point.
+MAX_SCOPE_RECOVERIES = 2 * MAX_RECONNECT_ATTEMPTS
+
+# Sizing note, not a defect: a full burst against a server that accepts
+# connections but never finishes `initialize()` costs up to
+# MAX_RECONNECT_ATTEMPTS * MOUNT_TIMEOUT plus backoff (~46s), which exceeds
+# CALL_TIMEOUT. The tool call the Router is holding open therefore reports
+# its own timeout rather than the reconnect's diagnosis; the reconnect still
+# finishes in the background and the next call sees the result.
 
 # An MCP server's input_schema and description are embedded verbatim in every
 # LLM request, so both are a token-budget cost AND a prompt-injection channel
@@ -675,19 +686,22 @@ class _MountedServer:
         consequence: when one of those groups fails in the background -- an
         HTTP transport losing its connection is the ordinary case -- anyio
         cancels its host, which lands here as a `CancelledError` on whatever
-        this task is awaiting, usually the idle `_requests.get()`. Letting
-        that kill the supervisor outright would leak the whole stack (nothing
-        would ever `aclose()` it) and strand the server, since every later
-        `_submit` would find no supervisor to talk to.
+        this task is awaiting -- the idle `_requests.get()`, or a connection
+        attempt in flight inside `_rebuild`. Letting that kill the supervisor
+        outright would leak the whole stack (nothing would ever `aclose()`
+        it) and strand the server, since every later `_submit` would find no
+        supervisor to talk to.
 
-        So a cancellation is caught, the stack is unwound inline, and this
-        task then **stands down** -- it returns rather than re-arming, and
-        `_submit` starts a fresh supervisor when there is work again. It does
-        not re-arm in place because re-arming makes this task uncancellable:
-        `asyncio.run`'s shutdown cancels each remaining task exactly once and
-        then waits for it, so a supervisor that absorbs that one cancellation
-        and goes back to `_requests.get()` never finishes and loop teardown
-        hangs forever (measured). A hang is a worse failure than the leak
+        So a cancellation is caught HERE, wherever in the loop it arose --
+        `_rebuild` deliberately re-raises rather than handling its own -- the
+        stack is unwound inline, and this task then **stands down**: it
+        returns rather than re-arming, and `_submit` starts a fresh
+        supervisor when there is work again. It does not re-arm in place
+        because re-arming makes this task uncancellable: `asyncio.run`'s
+        shutdown cancels each remaining task exactly once and then waits for
+        it, so a supervisor that absorbs that one cancellation and goes back
+        to `_requests.get()` never finishes and loop teardown hangs forever
+        (measured, on both paths). A hang is a worse failure than the leak
         this whole path exists to prevent. Standing down keeps both
         properties: the stack is always released, and the task always
         completes.
@@ -791,30 +805,34 @@ class _MountedServer:
             await asyncio.wait_for(self._connect(stack), timeout=MOUNT_TIMEOUT)
         except (KeyboardInterrupt, SystemExit):
             raise
-        except BaseException as e:
-            # A cancellation here is almost always this server's own doing:
-            # `wait_for`'s expiry, or the half-built transport's scope
-            # cancelling its host. Neither says the supervisor should stop,
-            # and `_cancellation_was_requested()` cannot tell them apart from
-            # a real shutdown because anyio cancels scopes with
-            # `Task.cancel()` too. `_closed` is the authoritative signal for
-            # "stop", so only that re-raises; everything else is just a
-            # failed connection attempt.
+        except asyncio.CancelledError:
+            # ALWAYS re-raised, never turned into a return value. Measured on
+            # 3.11+: `wait_for` reports its own expiry as `TimeoutError` and
+            # never as `CancelledError`, so a cancellation arriving here is
+            # always someone else's -- an anyio scope this half-built
+            # connection opened, or the event loop shutting the process down.
+            # Absorbing it and returning normally would send `_supervise`
+            # back to its idle await carrying a cancellation that was meant
+            # to stop it, which is exactly how an unclosed mount used to hang
+            # `asyncio.run`'s teardown forever (measured: no exit, SIGKILL at
+            # 25s, with the supervisor parked inside this call).
             #
-            # This and `_supervise`'s `CancelledError` handler are two layers
-            # of one defense: a scope cancellation must not leak the stack,
-            # and which layer sees it depends on whether it lands while a
-            # connection is being built or while the task sits idle. They
-            # overlap on purpose -- removing either alone leaves the behavior
-            # intact, only removing both regresses it.
-            if isinstance(e, asyncio.CancelledError) and self._closed:
-                raise
+            # `_supervise`'s stand-down handler is the single owner of this
+            # path. It releases `self._stack` -- already installed above, so
+            # the half-built connection is not leaked -- lets the task
+            # finish, and counts the stand-down against
+            # `MAX_SCOPE_RECOVERIES`. This is deliberately NOT a second,
+            # overlapping layer: a `CancelledError` handled here instead of
+            # there would defeat that guarantee rather than duplicate it.
+            raise
+        except BaseException as e:
             await self._teardown()
             return e
         self.alive = True
         self.generation += 1
-        # A working connection clears both stand-down budgets: they exist to
-        # stop pathological loops, not to accumulate over a long uptime.
+        # A working connection clears the stand-down budget (the reconnect
+        # cooldown is cleared separately, by `reconnect` itself). It exists
+        # to stop a pathological loop, not to accumulate over a long uptime.
         self._standdowns = 0
         return None
 

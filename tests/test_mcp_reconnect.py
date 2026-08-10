@@ -872,25 +872,24 @@ async def test_repeated_supervisor_cancellation_is_bounded(
         await mount.close()
 
 
-@pytest.mark.slow
-def test_an_unclosed_mount_does_not_hang_loop_shutdown(tmp_path: Path) -> None:
-    """`asyncio.run` cancels each surviving task exactly once and then waits
-    for it. A supervisor that absorbed that cancellation and went back to
-    waiting would never finish, so the interpreter would hang on exit
-    instead of reporting whatever the real problem was.
+SRC_DIR = Path(__file__).parent.parent / "src"
 
-    Run as a subprocess because that shutdown sequence is the thing under
-    test, and it cannot be exercised from inside a running event loop.
+
+def _run_shutdown_script(script: Path, body: str) -> None:
+    """Run `body` under `asyncio.run` in a fresh interpreter and require a
+    clean exit.
+
+    A subprocess because the thing under test is `asyncio.run`'s own
+    shutdown sequence, which cannot be exercised from inside a running event
+    loop. A hang surfaces as `subprocess.TimeoutExpired`, failing the test
+    instead of wedging the suite.
     """
-    script = tmp_path / "unclosed.py"
     script.write_text(
         "import asyncio, sys\n"
-        f"sys.path.insert(0, {str(Path(__file__).parent.parent / 'src')!r})\n"
+        f"sys.path.insert(0, {str(SRC_DIR)!r})\n"
         "from dudamel.mcp_mount import MCPMount\n"
         "async def main():\n"
-        f"    mount = MCPMount([{shlex.join([sys.executable, str(FIXTURE)])!r}])\n"
-        "    assert await mount.mount()\n"
-        "    # deliberately never closed\n"
+        f"{body}"
         "asyncio.run(main())\n"
         "print('EXITED CLEANLY')\n"
     )
@@ -898,10 +897,47 @@ def test_an_unclosed_mount_does_not_hang_loop_shutdown(tmp_path: Path) -> None:
         [sys.executable, str(script)],
         capture_output=True,
         text=True,
-        timeout=60,  # a hang shows up as TimeoutExpired, which fails the test
+        timeout=60,
     )
     assert "EXITED CLEANLY" in proc.stdout, f"stdout={proc.stdout!r} stderr={proc.stderr[-2000:]!r}"
     assert proc.returncode == 0, f"stderr={proc.stderr[-2000:]!r}"
+
+
+def test_an_unclosed_mount_does_not_hang_loop_shutdown(tmp_path: Path) -> None:
+    """`asyncio.run` cancels each surviving task exactly once and then waits
+    for it. A supervisor that absorbed that cancellation and went back to
+    waiting would never finish, so the interpreter would hang on exit
+    instead of reporting whatever the real problem was.
+
+    This is the idle case: the supervisor is parked on its request queue.
+    """
+    _run_shutdown_script(
+        tmp_path / "unclosed_idle.py",
+        f"    mount = MCPMount([{shlex.join([sys.executable, str(FIXTURE)])!r}])\n"
+        "    assert await mount.mount()\n"
+        "    # deliberately never closed\n",
+    )
+
+
+def test_an_unclosed_mount_does_not_hang_with_a_connect_in_flight(tmp_path: Path) -> None:
+    """The same shutdown, but with the supervisor inside a connection attempt
+    rather than idle.
+
+    This is the harder half. The command below starts and then says nothing,
+    so the handshake never completes and the supervisor sits in `_rebuild`
+    until `MOUNT_TIMEOUT`. A `CancelledError` swallowed there -- returned as
+    a failed attempt instead of re-raised -- puts the supervisor back on its
+    idle await holding a cancellation meant to stop it, and the process never
+    exits. Unlike the idle case there is no second cancellation to rescue it.
+    """
+    mute = shlex.join([sys.executable, "-c", "import time; time.sleep(3600)"])
+    _run_shutdown_script(
+        tmp_path / "unclosed_connecting.py",
+        f"    mount = MCPMount([{mute!r}])\n"
+        "    asyncio.create_task(mount.mount())\n"
+        "    await asyncio.sleep(1.5)  # let the handshake block\n"
+        "    # deliberately never closed, with a connect still in flight\n",
+    )
 
 
 # -- the reconnect budget bounds a burst, not the process ----------------------
