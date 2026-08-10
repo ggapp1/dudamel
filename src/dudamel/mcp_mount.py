@@ -91,11 +91,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import mcp.types as types
-
-# `mcp_types` is a separate top-level distribution that mcp 2.x pins exactly
-# (see the dependency comment in pyproject.toml); the JSON-RPC error codes
-# live there, NOT in `mcp.types`, which is the import that looks right.
-import mcp_types
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.context import ClientRequestContext
 from mcp.client.stdio import stdio_client
@@ -127,6 +122,11 @@ MAX_SCHEMA_BYTES = 16384
 MAX_DESCRIPTION_CHARS = 1024
 
 _REFUSAL = "MCP server-initiated callbacks are not supported in dudamel v1"
+
+# Exact `MCPError` messages that mean "this HTTP session id is gone, start a
+# new one" rather than "your request was malformed" -- see
+# `_is_connection_death`.
+_HTTP_SESSION_GONE = frozenset({"session terminated", "session not found", "session expired"})
 
 
 # -- server configuration -----------------------------------------------------
@@ -261,16 +261,29 @@ class McpToolSchema:
 # -- connection-death classification ---------------------------------------------
 
 
-def _is_self_cancellation() -> bool:
-    """True when THIS task has an outstanding `cancel()` request against it.
+def _cancellation_was_requested() -> bool:
+    """True when THIS task has an outstanding `Task.cancel()` against it.
 
-    The Router runs every tool under `asyncio.wait_for`, which cancels the
-    task running the tool when the timeout expires. That cancellation must
-    be allowed through untouched, or `wait_for` never converts it into the
-    `TimeoutError` the Router reports -- a slow tool would be misreported as
-    a dead connection. A cancellation arriving from a dead MCP session, by
-    contrast, comes out of the SDK's own anyio scopes and leaves this task's
-    cancellation count at zero.
+    That is all it distinguishes, and the distinction is narrower than it
+    looks: anyio delivers cancel-scope cancellation by calling
+    `Task.cancel()` too, so a task that is a *member* of a cancelled anyio
+    scope also answers True here. What answers False is a `CancelledError`
+    object that merely propagated to this task -- e.g. from awaiting a
+    future that someone else cancelled -- without any cancel request against
+    this task.
+
+    That is exactly the distinction the tool-call path needs. The Router
+    runs every tool under `asyncio.wait_for`, which cancels the task running
+    the tool; that cancellation must pass through untouched or `wait_for`
+    never converts it into the `TimeoutError` the Router reports, and a
+    merely slow tool would be misreported as a dead connection. A Router
+    task, meanwhile, is never a member of an MCP session's cancel scopes:
+    those are entered by -- and belong to -- the server's supervisor task,
+    so a death arrives at the Router as a propagated `CancelledError` with
+    no cancel request against it.
+
+    It is NOT a usable test inside the supervisor task, which *is* the host
+    of those scopes; see `_supervise`.
     """
     task = asyncio.current_task()
     return task is not None and task.cancelling() > 0
@@ -293,13 +306,39 @@ def _is_connection_death(e: BaseException) -> bool:
       raises a bare `asyncio.CancelledError` instead -- a `BaseException`,
       invisible to `except Exception`. Call sites must therefore catch
       `BaseException`, and must rule out their own cancellation first (see
-      `_is_self_cancellation`), because the exception alone cannot say who
-      asked for it.
+      `_cancellation_was_requested`), because the exception alone cannot say
+      who asked for it.
     - A background failure that was deferred inside a task group surfaces as
       an exception group, so groups are searched member by member.
+
+    Known false negative: an exception group whose members are raw transport
+    errors (`httpx2.*`, `anyio.*`) rather than `MCPError`s is not recognized
+    here, because matching them would mean importing two packages dudamel
+    does not depend on directly. Those only surface while a transport is
+    being torn down -- a path that is already guarded -- so the cost is that
+    such a death is noticed one call later than it could be, not that it is
+    missed.
     """
     if isinstance(e, MCPError):
-        return e.code == mcp_types.CONNECTION_CLOSED
+        if e.code == types.CONNECTION_CLOSED:
+            return True
+        # A streamable-HTTP server that restarted is still reachable, so
+        # nothing above fires -- but it no longer knows the session id we
+        # hold, and answers 404. Measured, that reaches a caller as
+        # INVALID_REQUEST with one of two messages: "Session terminated"
+        # (synthesized by the client transport) or whatever JSON-RPC error
+        # the server itself put in the body, "Session not found" for a
+        # spec-correct one. The protocol's remedy for a 404 against a session
+        # id is to start a new session, which is precisely a reconnect.
+        #
+        # Matched on the exact known messages rather than on INVALID_REQUEST
+        # alone: that code is also how ordinary malformed-request errors
+        # arrive, and reconnecting on those would be churn. An unrecognized
+        # wording simply does not reconnect, which is no worse than before.
+        if e.code == types.INVALID_REQUEST:
+            message = str(getattr(e, "message", "") or e).strip().lower()
+            return message in _HTTP_SESSION_GONE
+        return False
     if isinstance(e, asyncio.CancelledError):
         return True
     if isinstance(e, BaseExceptionGroup):
@@ -381,7 +420,7 @@ def _make_call_fn(
         except (KeyboardInterrupt, SystemExit):
             raise
         except BaseException as e:
-            if _is_self_cancellation():
+            if _cancellation_was_requested():
                 # The Router's own timeout, not the server dying. Passing it
                 # through is what lets `wait_for` report a TimeoutError.
                 raise
@@ -404,7 +443,7 @@ def _make_call_fn(
                 except (KeyboardInterrupt, SystemExit):
                     raise
                 except BaseException as retry_error:
-                    if _is_self_cancellation():
+                    if _cancellation_was_requested():
                         raise
                     if isinstance(retry_error, Exception):
                         raise
@@ -583,18 +622,39 @@ class _MountedServer:
         Operations are serialized here by construction -- one task, one
         queue -- so a connect can never overlap a teardown, and every cancel
         scope is entered and exited by this task and no other.
+
+        This task is the *host* of the transport's and the `ClientSession`'s
+        anyio task groups, because it is the task that entered them. Measured
+        consequence: when one of those groups fails in the background -- an
+        HTTP transport losing its connection is the ordinary case -- anyio
+        cancels its host, which lands here as a `CancelledError` on whatever
+        this task is awaiting, usually the idle `_requests.get()`. Letting
+        that kill the supervisor would leak the whole stack (nothing would
+        ever `aclose()` it) and permanently strand the server, since every
+        later `_submit` would find no supervisor to talk to. So it is caught
+        and recovered from instead.
         """
         pending: asyncio.Future[BaseException | None] | None = None
         try:
             while True:
-                op, fut = await self._requests.get()
-                pending = fut
-                if op == "stop":
-                    await self._teardown()
-                    self._resolve(fut, None)
-                    return
-                self._resolve(fut, await self._rebuild())
-                pending = None
+                try:
+                    op, fut = await self._requests.get()
+                    pending = fut
+                    if op == "stop":
+                        await self._teardown()
+                        self._resolve(fut, None)
+                        return
+                    self._resolve(fut, await self._rebuild())
+                    pending = None
+                except asyncio.CancelledError as e:
+                    if self._retired:
+                        # close() gave up waiting and cancelled us, or the
+                        # attempt budget is spent. Either way, stop.
+                        raise
+                    if pending is not None:
+                        self._resolve(pending, e)
+                        pending = None
+                    await self._recover_from_scope_cancellation()
         except (KeyboardInterrupt, SystemExit) as e:
             # Resolve before re-raising, or whoever is waiting on this
             # operation waits for a task that is never coming back.
@@ -609,6 +669,35 @@ class _MountedServer:
             while not self._requests.empty():
                 _, queued = self._requests.get_nowait()
                 self._resolve(queued, RuntimeError("mcp: server supervisor stopped"))
+
+    async def _recover_from_scope_cancellation(self) -> None:
+        """Absorb a cancellation delivered by one of this server's own anyio
+        scopes, and get back to a clean, connection-less state that the next
+        tool call can reconnect from.
+
+        `_teardown()` is awaited inline and NOT under `asyncio.shield`.
+        Shield runs its argument in a *new* task, and exiting an anyio cancel
+        scope from a task other than the one that entered it is exactly the
+        corruption this whole structure exists to prevent -- measured, it
+        fails with "Attempted to exit cancel scope in a different task than
+        it was entered in". Unwinding the scope inline is also what clears
+        the cancellation: anyio's `__aexit__` uncancels the host task on its
+        way out and re-raises the deferred background error, which
+        `_teardown` logs.
+        """
+        logger.warning(
+            "mcp: server %r cancelled its own connection scope -- its transport failed "
+            "in the background. Discarding the connection; the next tool call will "
+            "reconnect.",
+            self.config.label,
+        )
+        await self._teardown()
+        # Defensive: anyio uncancels the host task as it unwinds, but if
+        # there was no stack left to unwind nothing did that for us, and a
+        # task carrying a pending cancel request aborts its very next await.
+        task = asyncio.current_task()
+        while task is not None and task.cancelling() > 0:
+            task.uncancel()
 
     async def _rebuild(self) -> BaseException | None:
         """Discard whatever connection exists and build a brand-new one.
@@ -626,11 +715,22 @@ class _MountedServer:
         except (KeyboardInterrupt, SystemExit):
             raise
         except BaseException as e:
-            # `wait_for` has already absorbed its own timeout cancellation by
-            # this point, so an outstanding one means the supervisor task
-            # itself is being torn down -- let that through rather than
-            # reporting it as a connection failure and looping.
-            if _is_self_cancellation():
+            # A cancellation here is almost always this server's own doing:
+            # `wait_for`'s expiry, or the half-built transport's scope
+            # cancelling its host. Neither says the supervisor should stop,
+            # and `_cancellation_was_requested()` cannot tell them apart from
+            # a real shutdown because anyio cancels scopes with
+            # `Task.cancel()` too. `_retired` is the authoritative signal for
+            # "stop", so only that re-raises; everything else is just a
+            # failed connection attempt.
+            #
+            # This and `_supervise`'s `CancelledError` handler are two layers
+            # of one defense: a scope cancellation must not kill the
+            # supervisor, and which layer sees it depends on whether it lands
+            # while a connection is being built or while the task sits idle.
+            # They overlap on purpose -- removing either alone leaves the
+            # behavior intact, only removing both regresses it.
+            if isinstance(e, asyncio.CancelledError) and self._retired:
                 raise
             await self._teardown()
             return e
@@ -645,18 +745,18 @@ class _MountedServer:
         if stack is None:
             return
         # Best-effort: a server that's already dead/misbehaving must not make
-        # shutdown -- or the next reconnect -- fail. Such misuse surfaces as
-        # `CancelledError`, a `BaseException` that a plain `except Exception`
-        # would NOT catch: it's connection plumbing, not a real cancellation,
-        # so catch broadly here but still let a genuine
-        # KeyboardInterrupt/SystemExit through.
+        # shutdown -- or the next reconnect -- fail. Unwinding a failed
+        # transport routinely raises here: `CancelledError` from a cancel
+        # scope, or the exception group anyio defers until teardown carrying
+        # the real background error. Both are `BaseException`s a plain
+        # `except Exception` would miss, and neither may propagate -- this is
+        # the one place that guarantees the stack is released, so it must
+        # always run to completion. Only KeyboardInterrupt/SystemExit escape.
         try:
             await stack.aclose()
         except (KeyboardInterrupt, SystemExit):
             raise
         except BaseException as e:
-            if _is_self_cancellation():
-                raise
             logger.warning(
                 "mcp: error closing server %r (%s: %s) -- ignoring, best-effort",
                 self.config.label,
