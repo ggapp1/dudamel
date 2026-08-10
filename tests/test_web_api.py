@@ -141,6 +141,36 @@ async def test_bearer_widgets_and_pending(tmp_path: Path, token_env: str) -> Non
     await rt.stop()
 
 
+async def test_pending_entries_report_channel_and_resolvability(
+    tmp_path: Path, token_env: str
+) -> None:
+    """The list is deliberately unscoped -- reaching it already requires the
+    web token, and the activity view shows every channel's tool calls to any
+    authenticated operator. What the payload adds is the distinction between
+    seeing an entry and being able to resolve it, so the dashboard stops
+    offering actions that will always be rejected."""
+    rt, transport = await build(tmp_path, [fake_tool_call("wipe", {"reason": "x"})])
+    # Created directly through the runtime on a non-web channel/user, the way
+    # a Telegram interface would -- api_chat itself only ever writes to
+    # "web:*" channels, so this is otherwise unreachable from the HTTP API.
+    reply = await rt.chat("telegram:1", "wipe it", user_id="someone-else")
+    assert reply.pending_confirmation_id
+    headers = {"Authorization": f"Bearer {token_env}"}
+    async with client(transport) as c:
+        resp = await c.get("/api/pending", headers=headers)
+    assert resp.status_code == 200
+    entries = resp.json()
+    assert entries
+    entry = entries[0]
+    assert entry["channel"] == "telegram:1"
+    # api_confirm always resolves as user_id="web"; resolve_confirmation
+    # rejects any resolve where the resolver's user_id doesn't match the
+    # confirmation's -- so a confirmation raised by "someone-else" is not
+    # resolvable by this caller.
+    assert entry["resolvable"] is False
+    await rt.stop()
+
+
 # --- session cookie login + CSRF ---------------------------------------------
 
 

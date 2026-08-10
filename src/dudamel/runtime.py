@@ -177,14 +177,16 @@ class Runtime:
         )
 
     async def list_pending_confirmations(self, channel: str | None = None) -> list[dict[str, Any]]:
-        stmt = select(PendingConfirmation).where(PendingConfirmation.status == "pending")
+        stmt = (
+            select(PendingConfirmation, Conversation.channel)
+            .join(Conversation, Conversation.id == PendingConfirmation.conversation_id)
+            .where(PendingConfirmation.status == "pending")
+        )
         if channel is not None:
-            stmt = stmt.join(
-                Conversation, Conversation.id == PendingConfirmation.conversation_id
-            ).where(Conversation.channel == channel)
+            stmt = stmt.where(Conversation.channel == channel)
         stmt = stmt.order_by(PendingConfirmation.created_at)
         async with self._db.session() as s:
-            rows = (await s.execute(stmt)).scalars().all()
+            rows = (await s.execute(stmt)).all()
         return [
             {
                 "id": r.id,
@@ -192,8 +194,10 @@ class Runtime:
                 "args": r.args,
                 "created_at": r.created_at,
                 "expires_at": r.expires_at,
+                "channel": conv_channel,
+                "user_id": r.user_id,
             }
-            for r in rows
+            for r, conv_channel in rows
         ]
 
     def bind_notify(self, fn: Callable[[str], Awaitable[None]]) -> None:
