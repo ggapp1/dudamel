@@ -127,6 +127,13 @@ machine it runs on. Two ways to reach it from elsewhere:
   the dashboard at its Tailscale address; `dudamel doctor` detects a
   running Tailscale client and prints the address to use. No inbound port
   needs to be opened, and traffic never leaves your own mesh network.
+  `dudamel doctor` prints that address as `http://…`, and reaching the
+  dashboard over plain HTTP at a non-loopback address is exactly the case
+  `cookie_secure`'s auto-derivation (see below) marks `Secure` — a browser
+  will not store a `Secure` cookie on a plain-HTTP, non-localhost origin,
+  which shows up as the login page redirecting back to itself instead of
+  an error. If you're reaching the dashboard this way, set `[web]
+  cookie_secure = false` in `dudamel.toml`.
 - **Telegram** — works from anywhere with zero network configuration,
   because dudamel's Telegram interface polls Telegram's API outward rather
   than listening for inbound connections. Set `DUDAMEL_TELEGRAM_TOKEN` and
@@ -157,7 +164,11 @@ on the same host, a few settings need attention:
   over that derivation, in either direction. When `Secure` is on, the
   cookie is also renamed to `__Host-dudamel_session` — a browser-enforced
   prefix that refuses the cookie unless it's `Secure`, scoped to `Path=/`,
-  and carries no `Domain` attribute.
+  and carries no `Domain` attribute. The derivation looks at `[web] host`,
+  not at what the browser sees: a proxy that terminates TLS and forwards
+  to a loopback bind leaves `[web] host` at `127.0.0.1`, so the
+  auto-derivation resolves to `False` even though the deployment is
+  HTTPS end-to-end. In that setup, set `cookie_secure = true` explicitly.
 - **`trusted_proxies`** — only ever list a proxy's address here if you
   actually run it: anything in this list is a peer dudamel will believe
   can claim any client address via `X-Forwarded-For`. Leaving it empty
@@ -193,6 +204,17 @@ both with the project's own path already filled in:
 
 Both templates restart `dudamel run` automatically if it exits — see the
 comments at the top of each file for the exact install steps.
+
+`auto_migrate` (a top-level key in `dudamel.toml`, default `true`) controls
+whether `dudamel run` upgrades the database schema in place on every
+startup. That's convenient for local development, but a service that
+restarts on its own — a crash, a `systemctl --user restart`, a machine
+reboot — should not be able to mutate the schema just by starting up. Set
+`auto_migrate = false` for a production deployment. With it off, a
+startup against a schema that's behind its migration scripts refuses to
+start instead of upgrading, and tells you to run `dudamel db migrate -m
+<message>` — which both autogenerates the pending migration and applies
+it (core and app schemas), not apply-only.
 
 ## Security
 
