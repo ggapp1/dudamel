@@ -50,7 +50,8 @@ from fastapi.templating import Jinja2Templates
 
 from dudamel.config import Settings
 from dudamel.runtime import Runtime
-from dudamel.web.auth import SESSION_COOKIE, SessionStore
+from dudamel.web.api import is_loopback_host
+from dudamel.web.auth import SessionStore, session_cookie_name
 
 __all__ = ["add_ui"]
 
@@ -78,9 +79,19 @@ def add_ui(app: FastAPI, runtime: Runtime, settings: Settings) -> None:
         )
     app.mount("/static", StaticFiles(directory=str(_WEB_DIR / "static")), name="static")
 
+    # Same derivation as create_api(): whichever name /login issued is the
+    # name these pages must read, or a secure deployment's dashboard would
+    # loop back to /login forever despite a valid session cookie.
+    cookie_secure = (
+        settings.web.cookie_secure
+        if settings.web.cookie_secure is not None
+        else not is_loopback_host(settings.web.host)
+    )
+    cookie_name = session_cookie_name(cookie_secure)
+
     def _session(request: Request) -> str | None:
         """The CSRF token for a valid session cookie on `request`, else None."""
-        session_id = request.cookies.get(SESSION_COOKIE)
+        session_id = request.cookies.get(cookie_name)
         if session_id is None:
             return None
         return sessions.csrf_for(session_id)

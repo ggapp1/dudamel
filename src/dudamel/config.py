@@ -46,6 +46,12 @@ class WebConfig(BaseModel):
     # peer. Only list a proxy you actually run: anything here can name any
     # client it likes.
     trusted_proxies: list[str] = []
+    # None means auto: secure whenever the bind host is not loopback. An
+    # explicit value always wins. A static False would make the insecure
+    # setting the silent default in exactly the deployment that needs it,
+    # and browsers treat http://localhost as a secure context, so deriving
+    # this from the host is safe for local development.
+    cookie_secure: bool | None = None
 
 
 class TelegramConfig(BaseModel):

@@ -26,12 +26,23 @@ from dudamel.config import Settings
 from dudamel.web.throttle import FailedAuthThrottle
 
 SESSION_COOKIE = "dudamel_session"
+SECURE_SESSION_COOKIE = "__Host-dudamel_session"
 CSRF_HEADER = "x-csrf-token"
 
-_SESSION_TTL = timedelta(hours=24)
+# Exported (not `_SESSION_TTL`) so the cookie's Max-Age can be derived from
+# the exact same value that expires the server-side session -- two constants
+# for one lifetime is how they drift.
+SESSION_TTL = timedelta(hours=24)
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 AuthVia = Literal["bearer", "session"]
+
+
+def session_cookie_name(secure: bool) -> str:
+    """The `__Host-` prefix is browser-enforced: it requires Secure, Path=/,
+    and no Domain. All three hold when secure is on, and the prefix buys
+    protection against a subdomain overwriting the session cookie."""
+    return SECURE_SESSION_COOKIE if secure else SESSION_COOKIE
 
 
 def _now() -> datetime:
@@ -70,7 +81,7 @@ class SessionStore:
         session = self._sessions.get(session_id)
         if session is None:
             return None
-        if _now() - session.created_at > _SESSION_TTL:
+        if _now() - session.created_at > SESSION_TTL:
             del self._sessions[session_id]
             return None
         return session.csrf_token
@@ -87,11 +98,17 @@ class Authenticator:
         sessions: SessionStore,
         throttle: FailedAuthThrottle,
         client_key: Callable[[Request], str],
+        cookie_secure: bool,
     ) -> None:
         self._settings = settings
         self._sessions = sessions
         self._throttle = throttle
         self._client_key = client_key
+        # The name the cookie was actually issued under: `create_api` resolves
+        # `cookie_secure` once from config/host and uses it both to name the
+        # cookie at /login and here, so a secure deployment's session cookie
+        # is always readable by the same request that issued it.
+        self._cookie_name = session_cookie_name(cookie_secure)
 
     async def __call__(self, request: Request) -> AuthVia:
         token = resolve_token(self._settings)
@@ -116,7 +133,7 @@ class Authenticator:
             self._throttle.record_failure(self._client_key(request))
             raise HTTPException(status_code=401, detail="invalid bearer token")
 
-        session_id = request.cookies.get(SESSION_COOKIE)
+        session_id = request.cookies.get(self._cookie_name)
         if session_id is not None:
             csrf_token = self._sessions.csrf_for(session_id)
             if csrf_token is not None:

@@ -144,6 +144,37 @@ trusted_proxies` in `dudamel.toml`, or dudamel ignores `X-Forwarded-For`
 entirely and every request looks like it came from the proxy itself
 instead of the real client.
 
+### HTTPS behind a reverse proxy
+
+If the proxy terminates TLS and forwards to the dashboard over plain HTTP
+on the same host, a few settings need attention:
+
+- **`cookie_secure`** — `[web] cookie_secure` in `dudamel.toml` is `None`
+  (auto) by default: the session cookie gets the `Secure` flag whenever the
+  configured `[web] host` isn't a loopback address, and stays plain on
+  `127.0.0.1` / `localhost` / `::1` since those are secure contexts to a
+  browser even over HTTP. Setting `cookie_secure` explicitly always wins
+  over that derivation, in either direction. When `Secure` is on, the
+  cookie is also renamed to `__Host-dudamel_session` — a browser-enforced
+  prefix that refuses the cookie unless it's `Secure`, scoped to `Path=/`,
+  and carries no `Domain` attribute.
+- **`trusted_proxies`** — only ever list a proxy's address here if you
+  actually run it: anything in this list is a peer dudamel will believe
+  can claim any client address via `X-Forwarded-For`. Leaving it empty
+  (the default) means forwarded headers are ignored and requests are
+  attributed to whichever address actually opened the connection — the
+  proxy itself, not its clients.
+- **HSTS** — dudamel does not set `Strict-Transport-Security` itself; that
+  header belongs to whatever terminates TLS. Set it on the proxy.
+- **`allowed_hosts`** — `[web] allowed_hosts` defaults to `["localhost",
+  "127.0.0.1"]`. Every request's `Host` header is checked against this
+  list; a request whose `Host` isn't on it gets a `400` before it reaches
+  any route, `/health` included. A proxy forwarding its own external
+  hostname will 400 every single request until that hostname is added to
+  `allowed_hosts`. Do not set it to `["*"]` to make the 400s go away —
+  that disables the host check entirely and reopens the DNS-rebinding
+  attack it exists to close; add the specific hostname(s) instead.
+
 ### Running as a service
 
 A personal assistant is only useful if it's actually running. `dudamel new`
