@@ -50,11 +50,22 @@ of touching the stack itself, because the transport and `ClientSession` open
 anyio cancel scopes that may only be exited by the task that entered them. A
 reconnect always discards the whole transport + session pair and builds a
 fresh one: once a session has seen its connection die, every later operation
-on it fails too, so reusing it can never work. Reconnects are bounded at
-`MAX_RECONNECT_ATTEMPTS` with exponential backoff and serialized per server,
-so a burst of failing calls produces exactly one rebuild; a server that
-exhausts its attempts -- or that never mounted successfully in the first
-place -- stays down for the rest of the process lifetime.
+on it fails too, so reusing it can never work. Reconnects are serialized per
+server, so a burst of failing calls produces exactly one rebuild.
+
+`MAX_RECONNECT_ATTEMPTS` with exponential backoff bounds one such burst, not
+the process. If the whole burst fails, the server's tools fail fast for
+`RECONNECT_COOLDOWN_SECONDS` and then one more burst is allowed. That is
+deliberate: what a reconnect usually waits for is somebody else's
+deployment, and an HTTP server being restarted, rolled, or cut over is
+routinely gone for far longer than three backed-off attempts span --
+disabling its tools permanently because it took a minute to come back would
+defeat the feature in the case it exists for. The cooldown is what keeps
+this bounded: a server that is gone for good costs a few attempts per
+cooldown, not attempts on every tool call. A server that never mounted
+successfully in the first place is different, and does stay skipped for the
+rest of the process lifetime -- it contributed no tools, so there is nothing
+to reconnect for.
 
 What a reconnect deliberately does NOT do is re-run the call that failed,
 unless re-running it is provably harmless. A read-only tool is retried and
@@ -106,12 +117,22 @@ CALL_TIMEOUT = 30.0  # per-tool-call timeout (Tool.timeout), enforced by Router
 MOUNT_TIMEOUT = 15.0  # connect + list_tools budget per server, at mount time
 CLOSE_TIMEOUT = 10.0  # how long to wait for a server's supervisor task to exit
 
-# How many times a dead server is rebuilt before it is retired for the rest
-# of the process lifetime, and the base delay between those attempts (which
-# doubles each time: 0s, 0.5s, 1.0s). Bounded on purpose -- a server that is
-# gone for good must not turn every tool call into a multi-second stall.
+# How many times a dead server is rebuilt in one burst, and the base delay
+# between those attempts (which doubles each time: 0s, 0.5s, 1.0s). Bounded
+# on purpose -- a server that is gone must not turn every tool call into a
+# multi-second stall. When a burst fails outright the server's tools fail
+# fast for RECONNECT_COOLDOWN_SECONDS, and the next call after that gets a
+# fresh burst: an HTTP server being restarted or rolled is routinely gone
+# for much longer than one burst spans, so the budget bounds a burst rather
+# than the process lifetime.
 MAX_RECONNECT_ATTEMPTS = 3
 RECONNECT_BACKOFF_SECONDS = 0.5
+RECONNECT_COOLDOWN_SECONDS = 60.0
+
+# How many times in a row a server's supervisor may be cancelled by its own
+# transport, with no working connection in between, before that server is
+# abandoned. Guards against a cancel source stuck in a loop.
+MAX_SCOPE_RECOVERIES = 3
 
 # An MCP server's input_schema and description are embedded verbatim in every
 # LLM request, so both are a token-budget cost AND a prompt-injection channel
@@ -562,8 +583,19 @@ class _MountedServer:
         # one that failed at startup contributed no tools and must stay
         # skipped for the process lifetime rather than being retried forever.
         self._mounted = False
-        # Set when the attempt budget is spent, or when close() is called.
-        self._retired = False
+        # Permanent, and set only by close(): the server is being shut down,
+        # so the supervisor must stop and nothing may reconnect it. Kept
+        # strictly apart from the reconnect budget below, which is temporary.
+        self._closed = False
+        # Deadline before which no further reconnect burst may start. A spent
+        # budget is a cooldown, not a retirement -- see `reconnect`.
+        self._cooldown_until = 0.0
+        # Consecutive supervisor stand-downs with no successful connection in
+        # between; the bound on `MAX_SCOPE_RECOVERIES`.
+        self._standdowns = 0
+        # Set when those stand-downs are exhausted: the supervisor is not
+        # respawned again, because something is cancelling it in a loop.
+        self._supervisor_failed = False
 
     # -- what callers read ----------------------------------------------------
 
@@ -592,11 +624,26 @@ class _MountedServer:
         Returns the failure instead of raising it: this is called from tool
         calls and from shutdown, and neither may be handed a `BaseException`
         it did not ask for.
+
+        Respawns the supervisor if a previous one stood down after absorbing
+        a cancellation. A stood-down supervisor has already released its
+        stack, so there is nothing to inherit and a fresh one starts clean.
         """
+        if self._closed or self._supervisor_failed:
+            return RuntimeError("mcp: server supervisor is not running")
         supervisor = self._supervisor
         if supervisor is None:
             return RuntimeError("mcp: server supervisor is not running")
+        if supervisor.done():
+            supervisor = self._spawn_supervisor()
         return await self._submit_to(supervisor, op)
+
+    def _spawn_supervisor(self) -> asyncio.Task[None]:
+        supervisor = asyncio.create_task(
+            self._supervise(), name=f"mcp-supervisor:{self.config.label}"
+        )
+        self._supervisor = supervisor
+        return supervisor
 
     async def _submit_to(self, supervisor: asyncio.Task[None], op: str) -> BaseException | None:
         if supervisor.done():
@@ -629,10 +676,25 @@ class _MountedServer:
         HTTP transport losing its connection is the ordinary case -- anyio
         cancels its host, which lands here as a `CancelledError` on whatever
         this task is awaiting, usually the idle `_requests.get()`. Letting
-        that kill the supervisor would leak the whole stack (nothing would
-        ever `aclose()` it) and permanently strand the server, since every
-        later `_submit` would find no supervisor to talk to. So it is caught
-        and recovered from instead.
+        that kill the supervisor outright would leak the whole stack (nothing
+        would ever `aclose()` it) and strand the server, since every later
+        `_submit` would find no supervisor to talk to.
+
+        So a cancellation is caught, the stack is unwound inline, and this
+        task then **stands down** -- it returns rather than re-arming, and
+        `_submit` starts a fresh supervisor when there is work again. It does
+        not re-arm in place because re-arming makes this task uncancellable:
+        `asyncio.run`'s shutdown cancels each remaining task exactly once and
+        then waits for it, so a supervisor that absorbs that one cancellation
+        and goes back to `_requests.get()` never finishes and loop teardown
+        hangs forever (measured). A hang is a worse failure than the leak
+        this whole path exists to prevent. Standing down keeps both
+        properties: the stack is always released, and the task always
+        completes.
+
+        Consecutive stand-downs with no successful connection in between are
+        bounded by `MAX_SCOPE_RECOVERIES`; past that the supervisor is not
+        respawned, so a cancel source stuck in a loop cannot spin.
         """
         pending: asyncio.Future[BaseException | None] | None = None
         try:
@@ -647,14 +709,21 @@ class _MountedServer:
                     self._resolve(fut, await self._rebuild())
                     pending = None
                 except asyncio.CancelledError as e:
-                    if self._retired:
-                        # close() gave up waiting and cancelled us, or the
-                        # attempt budget is spent. Either way, stop.
+                    if self._closed:
+                        # close() gave up waiting and cancelled us. Stop.
                         raise
                     if pending is not None:
                         self._resolve(pending, e)
                         pending = None
-                    await self._recover_from_scope_cancellation()
+                    self._standdowns += 1
+                    exhausted = self._standdowns > MAX_SCOPE_RECOVERIES
+                    # Release the stack either way -- that is the whole point
+                    # of catching this -- and only then decide whether this
+                    # server is worth serving again.
+                    await self._stand_down(final=exhausted)
+                    if exhausted:
+                        self._supervisor_failed = True
+                    return
         except (KeyboardInterrupt, SystemExit) as e:
             # Resolve before re-raising, or whoever is waiting on this
             # operation waits for a task that is never coming back.
@@ -670,10 +739,9 @@ class _MountedServer:
                 _, queued = self._requests.get_nowait()
                 self._resolve(queued, RuntimeError("mcp: server supervisor stopped"))
 
-    async def _recover_from_scope_cancellation(self) -> None:
+    async def _stand_down(self, *, final: bool) -> None:
         """Absorb a cancellation delivered by one of this server's own anyio
-        scopes, and get back to a clean, connection-less state that the next
-        tool call can reconnect from.
+        scopes and release everything it was holding, so this task can finish.
 
         `_teardown()` is awaited inline and NOT under `asyncio.shield`.
         Shield runs its argument in a *new* task, and exiting an anyio cancel
@@ -685,12 +753,21 @@ class _MountedServer:
         way out and re-raises the deferred background error, which
         `_teardown` logs.
         """
-        logger.warning(
-            "mcp: server %r cancelled its own connection scope -- its transport failed "
-            "in the background. Discarding the connection; the next tool call will "
-            "reconnect.",
-            self.config.label,
-        )
+        if final:
+            logger.warning(
+                "mcp: server %r has had its connection scope cancelled %d times in a row "
+                "without a working connection in between -- giving up on it; its tools "
+                "stay unavailable for the rest of this process. Core unaffected.",
+                self.config.label,
+                self._standdowns,
+            )
+        else:
+            logger.warning(
+                "mcp: server %r cancelled its own connection scope -- its transport failed "
+                "in the background. Discarding the connection; the next tool call will "
+                "reconnect.",
+                self.config.label,
+            )
         await self._teardown()
         # Defensive: anyio uncancels the host task as it unwinds, but if
         # there was no stack left to unwind nothing did that for us, and a
@@ -720,22 +797,25 @@ class _MountedServer:
             # cancelling its host. Neither says the supervisor should stop,
             # and `_cancellation_was_requested()` cannot tell them apart from
             # a real shutdown because anyio cancels scopes with
-            # `Task.cancel()` too. `_retired` is the authoritative signal for
+            # `Task.cancel()` too. `_closed` is the authoritative signal for
             # "stop", so only that re-raises; everything else is just a
             # failed connection attempt.
             #
             # This and `_supervise`'s `CancelledError` handler are two layers
-            # of one defense: a scope cancellation must not kill the
-            # supervisor, and which layer sees it depends on whether it lands
-            # while a connection is being built or while the task sits idle.
-            # They overlap on purpose -- removing either alone leaves the
-            # behavior intact, only removing both regresses it.
-            if isinstance(e, asyncio.CancelledError) and self._retired:
+            # of one defense: a scope cancellation must not leak the stack,
+            # and which layer sees it depends on whether it lands while a
+            # connection is being built or while the task sits idle. They
+            # overlap on purpose -- removing either alone leaves the behavior
+            # intact, only removing both regresses it.
+            if isinstance(e, asyncio.CancelledError) and self._closed:
                 raise
             await self._teardown()
             return e
         self.alive = True
         self.generation += 1
+        # A working connection clears both stand-down budgets: they exist to
+        # stop pathological loops, not to accumulate over a long uptime.
+        self._standdowns = 0
         return None
 
     async def _teardown(self) -> None:
@@ -833,9 +913,7 @@ class _MountedServer:
         Raises on failure so `MCPMount.mount()`'s per-server handler can log
         and skip the server, exactly as it did when connecting inline.
         """
-        self._supervisor = asyncio.create_task(
-            self._supervise(), name=f"mcp-supervisor:{self.config.label}"
-        )
+        self._spawn_supervisor()
         error = await self._submit("connect")
         if error is not None:
             if isinstance(error, Exception):
@@ -856,24 +934,42 @@ class _MountedServer:
         makes a batch of simultaneously-failing calls produce exactly one
         reconnect instead of one per call.
 
+        `MAX_RECONNECT_ATTEMPTS` bounds one *burst*, not the process. A burst
+        that fails outright starts a `RECONNECT_COOLDOWN_SECONDS` cooldown
+        during which calls fail fast; after it, the next call is allowed a
+        fresh burst. The bound has to work this way because the thing being
+        waited for is usually somebody else's deployment: an HTTP server
+        being restarted, rolled, or cut over is routinely gone for far longer
+        than three backed-off attempts span, and permanently disabling its
+        tools because it took a minute to come back would make the whole
+        reconnect path useless in exactly the case it was built for. The
+        cooldown is what keeps that from becoming an unbounded retry loop --
+        a permanently dead server costs a handful of attempts per cooldown,
+        not one per tool call.
+
         Never raises, and never enters or exits a context itself: it only
         signals the supervisor task that owns them.
         """
-        if not self._mounted or self._retired:
-            # Either it never worked at all, or its attempt budget is spent.
-            # Both stay down for the rest of the process lifetime.
+        if not self._mounted or self._closed or self._supervisor_failed:
+            # Never worked at all, being shut down, or its supervisor gave
+            # up. All three stay down for the rest of the process lifetime.
             return False
         async with self._lock:
-            if self._retired:
+            if self._closed or self._supervisor_failed:
                 return False
             if self.generation != seen_generation and self.alive:
                 return True
+            now = asyncio.get_running_loop().time()
+            if now < self._cooldown_until:
+                # A burst already failed recently. Fail fast rather than
+                # making every tool call pay for three more attempts.
+                return False
             self.reconnect_count += 1
             delay = 0.0
             for attempt in range(MAX_RECONNECT_ATTEMPTS):
                 if delay:
                     await asyncio.sleep(delay)
-                if self._retired:  # close() landed while we were backing off
+                if self._closed:  # close() landed while we were backing off
                     return False
                 self.reconnect_attempts += 1
                 error = await self._submit("connect")
@@ -883,6 +979,7 @@ class _MountedServer:
                         self.config.label,
                         attempt + 1,
                     )
+                    self._cooldown_until = 0.0
                     self._apply_reconnect_drift()
                     return True
                 logger.warning(
@@ -894,12 +991,13 @@ class _MountedServer:
                     error,
                 )
                 delay = RECONNECT_BACKOFF_SECONDS * (2**attempt)
-            self._retired = True
+            self._cooldown_until = asyncio.get_running_loop().time() + RECONNECT_COOLDOWN_SECONDS
             logger.warning(
-                "mcp: server %r could not be reconnected in %d attempts -- its tools stay "
-                "unavailable for the rest of this process; core unaffected",
+                "mcp: server %r could not be reconnected in %d attempts -- its tools fail "
+                "fast for the next %.0fs, then one more burst will be tried; core unaffected",
                 self.config.label,
                 MAX_RECONNECT_ATTEMPTS,
+                RECONNECT_COOLDOWN_SECONDS,
             )
             return False
 
@@ -965,9 +1063,12 @@ class _MountedServer:
         started. Never raises: shutdown must not be able to fail because a
         server is misbehaving.
         """
-        self._retired = True
+        self._closed = True
         supervisor, self._supervisor = self._supervisor, None
-        if supervisor is None:
+        if supervisor is None or supervisor.done():
+            # Either it never started, or it already stood down after a
+            # cancellation -- in which case it released its stack on the way
+            # out and there is nothing left to stop.
             return
         error = await self._submit_to(supervisor, "stop")
         if error is not None:

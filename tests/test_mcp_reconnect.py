@@ -34,11 +34,18 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import mcp.types as types
 import pytest
+from mcp.shared.exceptions import MCPError
 
 from dudamel import mcp_mount
 from dudamel.contract.types import Tool
-from dudamel.mcp_mount import MCPMount, MCPServerConfig, _MountedServer
+from dudamel.mcp_mount import (
+    MCPMount,
+    MCPServerConfig,
+    _is_connection_death,
+    _MountedServer,
+)
 
 FIXTURE = Path(__file__).parent / "fixtures" / "mcp_flaky_server.py"
 
@@ -627,26 +634,39 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _start_http_fixture(port: int, state: Path, *, slow_seconds: float) -> subprocess.Popen[bytes]:
+def _start_http_fixture(
+    port: int, state: Path, *, slow_seconds: float, log: Path
+) -> subprocess.Popen[bytes]:
+    """Start the fixture in HTTP mode, keeping its output.
+
+    The output goes to a file rather than to `DEVNULL` so that a failure to
+    bind or import shows up as a diagnostic instead of only as a timeout
+    waiting for a port that is never going to open.
+    """
     env = dict(
         os.environ,
         MCP_FLAKY_HTTP_PORT=str(port),
         MCP_FLAKY_STATE=str(state),
         MCP_FLAKY_SLOW_SECONDS=str(slow_seconds),
     )
-    return subprocess.Popen(
-        [sys.executable, str(FIXTURE), "httpflaky"],
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    handle = log.open("ab")
+    try:
+        return subprocess.Popen(
+            [sys.executable, str(FIXTURE), "httpflaky"],
+            env=env,
+            stdout=handle,
+            stderr=handle,
+        )
+    finally:
+        handle.close()
 
 
-async def _wait_for_port(port: int, *, listening: bool, timeout: float = 20.0) -> None:
+async def _wait_for_port(port: int, *, listening: bool, log: Path, timeout: float = 20.0) -> None:
     """Block until the port is (or is no longer) accepting connections.
 
     Polled rather than slept: an ASGI server's startup time is not something
-    a test can assume, and guessing would make these race.
+    a test can assume, and guessing would make these race. On timeout the
+    server's own output is included, which is usually the actual answer.
     """
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
@@ -657,7 +677,10 @@ async def _wait_for_port(port: int, *, listening: bool, timeout: float = 20.0) -
         if open_now == listening:
             return
         await asyncio.sleep(0.05)
-    raise AssertionError(f"timed out waiting for port {port} listening={listening}")
+    output = log.read_text(errors="replace") if log.exists() else "<no output captured>"
+    raise AssertionError(
+        f"timed out waiting for port {port} listening={listening}; server output:\n{output}"
+    )
 
 
 @pytest.mark.slow
@@ -671,19 +694,20 @@ async def test_http_server_restart_reconnects_transparently(tmp_path: Path) -> N
     """
     port = _free_port()
     state = tmp_path / "state"
-    server_proc = _start_http_fixture(port, state, slow_seconds=0.05)
+    log = tmp_path / "server.log"
+    server_proc = _start_http_fixture(port, state, slow_seconds=0.05, log=log)
     mount = MCPMount([MCPServerConfig(url=f"http://127.0.0.1:{port}/mcp")])
     try:
-        await _wait_for_port(port, listening=True)
+        await _wait_for_port(port, listening=True, log=log)
         tools = await mount.mount()
         echo = _tool(tools, "echo")
         assert await echo.fn(text="before") == "before"
 
         server_proc.kill()
         server_proc.wait()
-        await _wait_for_port(port, listening=False)
-        server_proc = _start_http_fixture(port, state, slow_seconds=0.05)
-        await _wait_for_port(port, listening=True)
+        await _wait_for_port(port, listening=False, log=log)
+        server_proc = _start_http_fixture(port, state, slow_seconds=0.05, log=log)
+        await _wait_for_port(port, listening=True, log=log)
 
         # No error surfaces: the stale session is recognized, rebuilt, and
         # the read-only call retried against the new one.
@@ -696,20 +720,28 @@ async def test_http_server_restart_reconnects_transparently(tmp_path: Path) -> N
 
 
 @pytest.mark.slow
-async def test_http_background_failure_does_not_strand_the_supervisor(tmp_path: Path) -> None:
+async def test_http_background_failure_does_not_strand_the_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A transport that fails in the background cancels the task that hosts
-    its scopes -- the supervisor. That must not kill it.
+    its cancel scopes -- the supervisor.
 
-    If it did, nothing would ever release the connection's stack and every
-    later request would find no supervisor to talk to, so the server would be
-    unreachable for the rest of the process with no way back.
+    Left unhandled, that killed the supervisor with the connection's stack
+    still open: nothing ever released it, and every later request found no
+    supervisor to talk to, so the server was unreachable for the rest of the
+    process with no way back. What is asserted here is that outcome, not the
+    mechanism: whether the supervisor rides the cancellation out or stands
+    down and is replaced, the server has to come back.
     """
     port = _free_port()
     state = tmp_path / "state"
-    server_proc = _start_http_fixture(port, state, slow_seconds=30.0)
+    log = tmp_path / "server.log"
+    monkeypatch.setattr(mcp_mount, "RECONNECT_COOLDOWN_SECONDS", 0.2)
+    server_proc = _start_http_fixture(port, state, slow_seconds=30.0, log=log)
     mount = MCPMount([MCPServerConfig(url=f"http://127.0.0.1:{port}/mcp")])
+    call: asyncio.Future[str] | None = None
     try:
-        await _wait_for_port(port, listening=True)
+        await _wait_for_port(port, listening=True, log=log)
         tools = await mount.mount()
         server = mount._servers[0]
         call = asyncio.ensure_future(_tool(tools, "slow_mutate").fn(value="inflight"))
@@ -717,17 +749,202 @@ async def test_http_background_failure_does_not_strand_the_supervisor(tmp_path: 
 
         server_proc.kill()
         server_proc.wait()
-        await _wait_for_port(port, listening=False)
+        await _wait_for_port(port, listening=False, log=log)
 
         # Mutating, and the request was in flight, so the outcome is unknown.
         with pytest.raises(RuntimeError, match="UNKNOWN"):
             await call
-        # The point of the test: the supervisor absorbed its own scope's
-        # cancellation instead of dying with it.
-        assert server._supervisor is not None
-        assert server._supervisor.done() is False
         assert server.session is None
+
+        # The server comes back, as a restarted one eventually does. Nothing
+        # is stranded: the connection rebuilds and the tools work again.
+        server_proc = _start_http_fixture(port, state, slow_seconds=0.05, log=log)
+        await _wait_for_port(port, listening=True, log=log)
+        await asyncio.sleep(0.25)  # let the failed burst's cooldown lapse
+        assert await _tool(tools, "echo").fn(text="recovered") == "recovered"
+        assert server.alive is True
     finally:
+        # A pending call whose exception is never retrieved would otherwise
+        # surface as an unraisable-exception warning if an assertion above
+        # failed before it was awaited.
+        if call is not None and not call.done():
+            call.cancel()
         await mount.close()
         server_proc.kill()
         server_proc.wait()
+
+
+# -- the classifier, on its own ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("error", "is_death"),
+    [
+        (MCPError(code=types.CONNECTION_CLOSED, message="Connection closed"), True),
+        (MCPError(code=types.CONNECTION_CLOSED, message="SSE stream ended"), True),
+        # A restarted HTTP server rejecting the session id it no longer knows.
+        (MCPError(code=types.INVALID_REQUEST, message="Session terminated"), True),
+        (MCPError(code=types.INVALID_REQUEST, message="Session not found"), True),
+        (MCPError(code=types.INVALID_REQUEST, message="session expired"), True),
+        (asyncio.CancelledError("via cancel scope"), True),
+        (BaseExceptionGroup("g", [MCPError(code=types.CONNECTION_CLOSED, message="x")]), True),
+        # A slow tool is not a dead transport.
+        (MCPError(code=types.REQUEST_TIMEOUT, message="Request timed out"), False),
+        # Ordinary protocol errors must not trigger connection churn...
+        (MCPError(code=types.INVALID_REQUEST, message="Missing required field"), False),
+        (MCPError(code=types.INVALID_PARAMS, message="bad params"), False),
+        # ...including one that merely mentions a session.
+        (MCPError(code=types.INVALID_REQUEST, message="session not found in workspace"), False),
+        (RuntimeError("tool blew up"), False),
+        (BaseExceptionGroup("g", [RuntimeError("unrelated")]), False),
+    ],
+)
+def test_connection_death_classification(error: BaseException, is_death: bool) -> None:
+    """The classifier gates the whole retry decision, so it is pinned here
+    directly rather than only through tests that need a live server."""
+    assert _is_connection_death(error) is is_death
+
+
+# -- supervisor stand-down -----------------------------------------------------
+
+
+async def _wait_done(task: asyncio.Task[Any], *, timeout: float = 5.0) -> None:
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if task.done():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("supervisor did not finish after being cancelled")
+
+
+async def test_cancelling_the_supervisor_lets_it_finish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancelled supervisor must release its stack AND complete.
+
+    Absorbing the cancellation and going back to waiting would make the task
+    effectively uncancellable, which is what hangs an event loop's shutdown.
+    """
+    mount = MCPMount([flaky_cmd(tmp_path, monkeypatch, name="standdown")])
+    try:
+        await mount.mount()
+        server = mount._servers[0]
+        supervisor = server._supervisor
+        assert supervisor is not None
+        supervisor.cancel()
+        await _wait_done(supervisor)
+        assert server.session is None
+        assert server._stack is None
+        # ...and the server is not stranded: the next call gets a new one.
+        assert await server.reconnect(server.generation) is True
+        assert server.alive is True
+    finally:
+        await mount.close()
+
+
+async def test_repeated_supervisor_cancellation_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stand-downs without a working connection in between are not
+    unlimited: something cancelling the supervisor in a loop must not make
+    every tool call respawn one forever."""
+    mount = MCPMount([flaky_cmd(tmp_path, monkeypatch, name="standdown-bound")])
+    try:
+        await mount.mount()
+        server = mount._servers[0]
+
+        async def never_connects(stack: Any) -> None:
+            raise RuntimeError("cannot connect")
+
+        # No successful connection can intervene, so the stand-downs count.
+        monkeypatch.setattr(server, "_connect", never_connects)
+        for _ in range(mcp_mount.MAX_SCOPE_RECOVERIES + 1):
+            supervisor = server._supervisor
+            assert supervisor is not None
+            supervisor.cancel()
+            await _wait_done(supervisor)
+            await server._submit("connect")  # respawns, and fails to connect
+        assert server._supervisor_failed is True
+        assert await server.reconnect(server.generation) is False
+        assert isinstance(await server._submit("connect"), BaseException)
+    finally:
+        await mount.close()
+
+
+@pytest.mark.slow
+def test_an_unclosed_mount_does_not_hang_loop_shutdown(tmp_path: Path) -> None:
+    """`asyncio.run` cancels each surviving task exactly once and then waits
+    for it. A supervisor that absorbed that cancellation and went back to
+    waiting would never finish, so the interpreter would hang on exit
+    instead of reporting whatever the real problem was.
+
+    Run as a subprocess because that shutdown sequence is the thing under
+    test, and it cannot be exercised from inside a running event loop.
+    """
+    script = tmp_path / "unclosed.py"
+    script.write_text(
+        "import asyncio, sys\n"
+        f"sys.path.insert(0, {str(Path(__file__).parent.parent / 'src')!r})\n"
+        "from dudamel.mcp_mount import MCPMount\n"
+        "async def main():\n"
+        f"    mount = MCPMount([{shlex.join([sys.executable, str(FIXTURE)])!r}])\n"
+        "    assert await mount.mount()\n"
+        "    # deliberately never closed\n"
+        "asyncio.run(main())\n"
+        "print('EXITED CLEANLY')\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        timeout=60,  # a hang shows up as TimeoutExpired, which fails the test
+    )
+    assert "EXITED CLEANLY" in proc.stdout, f"stdout={proc.stdout!r} stderr={proc.stderr[-2000:]!r}"
+    assert proc.returncode == 0, f"stderr={proc.stderr[-2000:]!r}"
+
+
+# -- the reconnect budget bounds a burst, not the process ----------------------
+
+
+async def test_reconnect_budget_rearms_after_the_cooldown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A server that is still down when its burst runs out is not written
+    off. Real restarts routinely take longer than one burst, so after the
+    cooldown the next call gets a fresh burst -- and succeeds if the server
+    came back in the meantime."""
+    name = "rearm"
+    script = tmp_path / "rearm_fixture.py"
+    original = FIXTURE.read_text()
+    script.write_text(original)
+    monkeypatch.setattr(mcp_mount, "MOUNT_TIMEOUT", 5.0)
+    monkeypatch.setattr(mcp_mount, "RECONNECT_COOLDOWN_SECONDS", 0.2)
+    mount = MCPMount([flaky_cmd(tmp_path, monkeypatch, name=name, script=script)])
+    try:
+        tools = await mount.mount()
+        echo = _tool(tools, "echo")
+        server = mount._servers[0]
+
+        # Server is unrestartable, so the first burst fails outright.
+        script.write_text("import sys\n\nsys.exit(1)\n")
+        await _kill_and_wait(await _wait_for_pid(f"rearm_fixture.py {name}"))
+        with pytest.raises(RuntimeError):
+            await echo.fn(text="down")
+        assert server.reconnect_attempts == mcp_mount.MAX_RECONNECT_ATTEMPTS
+        assert server.alive is False
+
+        # Inside the cooldown: fails fast, no new attempts at all.
+        with pytest.raises(RuntimeError):
+            await echo.fn(text="still down")
+        assert server.reconnect_attempts == mcp_mount.MAX_RECONNECT_ATTEMPTS
+
+        # The server comes back, the cooldown expires, and so does the
+        # write-off: the next call reconnects instead of failing forever.
+        script.write_text(original)
+        await asyncio.sleep(0.25)
+        assert await echo.fn(text="back") == "back"
+        assert server.alive is True
+        assert server.reconnect_attempts == mcp_mount.MAX_RECONNECT_ATTEMPTS + 1
+    finally:
+        await mount.close()
