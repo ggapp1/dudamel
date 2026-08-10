@@ -235,6 +235,28 @@ async def test_failed_bearer_auth_feeds_the_same_counter(tmp_path: Path, token_e
     await rt.stop()
 
 
+async def test_successful_bearer_auth_clears_accumulated_failures(
+    tmp_path: Path, token_env: str
+) -> None:
+    """A legitimate API client that occasionally sends a stale token must not
+    accumulate toward the throttle forever -- its own successes clear the
+    counter, same as a successful /login does."""
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        for _ in range(MAX_FAILURES - 1):
+            await c.get("/api/pending", headers={"Authorization": "Bearer wrong"})
+        good = await c.get("/api/pending", headers={"Authorization": f"Bearer {token_env}"})
+        assert good.status_code == 200
+
+        # Without the clear, the accumulated failures above plus these would
+        # trip the throttle partway through; with the clear, none of these
+        # should see anything but 401.
+        for _ in range(MAX_FAILURES - 1):
+            resp = await c.post("/login", json={"token": "wrong"})
+            assert resp.status_code == 401
+    await rt.stop()
+
+
 # --- host allowlist -----------------------------------------------------------
 
 

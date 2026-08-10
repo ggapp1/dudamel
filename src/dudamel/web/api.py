@@ -83,6 +83,10 @@ def _client_key(request: Request) -> str:
     disagree with it -- so this reads the address ASGI handed the app.
     """
     client = request.client
+    # `request.client` is Optional per the ASGI spec, but uvicorn's real HTTP
+    # protocol always populates it -- this fallback merges any such request
+    # into one shared bucket, which is intentionally unreachable in practice
+    # rather than a latent shared-throttle risk.
     return client.host if client is not None else "unknown"
 
 
