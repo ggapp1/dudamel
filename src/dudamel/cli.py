@@ -39,6 +39,7 @@ from sqlalchemy import create_engine, text
 from dudamel.config import Settings, TierConfig
 from dudamel.exceptions import DudamelError
 from dudamel.interfaces.telegram import resolve_token as resolve_telegram_token
+from dudamel.llm.probe import probe_tool_calling
 from dudamel.migrate import (
     current_heads,
     ensure_app_migrations,
@@ -49,6 +50,7 @@ from dudamel.migrate import (
     upgrade_core,
 )
 from dudamel.orchestrator import Orchestrator
+from dudamel.runtime import build_provider
 from dudamel.serve import serve
 from dudamel.web.auth import resolve_token as resolve_web_token
 
@@ -339,6 +341,19 @@ def _check_tier(cfg: TierConfig) -> tuple[bool, str]:
     return True, "fake provider (tests only)"
 
 
+def _probe_tier_tool_calling(name: str, cfg: TierConfig) -> tuple[bool, str]:
+    """Build a live Provider for tier `name` and run the tool-calling probe
+    against it. Never raises: a probe that could crash `doctor` would be
+    worse than no probe -- construction failures (missing base_url, unset
+    API key env var) and runtime failures (unreachable backend, malformed
+    reply) both degrade to a ✗ line."""
+    try:
+        provider = build_provider(name, cfg)
+        return asyncio.run(probe_tool_calling(provider, model=cfg.model))
+    except Exception as e:
+        return False, f"probe could not run ({type(e).__name__}: {e})"
+
+
 def _check_telegram(settings: Settings) -> tuple[bool, str]:
     token = resolve_telegram_token(settings)
     if not token:
@@ -410,6 +425,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         for name, cfg in settings.llm_tiers.items():
             ok, detail = _check_tier(cfg)
             lines.append(_line(ok, f"llm tier {name!r}", detail))
+        if args.probe_tools:
+            for name, cfg in settings.llm_tiers.items():
+                ok, detail = _probe_tier_tool_calling(name, cfg)
+                lines.append(_line(ok, f"tier {name!r}", detail))
     else:
         lines.append(_line(False, "llm tiers", "none configured in dudamel.toml"))
 
@@ -532,9 +551,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_migrate.set_defaults(handler=cmd_db_migrate)
 
-    sub.add_parser(
+    p_doctor = sub.add_parser(
         "doctor", help="diagnose this project's configuration", parents=[debug]
-    ).set_defaults(handler=cmd_doctor)
+    )
+    p_doctor.add_argument(
+        "--probe-tools",
+        action="store_true",
+        help="probe each llm tier for native tool calling (spends real tokens; off by default)",
+    )
+    p_doctor.set_defaults(handler=cmd_doctor)
 
     p_token = sub.add_parser("token", help="manage the web dashboard token")
     token_sub = p_token.add_subparsers(dest="token_command", required=True, metavar="command")
