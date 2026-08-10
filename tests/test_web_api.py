@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from pathlib import Path
 
 import httpx
 import pytest
+from sqlalchemy import select
 
 from dudamel import App, Orchestrator, Runtime
 from dudamel.config import Settings, TierConfig, WebConfig
 from dudamel.llm.testing import Completion, FakeProvider, fake_text, fake_tool_call
+from dudamel.models_core import PendingConfirmation
+from dudamel.router import _utcnow
 from dudamel.web.api import create_api
 from dudamel.web.auth import CSRF_HEADER
 from dudamel.web.throttle import MAX_FAILURES
@@ -172,6 +176,40 @@ async def test_pending_entries_report_channel_and_resolvability(
     # confirmation's -- so a confirmation raised by "someone-else" is not
     # resolvable by this caller.
     assert entry["resolvable"] is False
+    await rt.stop()
+
+
+async def test_expired_pending_entry_is_not_resolvable(tmp_path: Path, token_env: str) -> None:
+    """Requester identity matching isn't enough: resolve_confirmation also
+    flips an expired-but-still-"pending" row to "expired" and reports nothing
+    was done, even when the user_id matches -- so a stale entry must report
+    resolvable: false too, or the dashboard offers a button that silently
+    no-ops instead of applying the operator's decision."""
+    rt, transport = await build(tmp_path, [fake_tool_call("wipe", {"reason": "x"})])
+    headers = {"Authorization": f"Bearer {token_env}"}
+    async with client(transport) as c:
+        chat = await c.post("/api/chat", json={"text": "wipe it"}, headers=headers)
+        confirmation_id = chat.json()["pending_confirmation_id"]
+        assert confirmation_id
+
+        # This row's user_id is "web" -- the identity axis alone would call it
+        # resolvable -- but it has aged past its TTL, exactly like a real
+        # confirmation left unattended past confirm_ttl_seconds with no
+        # reaper to clear it.
+        async with rt._db.session() as s:
+            row = (
+                await s.execute(
+                    select(PendingConfirmation).where(PendingConfirmation.id == confirmation_id)
+                )
+            ).scalar_one()
+            row.expires_at = _utcnow() - timedelta(seconds=1)
+
+        resp = await c.get("/api/pending", headers=headers)
+    assert resp.status_code == 200
+    entries = resp.json()
+    assert entries
+    assert entries[0]["id"] == confirmation_id
+    assert entries[0]["resolvable"] is False
     await rt.stop()
 
 
