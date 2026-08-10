@@ -8,6 +8,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import secrets
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
@@ -71,6 +72,13 @@ def is_loopback_host(host: str) -> bool:
         # so treat it as exposed. Refusing to start without a token is the
         # safe direction to be wrong in.
         return False
+
+
+def _utcnow() -> datetime:
+    # Naive UTC, matching how `dudamel.router` stores and compares
+    # PendingConfirmation.expires_at -- a tz-aware value here would raise on
+    # comparison against that column instead of ever comparing false.
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 def _client_key(request: Request) -> str:
@@ -223,12 +231,21 @@ def create_api(runtime: Runtime, settings: Settings) -> FastAPI:
         channel's tool calls and arguments to any authenticated operator, so
         scoping this list would be inconsistent rather than safer.
 
-        `resolvable` mirrors that same check for this API surface, which
-        always resolves as user_id="web" (see api_confirm above): it marks
-        the entries this caller can actually act on, so the dashboard can
-        show the rest as read-only instead of offering a button that will
-        always be refused.
+        `resolvable` mirrors both grounds on which `resolve_confirmation`
+        would actually apply this API's decision, for this API surface,
+        which always resolves as user_id="web" (see api_confirm above):
+        requester identity (the confirmation's own user_id must be "web")
+        and TTL (its expires_at must not have passed -- past it,
+        resolve_confirmation flips the row to "expired" and reports nothing
+        was done instead of applying approve/decline, even for a matching
+        user_id). It marks the entries this caller can actually act on right
+        now, so the dashboard can show the rest as read-only instead of
+        offering a button that will always be refused or silently no-op.
+        The third ground resolve_confirmation checks, status != "pending",
+        never applies here: this list is already filtered to status ==
+        "pending".
         """
+        now = _utcnow()
         entries = await runtime.list_pending_confirmations(channel)
         return [
             {
@@ -238,7 +255,7 @@ def create_api(runtime: Runtime, settings: Settings) -> FastAPI:
                 "created_at": e["created_at"],
                 "expires_at": e["expires_at"],
                 "channel": e["channel"],
-                "resolvable": e["user_id"] == "web",
+                "resolvable": e["user_id"] == "web" and e["expires_at"] >= now,
             }
             for e in entries
         ]
