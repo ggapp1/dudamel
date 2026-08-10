@@ -11,6 +11,7 @@ from dudamel.config import Settings, TierConfig, WebConfig
 from dudamel.llm.testing import Completion, FakeProvider, fake_text, fake_tool_call
 from dudamel.web.api import create_api
 from dudamel.web.auth import CSRF_HEADER
+from dudamel.web.throttle import MAX_FAILURES
 
 TOKEN = "s3cr3t-token"  # noqa: S105 — test fixture, not a real credential
 
@@ -186,6 +187,51 @@ async def test_cookie_get_does_not_require_csrf(tmp_path: Path, token_env: str) 
         await c.post("/login", json={"token": token_env})
         resp = await c.get("/api/widgets")
     assert resp.status_code == 200
+    await rt.stop()
+
+
+# --- login throttling ---------------------------------------------------------
+
+
+async def test_correct_token_succeeds_even_while_throttled(tmp_path: Path, token_env: str) -> None:
+    """The ordering that matters: validate first, throttle only on failure.
+    Otherwise six bad requests every five minutes lock the operator out."""
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        for _ in range(MAX_FAILURES):
+            resp = await c.post("/login", json={"token": "wrong"})
+            assert resp.status_code == 401
+        throttled = await c.post("/login", json={"token": "wrong"})
+        assert throttled.status_code == 429
+
+        resp = await c.post("/login", json={"token": token_env})
+        assert resp.status_code == 200
+        assert "csrf_token" in resp.json()
+    await rt.stop()
+
+
+async def test_repeated_failures_return_429_with_retry_after(
+    tmp_path: Path, token_env: str
+) -> None:
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        for _ in range(MAX_FAILURES):
+            await c.post("/login", json={"token": "wrong"})
+        resp = await c.post("/login", json={"token": "wrong"})
+    assert resp.status_code == 429
+    assert int(resp.headers["Retry-After"]) > 0
+    await rt.stop()
+
+
+async def test_failed_bearer_auth_feeds_the_same_counter(tmp_path: Path, token_env: str) -> None:
+    """The same secret is accepted on every API route, so throttling only the
+    login endpoint would leave an attacker free to switch endpoints."""
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        for _ in range(MAX_FAILURES):
+            await c.get("/api/pending", headers={"Authorization": "Bearer wrong"})
+        resp = await c.post("/login", json={"token": "wrong"})
+    assert resp.status_code == 429
     await rt.stop()
 
 

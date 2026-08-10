@@ -10,7 +10,7 @@ import logging
 import secrets
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -24,6 +24,7 @@ from dudamel.web.auth import (
     SessionStore,
     resolve_token,
 )
+from dudamel.web.throttle import FailedAuthThrottle
 
 logger = logging.getLogger("dudamel.web.api")
 
@@ -71,6 +72,20 @@ def is_loopback_host(host: str) -> bool:
         return False
 
 
+def _client_key(request: Request) -> str:
+    """The address the failed-auth throttle keys on.
+
+    uvicorn's ``proxy_headers`` middleware (wired in ``dudamel.serve`` from
+    ``settings.web.trusted_proxies``) already rewrites `request.client.host`
+    to the forwarded address when the immediate peer is a trusted proxy, and
+    leaves it as the peer's own address otherwise. Re-parsing
+    `X-Forwarded-For` here would duplicate that trust decision -- and could
+    disagree with it -- so this reads the address ASGI handed the app.
+    """
+    client = request.client
+    return client.host if client is not None else "unknown"
+
+
 def create_api(runtime: Runtime, settings: Settings) -> FastAPI:
     """Build the FastAPI app. Raises RuntimeError at construction (never at
     request time) when the configured host is non-loopback and no web token
@@ -89,7 +104,8 @@ def create_api(runtime: Runtime, settings: Settings) -> FastAPI:
         logger.warning("dashboard login impossible until %s is set", settings.web.token_env)
 
     sessions = SessionStore()
-    authenticate = Authenticator(settings, sessions)
+    throttle = FailedAuthThrottle()
+    authenticate = Authenticator(settings, sessions, throttle, _client_key)
 
     app = FastAPI(title="dudamel", version=__version__)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.web.allowed_hosts)
@@ -113,20 +129,33 @@ def create_api(runtime: Runtime, settings: Settings) -> FastAPI:
         return {"status": "ok" if db_ok else "error", "version": __version__, "db": db_ok}
 
     @app.post("/login")
-    async def login(payload: LoginRequest, response: Response) -> dict[str, str]:
+    async def login(payload: LoginRequest, request: Request, response: Response) -> dict[str, str]:
+        key = _client_key(request)
         expected = resolve_token(settings)
-        if expected is None or not secrets.compare_digest(
+        # Validate BEFORE throttling, always. A correct token succeeds even
+        # while throttled and clears the counter -- otherwise anyone who can
+        # reach this endpoint could lock the operator out of their own
+        # dashboard with a handful of wrong guesses.
+        if expected is not None and secrets.compare_digest(
             payload.token.encode(), expected.encode()
         ):
-            raise HTTPException(status_code=401, detail="invalid token")
-        session_id, csrf_token = sessions.create()
-        response.set_cookie(
-            SESSION_COOKIE,
-            session_id,
-            httponly=True,
-            samesite="strict",
-        )
-        return {"csrf_token": csrf_token}
+            throttle.clear(key)
+            session_id, csrf_token = sessions.create()
+            response.set_cookie(
+                SESSION_COOKIE,
+                session_id,
+                httponly=True,
+                samesite="strict",
+            )
+            return {"csrf_token": csrf_token}
+        if throttle.is_throttled(key):
+            raise HTTPException(
+                status_code=429,
+                detail="too many failed attempts",
+                headers={"Retry-After": str(throttle.retry_after(key))},
+            )
+        throttle.record_failure(key)
+        raise HTTPException(status_code=401, detail="invalid token")
 
     @app.post("/api/chat")
     async def api_chat(
