@@ -342,6 +342,7 @@ async def test_mutating_tool_reports_unknown_outcome_rather_than_failure(
         await _kill_and_wait(await _wait_for_pid(f"mcp_flaky_server.py {name}"))
         with pytest.raises(RuntimeError) as excinfo:
             await mutate.fn(value="v")
+        assert isinstance(excinfo.value, UnknownToolOutcome)
         message = str(excinfo.value)
         assert "UNKNOWN" in message
         assert "Do not retry" in message
@@ -385,6 +386,14 @@ async def test_mutating_death_raises_unknown_before_paying_for_the_reconnect(
         # burst above: if the raise waited for the rebuild, this budget would
         # expire first and the caller would get a bare TimeoutError -- which
         # is not a RuntimeError, so this would fail rather than pass quietly.
+        #
+        # Measured at 0.48s, so the budget itself is not close. The way this
+        # test can go red without a regression is the other branch: if the
+        # supervisor stands down on its own between the kill and this call,
+        # the call finds no session and takes the PRE-dispatch rebuild
+        # branch, where the 5s backoff above is paid legitimately and blows
+        # the budget. That is a different code path from the one under test
+        # -- read the traceback before believing the timing.
         with pytest.raises(RuntimeError) as excinfo:
             await asyncio.wait_for(mutate.fn(value="v"), 2.0)
         assert "UNKNOWN" in str(excinfo.value)
@@ -574,6 +583,41 @@ async def test_drifted_tool_is_no_longer_retried_transparently(
         await mount.close()
 
 
+async def test_drift_discovered_by_a_call_s_own_reconnect_stops_that_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The retry decision cannot be made before the reconnect that reveals
+    the drift. `echo` is the tool that triggers the reconnect here, so its
+    new, MUTATING annotation is discovered by that very reconnect -- and is
+    first knowable only after it. Retrying anyway would execute, with no
+    confirm gate and no approval, a call the server has just declared
+    destructive.
+
+    Deliberately unlike the two drift tests above, which spend the
+    drift-discovering reconnect on `count()` and only then touch `echo`:
+    that ordering records the drift before the call under test, so it cannot
+    reach this case at all.
+    """
+    name = "drift-self"
+    mount = MCPMount([flaky_cmd(tmp_path, monkeypatch, name=name)])
+    try:
+        tools = await mount.mount()
+        echo = _tool(tools, "echo")
+        assert echo.read_only is True
+        monkeypatch.setenv("MCP_FLAKY_ANNOTATIONS", "drift")
+        await _kill_and_wait(await _wait_for_pid(f"mcp_flaky_server.py {name}"))
+        # First call after the death, and the first to see the restarted
+        # server's annotations: no transparent retry, an unknown outcome.
+        with pytest.raises(RuntimeError, match="UNKNOWN"):
+            await echo.fn(text="x")
+        # The reconnect still happened and still applied the drift -- what
+        # is withheld is only the re-invocation.
+        assert mount._servers[0].reconnect_count == 1
+        assert echo.read_only is False and echo.confirm is True
+    finally:
+        await mount.close()
+
+
 async def test_vanished_tool_returns_an_error_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -720,6 +764,9 @@ async def test_mutating_timeout_reports_an_unknown_outcome(
         # and the Router's backstop race for real.
         with pytest.raises(RuntimeError) as exc_info:
             await asyncio.wait_for(slow.fn(value="v"), slow.timeout)
+        # The TYPE is what the router keys on to avoid announcing this as a
+        # failure, so it is part of the contract, not an implementation detail.
+        assert isinstance(exc_info.value, UnknownToolOutcome)
         message = str(exc_info.value)
         assert "UNKNOWN" in message
         assert "Do not retry" in message
@@ -746,10 +793,11 @@ async def test_read_only_timeout_is_still_reported_as_a_plain_failure(
     try:
         tools = await mount.mount()
         slow = _tool(tools, "slow_read")
-        with pytest.raises(Exception) as exc_info:  # noqa: B017 -- the type IS the assertion
+        # The raised type is itself the assertion: an `UnknownToolOutcome`
+        # would not be an `MCPError` and would fail here before the wording
+        # is even looked at.
+        with pytest.raises(MCPError) as exc_info:
             await asyncio.wait_for(slow.fn(), slow.timeout)
-        assert isinstance(exc_info.value, MCPError)
-        assert not isinstance(exc_info.value, UnknownToolOutcome)
         message = str(exc_info.value)
         assert "timed out" in message.lower()
         assert "UNKNOWN" not in message
@@ -950,6 +998,30 @@ def test_connection_death_classification(error: BaseException, is_death: bool) -
     """The classifier gates the whole retry decision, so it is pinned here
     directly rather than only through tests that need a live server."""
     assert _is_connection_death(error) is is_death
+
+
+async def test_marking_a_connection_lost_never_clobbers_a_newer_one() -> None:
+    """Router tool calls in one batch run concurrently, and a batch of
+    simultaneously-failing calls is exactly what `reconnect()` coalesces. A
+    caller that diagnosed connection N as dead must not be able to clear a
+    connection some sibling has already rebuilt: a sibling that then reads
+    `server.session` would be told there is no live session about a
+    connection that is up, and would rebuild it again for nothing.
+
+    Driven directly rather than through two racing subprocesses -- the
+    window is a few statements wide and could not be hit reliably, but the
+    generation check that closes it is exact.
+    """
+    server = _MountedServer(MCPServerConfig(command="true"))
+    server.generation = 4
+    server.alive = True
+    server.session = object()  # type: ignore[assignment]
+
+    server.mark_connection_lost(3)  # a sibling already rebuilt past this
+    assert server.alive is True and server.session is not None
+
+    server.mark_connection_lost(4)  # the caller's own connection
+    assert server.alive is False and server.session is None
 
 
 # -- supervisor stand-down -----------------------------------------------------

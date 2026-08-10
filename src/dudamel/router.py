@@ -40,22 +40,37 @@ def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
-def _confirmed_error_text(name: str, e: Exception) -> str:
-    """How a raise from a tool the user has just approved is described to
-    the model.
+def _tool_error_text(name: str, e: Exception) -> str:
+    """How a raise from a tool is described to the model.
 
     An `UnknownToolOutcome` means the call was dispatched and no answer came
-    back, so the side effect may already have landed. Prefixing that with
-    "failed" -- on the one path where the user has spent an approval --
-    tells the model the exact thing the tool's own text was written to
-    avoid, and a model that reads "failed" reasonably tries again, spending
-    one approval on two executions. It is recognized by TYPE, not by
-    matching on its prose: the wording belongs to whoever raised it and must
-    stay free to change.
+    back, so the side effect may already have landed. Announcing that as a
+    failure -- of any shape -- tells the model the exact thing the tool's
+    own text was written to avoid, and a model that reads "failed" or
+    "raised" reasonably tries again, performing the side effect twice. It is
+    recognized by TYPE, not by matching on its prose: the wording belongs to
+    whoever raised it, must stay free to change, and (for an mcp tool)
+    passes through text an external server can influence, so a marker
+    inside the message would be something a server could counterfeit.
+
+    This path matters MORE than the confirmed one below, not less: an
+    unconfirmed call is one no confirm gate stopped -- under `[router]
+    taint_mode = "off"` there is no gate at all -- so the wording is the
+    only thing standing between an indeterminate mutation and a retry.
 
     Anything else keeps the plain failure wording. Blurring a genuine error
     into "indeterminate" would be the same mistake pointed the other way.
     """
+    if isinstance(e, UnknownToolOutcome):
+        return f"tool {name} did not report a definite outcome: {e}"
+    return f"tool {name} raised {type(e).__name__}: {e}"
+
+
+def _confirmed_error_text(name: str, e: Exception) -> str:
+    """`_tool_error_text` for a call the user has already approved, where
+    the router prefixes its own wording -- and where "failed" used to be
+    prepended to an indeterminate outcome on the one path where an approval
+    has actually been spent."""
     if isinstance(e, UnknownToolOutcome):
         return f"confirmed tool {name} did not report a definite outcome: {e}"
     return f"confirmed tool {name} failed: {type(e).__name__}: {e}"
@@ -372,7 +387,7 @@ class Router:
                     self._config.tool_result_cap,
                 )
             except Exception as e:  # tool bugs must not kill the conversation
-                detail = f"tool {call.name} raised {type(e).__name__}: {e}"
+                detail = _tool_error_text(call.name, e)
                 await log_activity(
                     self._db,
                     tool=call.name,
