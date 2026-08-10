@@ -7,14 +7,14 @@ from dudamel import App
 from dudamel.config import BudgetConfig, RouterConfig
 from dudamel.convo import ConversationStore
 from dudamel.db import Database
-from dudamel.exceptions import LLMError
+from dudamel.exceptions import LLMError, UnknownToolOutcome
 from dudamel.llm.client import LLMClient, Tier
 from dudamel.llm.testing import FakeProvider, fake_text, fake_tool_call
 from dudamel.llm.types import Completion, Message, ToolCall, Usage
 from dudamel.migrate import upgrade_core
 from dudamel.models_core import PendingConfirmation
 from dudamel.registry import Registry
-from dudamel.router import ChatReply, Router, _utcnow
+from dudamel.router import ChatReply, Router, _confirmed_error_text, _utcnow
 
 DELETED: list[str] = []
 MUTATED: list[str] = []
@@ -287,4 +287,47 @@ async def test_taint_survives_suspension_gap(tmp_path) -> None:
     assert sorted(row.status for row in rows) == ["confirmed", "pending"]
     second = next(row for row in rows if row.status == "pending")
     assert second.tool == "set_pref" and second.args == {"value": "b"}
+    await db.dispose()
+
+
+def test_confirmed_tool_failure_message_does_not_call_an_unknown_outcome_failed() -> None:
+    """On the confirmed path the router prefixes its own wording, so an
+    indeterminate outcome would otherwise be announced to the model with the
+    exact word the tool text was written to avoid."""
+    indeterminate = _confirmed_error_text(
+        "files__write",
+        UnknownToolOutcome(
+            "mcp tool files__write: the call timed out after 30s and the outcome is "
+            "UNKNOWN -- the server may still be completing it. Do not retry "
+            "automatically; check the server's state first."
+        ),
+    )
+    assert "failed" not in indeterminate
+    assert "UNKNOWN" in indeterminate and "Do not retry" in indeterminate
+    # Anything else keeps the plain, unambiguous failure wording, including
+    # the exception type -- an ordinary error must still read as an error.
+    ordinary = _confirmed_error_text("wipe_log", RuntimeError("disk is on fire"))
+    assert ordinary == "confirmed tool wipe_log failed: RuntimeError: disk is on fire"
+
+
+async def test_confirmed_indeterminate_outcome_reaches_the_model_unfailed(tmp_path) -> None:
+    """The end-to-end version of the test above: what the model is actually
+    handed after approving a tool whose outcome turned out to be unknown."""
+    script = [fake_tool_call("wipe_log", {"reason": "x"}), fake_text("I'll check first.")]
+    router, fp, db, convo, registry = build(tmp_path, script)
+
+    async def indeterminate(reason: str) -> str:
+        raise UnknownToolOutcome(
+            "mcp tool wipe_log: the server connection died during the call and the "
+            "outcome is UNKNOWN -- it may or may not have taken effect. Do not retry "
+            "automatically; check the server's state first."
+        )
+
+    registry.tools["wipe_log"].fn = indeterminate
+    r1 = await router.handle(channel="t:1", text="wipe", user_id="u1")
+    await router.resolve_confirmation(r1.pending_confirmation_id, approved=True, user_id="u1")
+    result = [m for m in fp.calls[1]["messages"] if m.role == "tool"][0]
+    assert result.is_error  # still an error result; just not a *failed* one
+    assert "failed" not in result.text
+    assert "UNKNOWN" in result.text and "Do not retry" in result.text
     await db.dispose()

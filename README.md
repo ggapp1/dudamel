@@ -240,10 +240,17 @@ burst is exhausted the server's tools fail fast for a cooldown period
 rather than being disabled for the rest of the process — the next call
 after the cooldown gets a fresh burst, because a real deployment being
 restarted or rolled routinely takes longer to come back than one burst
-spans. If a **mutating** tool's connection dies mid-call, dudamel reports
-the outcome as **unknown** rather than as a failure: the side effect may
-already have happened, and reporting failure would invite a retry that
-runs it twice.
+spans. If a **mutating** tool's call dies mid-flight — the connection drops,
+or the call outlives `call_timeout` — dudamel reports the outcome as
+**unknown** rather than as a failure: the side effect may already have
+happened, and reporting failure would invite a retry that runs it twice.
+That wording is aimed at the model, so what actually keeps one approval to
+one execution is the confirm gate in front of it, and that gate is
+conditional: a tool the server annotates `destructiveHint: true` is always
+gated, but an unannotated one is gated only once MCP output has already
+been seen (in the turn, or in the window — that's what `[router]
+taint_mode` selects), and not at all under `taint_mode = "off"`. Ungated,
+the model is free to call the tool again on its own.
 
 Two `[mcp]` settings in `dudamel.toml` control how long this is allowed to
 take: `call_timeout` (default 30 seconds) bounds a single tool call, and

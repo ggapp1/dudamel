@@ -1,7 +1,7 @@
 """Stdio MCP server fixture that can be killed mid-session and restarted.
 
 The echo fixture (``mcp_echo_server.py``) never dies, so it cannot exercise
-reconnect behavior at all. This one exposes four tools built specifically to
+reconnect behavior at all. This one exposes five tools built specifically to
 probe what happens across a real process death:
 
 - ``die()`` -- exits the process immediately (``os._exit``), killing the
@@ -14,6 +14,9 @@ probe what happens across a real process death:
   Because the side effect lands before the sleep, killing the process
   during that sleep produces exactly the case a naive retry gets wrong: the
   mutation already happened, but the caller never saw a reply.
+- ``slow_read()`` -- annotated read-only; sleeps for the same delay as
+  ``slow_mutate`` and touches nothing. The read-only twin of the call above,
+  so a timeout can be driven under either classification.
 - ``count()`` -- annotated read-only; reports how many times ``slow_mutate``
   has actually completed, read back from the same on-disk record (marker
   lines don't count). Since that record lives outside the process, a
@@ -99,6 +102,16 @@ def slow_mutate(value: str) -> str:
         os.fsync(fh.fileno())
     time.sleep(_SLOW_SECONDS)
     return f"mutated:{value}"
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+def slow_read() -> str:
+    """Sleep for the same configurable delay as ``slow_mutate``, then return
+    -- but annotated read-only, and with no side effect at all. The pair is
+    what lets a test drive the *same* slow call past a timeout under both
+    classifications and compare what the caller is told."""
+    time.sleep(_SLOW_SECONDS)
+    return "read"
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
