@@ -187,23 +187,68 @@ comments at the top of each file for the exact install steps.
 ## MCP (experimental)
 
 dudamel can mount external [MCP](https://modelcontextprotocol.io) servers
-as additional tools, configured in code alongside your apps:
+as additional tools, configured in code alongside your apps. A plain string
+is a stdio command, launched as a subprocess:
 
 ```python
 orchestrator = Orchestrator(apps=[workouts_app], mcp=["npx -y @some/mcp-server"])
 ```
 
+For an HTTP server, or a stdio server that needs its own environment
+variables, use `MCPServerConfig` instead of a string:
+
+```python
+from dudamel import MCPServerConfig
+
+orchestrator = Orchestrator(
+    apps=[workouts_app],
+    mcp=[
+        MCPServerConfig(
+            url="https://mcp.example.com/mcp",
+            headers={"Authorization": f"Bearer {token}"},
+        ),
+    ],
+)
+```
+
+`MCPServerConfig` takes exactly one of `command` (a stdio command string)
+or `url` (a streamable-HTTP endpoint) — never both, never neither.
+`headers` are sent with every HTTP request, which is the only way to reach
+an authenticated server: the underlying client sends no headers of its
+own, so a bare URL string can't carry a token. `env` names environment
+variables (already set in your own process) to pass through to a stdio
+server's subprocess, per server — this replaces the plain-string form's
+global `[mcp] env_passthrough` list for that one server.
+
 MCP support is **experimental**. Mounted tools are treated as less trusted
 than native ones: their results feed the taint rule described above, tool
 names are sanitized and namespaced (`{server}__{tool}`), and a server that
 fails to start or doesn't speak the protocol correctly is skipped with a
-warning rather than blocking the rest of the assistant from starting.
-Only the stdio transport is supported; a mounted server asking dudamel for
+warning rather than blocking the rest of the assistant from starting. A
+tool a server annotates `destructiveHint: true` is registered with
+`confirm=True`, so it gets a confirm prompt on every call, the same as a
+native tool registered that way. A mounted server asking dudamel for
 sampling, elicitation, or roots gets an explicit refusal rather than a
 hang or a silent no-op. If a mounted server pushes the tool count past
 `[router] max_tools`, the excess MCP tools — even ones you explicitly
 configured — are dropped from the model's tool list with only a log line,
 rather than failing startup.
+
+A server whose connection dies is reconnected automatically, but only
+within limits: a bounded number of attempts with growing backoff. If that
+burst is exhausted the server's tools fail fast for a cooldown period
+rather than being disabled for the rest of the process — the next call
+after the cooldown gets a fresh burst, because a real deployment being
+restarted or rolled routinely takes longer to come back than one burst
+spans. If a **mutating** tool's connection dies mid-call, dudamel reports
+the outcome as **unknown** rather than as a failure: the side effect may
+already have happened, and reporting failure would invite a retry that
+runs it twice.
+
+Two `[mcp]` settings in `dudamel.toml` control how long this is allowed to
+take: `call_timeout` (default 30 seconds) bounds a single tool call, and
+`mount_timeout` (default 15 seconds) bounds connecting to and listing
+tools from a server at startup and on each reconnect.
 
 ## Testing your apps
 
