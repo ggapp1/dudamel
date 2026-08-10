@@ -404,7 +404,6 @@ async def test_reconnect_is_bounded_at_three_attempts(
     name = "bounded"
     script = tmp_path / "flaky_copy.py"
     script.write_text(FIXTURE.read_text())
-    monkeypatch.setattr(mcp_mount, "MOUNT_TIMEOUT", 5.0)
     mount = MCPMount([flaky_cmd(tmp_path, monkeypatch, name=name, script=script)])
     try:
         tools = await mount.mount()
@@ -467,7 +466,6 @@ async def test_server_that_failed_to_mount_is_never_reconnected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A startup failure stays skipped for the process lifetime."""
-    monkeypatch.setattr(mcp_mount, "MOUNT_TIMEOUT", 5.0)
     script = tmp_path / "never_starts.py"
     script.write_text("import sys\n\nsys.exit(1)\n")
     mount = MCPMount([shlex.join([sys.executable, str(script)])])
@@ -659,7 +657,9 @@ async def test_call_timeout_reaches_the_caller_as_the_coded_native_error(
 # client library owns the server process, so "the connection died" and "the
 # process is being respawned" are the same event. An HTTP server is a separate
 # thing that can be absent for a while and then come back, which is what these
-# two cover. They are marked `slow` because each one starts a real ASGI server.
+# two cover. Like the rest of this module they are unmarked and run every
+# time -- each starts a real ASGI server, but that cost is small next to what
+# these two prove and nothing here should be dropped by a fast local lane.
 
 
 def _free_port() -> int:
@@ -717,7 +717,6 @@ async def _wait_for_port(port: int, *, listening: bool, log: Path, timeout: floa
     )
 
 
-@pytest.mark.slow
 async def test_http_server_restart_reconnects_transparently(tmp_path: Path) -> None:
     """An HTTP server that goes away and comes back is still reachable.
 
@@ -753,7 +752,6 @@ async def test_http_server_restart_reconnects_transparently(tmp_path: Path) -> N
         server_proc.wait()
 
 
-@pytest.mark.slow
 async def test_http_background_failure_does_not_strand_the_server(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1026,7 +1024,6 @@ async def test_reconnect_budget_rearms_after_the_cooldown(
     script = tmp_path / "rearm_fixture.py"
     original = FIXTURE.read_text()
     script.write_text(original)
-    monkeypatch.setattr(mcp_mount, "MOUNT_TIMEOUT", 5.0)
     monkeypatch.setattr(mcp_mount, "RECONNECT_COOLDOWN_SECONDS", 0.2)
     mount = MCPMount([flaky_cmd(tmp_path, monkeypatch, name=name, script=script)])
     try:
