@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import secrets
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal
@@ -22,6 +23,7 @@ from typing import Literal
 from fastapi import HTTPException, Request
 
 from dudamel.config import Settings
+from dudamel.web.throttle import FailedAuthThrottle
 
 SESSION_COOKIE = "dudamel_session"
 CSRF_HEADER = "x-csrf-token"
@@ -79,9 +81,17 @@ class Authenticator:
     cookie), enforcing CSRF for cookie-authed state-changing methods. Returns
     which mechanism authenticated the request; raises 401/403 otherwise."""
 
-    def __init__(self, settings: Settings, sessions: SessionStore) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        sessions: SessionStore,
+        throttle: FailedAuthThrottle,
+        client_key: Callable[[Request], str],
+    ) -> None:
         self._settings = settings
         self._sessions = sessions
+        self._throttle = throttle
+        self._client_key = client_key
 
     async def __call__(self, request: Request) -> AuthVia:
         token = resolve_token(self._settings)
@@ -93,6 +103,12 @@ class Authenticator:
             # 500 instead of the intended 401.
             if token is not None and secrets.compare_digest(provided.encode(), token.encode()):
                 return "bearer"
+            # The bearer path is not throttled itself (a bad bearer header on
+            # every /api/* route just 401s), but a failure here feeds the
+            # same counter /login checks: the token is accepted on every
+            # route, so throttling only /login would leave an attacker free
+            # to switch endpoints.
+            self._throttle.record_failure(self._client_key(request))
             raise HTTPException(status_code=401, detail="invalid bearer token")
 
         session_id = request.cookies.get(SESSION_COOKIE)
