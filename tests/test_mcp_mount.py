@@ -9,6 +9,7 @@ excluded from the default run; they run every time with the rest of the suite.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import shlex
 import sys
@@ -18,7 +19,7 @@ from pathlib import Path
 import mcp.types as types
 import pytest
 
-from dudamel import App, Orchestrator, Runtime
+from dudamel import App, Orchestrator, Runtime, mcp_mount
 from dudamel.config import McpConfig, RouterConfig, Settings, TierConfig
 from dudamel.contract.types import TOOL_NAME_RE, Tool
 from dudamel.exceptions import RegistryError, ToolValidationError
@@ -273,10 +274,12 @@ async def test_runtime_start_succeeds_with_unreachable_mcp_server(tmp_path: Path
         orc, make_settings(tmp_path), providers={"standard": FakeProvider([fake_text("hi")])}
     )
     await rt.start()  # must NOT raise -- broken mcp server never breaks core
-    assert orc.registry.tools == {}
-    reply = await rt.chat("t:1", "hi", user_id="u1")
-    assert reply.text == "hi"
-    await rt.stop()
+    try:
+        assert orc.registry.tools == {}
+        reply = await rt.chat("t:1", "hi", user_id="u1")
+        assert reply.text == "hi"
+    finally:
+        await rt.stop()
 
 
 async def test_mixed_reachable_and_unreachable_servers(tmp_path: Path) -> None:
@@ -504,9 +507,11 @@ async def test_mcp_mount_close_reversed_order_survives_two_servers() -> None:
     collision/dedupe policy exercised elsewhere."""
     for _ in range(3):
         mount = MCPMount([fixture_cmd("alpha"), fixture_cmd("beta")])
-        tools = await mount.mount()
-        assert {t.app_name for t in tools} == {"mcp:alpha", "mcp:beta"}
-        await mount.close()  # must not raise
+        try:
+            tools = await mount.mount()
+            assert {t.app_name for t in tools} == {"mcp:alpha", "mcp:beta"}
+        finally:
+            await mount.close()  # must not raise
 
 
 async def test_runtime_start_stop_survives_two_mounted_servers_repeatedly(
@@ -520,17 +525,19 @@ async def test_runtime_start_stop_survives_two_mounted_servers_repeatedly(
             orc, make_settings(tmp_path), providers={"standard": FakeProvider([fake_text("hi")])}
         )
         await rt.start()
-        assert set(orc.registry.tools) == {
-            "alpha__echo",
-            "alpha__mutate",
-            "alpha__read_env",
-            "alpha__destroy",
-            "beta__echo",
-            "beta__mutate",
-            "beta__read_env",
-            "beta__destroy",
-        }
-        await rt.stop()  # must not raise
+        try:
+            assert set(orc.registry.tools) == {
+                "alpha__echo",
+                "alpha__mutate",
+                "alpha__read_env",
+                "alpha__destroy",
+                "beta__echo",
+                "beta__mutate",
+                "beta__read_env",
+                "beta__destroy",
+            }
+        finally:
+            await rt.stop()  # must not raise
 
 
 # -- MCP-vs-MCP collisions warn + drop, never raise --------------------------
@@ -612,9 +619,15 @@ async def test_runtime_start_raises_registry_error_when_mcp_tool_collides_with_n
     rt = Runtime(
         orc, make_settings(tmp_path), providers={"standard": FakeProvider([fake_text("hi")])}
     )
-    with pytest.raises(RegistryError, match="collides"):
-        await rt.start()
-    await rt.stop()
+    try:
+        with pytest.raises(RegistryError, match="collides"):
+            await rt.start()
+    finally:
+        # rt.start() mounts the (live) fixture server before the collision
+        # is detected, so it must be stopped even if the expected raise
+        # above doesn't happen -- pytest.raises' own failure would otherwise
+        # skip straight past an un-try/finally'd rt.stop() and leak it.
+        await rt.stop()
 
 
 # -- env passthrough is explicit config, never ambient -----------------------
@@ -782,3 +795,55 @@ def test_unserializable_schema_drops_the_tool_rather_than_crashing() -> None:
         seen_names=seen,
     )
     assert [t.name for t in tools] == ["fixture__fine"]
+
+
+# -- label redaction: secrets in argv never reach a log line -----------------
+# (the HTTP-URL half of this -- userinfo/query stripping -- lives in
+# test_mcp_transport.py, next to the rest of the URL-transport coverage.)
+
+
+def test_stdio_label_never_contains_arguments() -> None:
+    """A stdio command's arguments can carry credentials (--api-key, tokens in
+    env-style args), and the label is interpolated into every reconnect and
+    shutdown warning. Only the executable itself may appear."""
+    cfg = MCPServerConfig(command="npx some-server --api-key sk-secret-123")
+    assert "sk-secret-123" not in cfg.label
+    assert "npx" in cfg.label
+
+
+async def test_mount_failure_warning_redacts_a_malformed_string_entry(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The mount-failure path logs the entry BEFORE it ever becomes an
+    MCPServerConfig (mount()'s `label = entry if isinstance(entry, str) else
+    entry.label`), so the `label` property alone cannot redact it -- the same
+    redaction has to be applied to the raw string entry too."""
+    mount = MCPMount(["nonexistent-cmd-xyz --api-key sk-secret-456"])
+    tools = await mount.mount()
+    assert tools == []
+    await mount.close()
+    assert any("failed to mount" in r.message for r in caplog.records)
+    assert not any("sk-secret-456" in r.message for r in caplog.records)
+    assert any("nonexistent-cmd-xyz" in r.message for r in caplog.records)
+
+
+async def test_close_returns_when_the_supervisor_never_acks_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wedged supervisor (alive, not draining its queue) must not be able
+    to hang shutdown; close() bounds its wait for the stop ack.
+
+    CLOSE_TIMEOUT is read directly off the module inside close() at call
+    time, not resolved into a bound default argument at import time, so
+    monkeypatching the module attribute here does take effect -- unlike the
+    call_timeout/mount_timeout trap documented at mcp_mount.py:159-166,
+    which this test deliberately does not fall into."""
+    monkeypatch.setattr(mcp_mount, "CLOSE_TIMEOUT", 0.2)
+    server = _MountedServer(MCPServerConfig(command="unused"))
+    # A supervisor that is alive but never reads `self._requests` -- close()
+    # must not be able to wait on it forever.
+    server._supervisor = asyncio.ensure_future(asyncio.sleep(3600))
+    start = time.monotonic()
+    await server.close()
+    elapsed = time.monotonic() - start
+    assert elapsed < 5.0

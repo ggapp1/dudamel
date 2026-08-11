@@ -121,6 +121,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import mcp.types as types
 from mcp import ClientSession, StdioServerParameters
@@ -137,15 +138,22 @@ logger = logging.getLogger("dudamel.mcp")
 CALL_TIMEOUT = 30.0  # per-tool-call timeout, enforced natively -- see `_make_call_fn`
 MOUNT_TIMEOUT = 15.0  # connect + list_tools budget per server, at mount time
 
-# `close()`'s own bound, and only that: once the supervisor has ACKed the
-# "stop" op, this is how long to wait for it to finish unwinding its stack
-# before giving up and cancelling it. It does NOT bound the wait for the ACK
-# itself -- `close()` first does an untimed `_submit_to(supervisor, "stop")`,
-# and if a connect is in flight when shutdown starts, that op sits in the
-# supervisor's queue behind `_rebuild`'s own `wait_for(..., mount_timeout)`.
-# So the worst case per server is close to mount_timeout (default 15s), not
-# CLOSE_TIMEOUT, and `MCPMount.close()` awaits each server's `close()` in
-# turn, so that worst case is serialized across servers, not just paid once.
+# `close()`'s own bound, spent twice, sequentially: once waiting for the
+# supervisor to ACK the "stop" op, and again (only if it did ACK) waiting
+# for it to finish unwinding its stack, before giving up and cancelling it
+# either way. Before both waits were bounded, a supervisor that was alive
+# but wedged -- not done, never draining `_requests` -- could hang shutdown
+# forever; now the worst case per server is ~2x CLOSE_TIMEOUT (default 20s),
+# and `MCPMount.close()` awaits each server's `close()` in turn, so that
+# worst case is serialized across servers, not just paid once. If a connect
+# is in flight when shutdown starts, "stop" sits in the supervisor's queue
+# behind `_rebuild`'s own `wait_for(..., mount_timeout)` -- with the default
+# mount_timeout (15s) larger than CLOSE_TIMEOUT (10s), the ack wait can now
+# time out while that connect is still legitimately in flight, in which case
+# the supervisor is cancelled mid-connect rather than given the extra
+# seconds it would have needed. That is the intended tradeoff: shutdown must
+# have an upper bound, and a connect that was already racing the process
+# exiting gets no special exemption from it.
 CLOSE_TIMEOUT = 10.0
 
 # Trap for a future test: `MCPMount`/`_MountedServer`'s `call_timeout`/
@@ -235,6 +243,45 @@ _HTTP_SESSION_GONE = frozenset({"session terminated", "session not found", "sess
 # -- server configuration -----------------------------------------------------
 
 
+def _redact_stdio_label(command: str) -> str:
+    """The executable a stdio `command` launches, with its arguments
+    stripped -- paths identify a server, arguments authenticate to it. A
+    credential passed as an argument (`npx some-server --api-key sk-...`) is
+    common enough (there is no other way to hand a stdio MCP server a
+    secret) that the full command string must never reach a log line.
+
+    Shared by `MCPServerConfig.label` and `MCPMount.mount()`'s
+    failure-warning path, which logs a raw string entry before it becomes an
+    `MCPServerConfig` at all -- the property alone can't reach that site.
+    """
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        # Unbalanced quotes: shlex can't even tokenize far enough to find an
+        # executable name, so there is nothing safe to show.
+        return "<unparseable command>"
+    if not parts:
+        # A non-empty string that is nonetheless all whitespace -- passes
+        # __post_init__'s truthiness check but has no executable to name.
+        return "<empty command>"
+    executable = parts[0]
+    # The " …" suffix is only a hint that arguments were dropped, so two
+    # servers sharing a binary (e.g. two `npx` entries) stay distinguishable
+    # in intent even though neither argument list is shown.
+    return f"{executable} …" if len(parts) > 1 else executable
+
+
+def _redact_url_label(url: str) -> str:
+    """`scheme://host[:port]/path`, dropping userinfo and query -- both of
+    which routinely carry secrets (`https://user:pw@host/mcp?token=...`).
+    Scheme, host and path are enough to identify a server in a log line."""
+    parts = urlsplit(url)
+    netloc = parts.hostname or ""
+    if parts.port is not None:
+        netloc = f"{netloc}:{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
 @dataclass(frozen=True)
 class MCPServerConfig:
     """One configured MCP server: either a stdio `command` or an HTTP `url`.
@@ -262,8 +309,17 @@ class MCPServerConfig:
 
     @property
     def label(self) -> str:
-        """Stable identifier for log messages, whichever transport this is."""
-        return self.command or self.url or "<unconfigured>"
+        """Stable identifier for log messages, whichever transport this is --
+        REDACTED: never the raw `command` (arguments may carry credentials)
+        or the raw `url` (userinfo/query may carry credentials). This is
+        interpolated into every reconnect warning, mount-failure warning,
+        shutdown warning, and the supervisor task name, so the redaction has
+        to hold for all of them, not just the obvious ones."""
+        if self.command is not None:
+            return _redact_stdio_label(self.command)
+        if self.url is not None:
+            return _redact_url_label(self.url)
+        return "<unconfigured>"
 
 
 # -- refused callbacks --------------------------------------------------------
@@ -892,6 +948,19 @@ class _MountedServer:
         return supervisor
 
     async def _submit_to(self, supervisor: asyncio.Task[None], op: str) -> BaseException | None:
+        """Not bounded here on purpose -- only `close()`'s own call site
+        wraps this in a timeout. This method also serves the "connect" path
+        (`_submit` -> `_submit_once` -> here), reached from a Router tool
+        call, and that path is already bounded end to end: `_rebuild` awaits
+        the connect itself under `wait_for(..., mount_timeout)`, and the
+        whole call is wrapped in `CALL_TIMEOUT` (plus the Router's own
+        margin) by `_make_call_fn`. Adding a second timeout at this layer
+        would either be redundant with those or -- if set shorter -- would
+        start cutting connect attempts off before their own documented
+        budget, for no benefit. `close()` has no such outer bound of its own
+        (nothing times a shutdown call), which is exactly why it needs one
+        here.
+        """
         if supervisor.done():
             return _SupervisorGone("mcp: server supervisor is not running")
         fut: asyncio.Future[BaseException | None] = asyncio.get_running_loop().create_future()
@@ -1334,7 +1403,32 @@ class _MountedServer:
             # cancellation -- in which case it released its stack on the way
             # out and there is nothing left to stop.
             return
-        error = await self._submit_to(supervisor, "stop")
+        # Two sequential CLOSE_TIMEOUT budgets, not one shared one: the ack
+        # wait and the post-ack unwind wait are different failure modes (a
+        # supervisor that never reads its queue at all, vs. one that is
+        # unwinding but stuck) and reporting them with their own timing and
+        # their own warning is clearer than splitting one budget across two
+        # `await`s that may or may not both run. Worst case this doubles the
+        # per-server bound documented above CLOSE_TIMEOUT's definition
+        # (~2x CLOSE_TIMEOUT instead of ~1x), which is still bounded and
+        # still serialized across servers by `MCPMount.close()` -- the
+        # tradeoff already accepted there.
+        try:
+            error = await asyncio.wait_for(
+                self._submit_to(supervisor, "stop"), timeout=CLOSE_TIMEOUT
+            )
+        except TimeoutError:
+            # Alive but wedged: not done, and never draining `_requests`, so
+            # the "stop" op it was just handed will never be picked up
+            # either. Nothing more to wait for -- abandon it the same way
+            # the post-ack branch below does.
+            logger.warning(
+                "mcp: server %r did not acknowledge stop within %.0fs -- abandoning it",
+                self.config.label,
+                CLOSE_TIMEOUT,
+            )
+            supervisor.cancel()
+            return
         if error is not None:
             logger.warning(
                 "mcp: server %r did not shut down cleanly (%s: %s) -- ignoring, best-effort",
@@ -1504,7 +1598,12 @@ class MCPMount:
         tools: list[Tool] = []
         seen_names: set[str] = set()
         for entry in self._entries:
-            label = entry if isinstance(entry, str) else entry.label
+            # A raw string entry hasn't become an MCPServerConfig yet -- it
+            # may fail to (see the empty-string case below) -- so it can't
+            # go through `.label`; redact it here with the same helper the
+            # property itself uses, so a string entry that fails to launch
+            # never logs its own argv.
+            label = _redact_stdio_label(entry) if isinstance(entry, str) else entry.label
             server: _MountedServer | None = None
             try:
                 # A plain string stays a stdio command, so existing configs

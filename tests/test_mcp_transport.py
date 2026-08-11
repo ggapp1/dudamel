@@ -54,6 +54,15 @@ def make_settings(
     )
 
 
+def test_http_label_strips_userinfo_and_query() -> None:
+    """URLs carry secrets in userinfo and query strings; scheme/host/path are
+    enough to identify a server in a log line."""
+    cfg = MCPServerConfig(url="https://user:pw@host/mcp?token=sk-secret-123")
+    assert "sk-secret-123" not in cfg.label
+    assert "pw" not in cfg.label
+    assert "host" in cfg.label
+
+
 def test_mcp_server_rejects_neither_command_nor_url() -> None:
     with pytest.raises(ValueError, match="exactly one of"):
         MCPServerConfig()
@@ -102,10 +111,12 @@ async def test_dataclass_entry_does_not_inherit_global_env_passthrough(
     mount = MCPMount(
         [MCPServerConfig(command=FIXTURE_COMMAND)], env_passthrough=("DUDAMEL_TEST_VAR",)
     )
-    tools = await mount.mount()
-    read_env = next(t for t in tools if t.name.endswith("__read_env"))
-    assert await read_env.fn(name="DUDAMEL_TEST_VAR") == ""
-    await mount.close()
+    try:
+        tools = await mount.mount()
+        read_env = next(t for t in tools if t.name.endswith("__read_env"))
+        assert await read_env.fn(name="DUDAMEL_TEST_VAR") == ""
+    finally:
+        await mount.close()
 
 
 async def test_runtime_start_succeeds_with_unreachable_http_server(tmp_path: Path) -> None:
@@ -114,24 +125,30 @@ async def test_runtime_start_succeeds_with_unreachable_http_server(tmp_path: Pat
         orc, make_settings(tmp_path), providers={"standard": FakeProvider([fake_text("hi")])}
     )
     await rt.start()  # must NOT raise -- broken mcp server never breaks core
-    assert orc.registry.tools == {}
-    reply = await rt.chat("t:1", "hi", user_id="u1")
-    assert reply.text == "hi"
-    await rt.stop()
+    try:
+        assert orc.registry.tools == {}
+        reply = await rt.chat("t:1", "hi", user_id="u1")
+        assert reply.text == "hi"
+    finally:
+        await rt.stop()
 
 
 async def test_string_entries_still_mount_as_stdio_commands() -> None:
     mount = MCPMount([fixture_cmd("alpha")])
-    tools = await mount.mount()
-    assert {t.name for t in tools} >= {"alpha__echo"}
-    await mount.close()
+    try:
+        tools = await mount.mount()
+        assert {t.name for t in tools} >= {"alpha__echo"}
+    finally:
+        await mount.close()
 
 
 async def test_per_server_env_reaches_the_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
     """MCPServerConfig(env=...) replaces the global env_passthrough list."""
     monkeypatch.setenv("DUDAMEL_TEST_VAR", "per-server-value")
     mount = MCPMount([MCPServerConfig(command=FIXTURE_COMMAND, env=("DUDAMEL_TEST_VAR",))])
-    tools = await mount.mount()
-    read_env = next(t for t in tools if t.name.endswith("__read_env"))
-    assert await read_env.fn(name="DUDAMEL_TEST_VAR") == "per-server-value"
-    await mount.close()
+    try:
+        tools = await mount.mount()
+        read_env = next(t for t in tools if t.name.endswith("__read_env"))
+        assert await read_env.fn(name="DUDAMEL_TEST_VAR") == "per-server-value"
+    finally:
+        await mount.close()
