@@ -33,11 +33,6 @@ class LLMClient:
         self._tiers = tiers
         self._db = db
         self._budget = budget
-        if budget.daily_usd is not None:
-            logger.warning(
-                "llm.budget.daily_usd is configured but v1 enforces token budgets "
-                "only — set daily_tokens for a hard ceiling"
-            )
 
     async def complete(
         self,

@@ -4,7 +4,7 @@ import tomllib
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -24,7 +24,13 @@ class TierConfig(BaseModel):
 
 class BudgetConfig(BaseModel):
     daily_tokens: int | None = None
-    daily_usd: float | None = None  # parsed; v1 enforcement is tokens-only (WARN)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_daily_usd(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "daily_usd" in data:
+            raise ValueError("daily_usd is not enforced; use daily_tokens")
+        return data
 
 
 class RouterConfig(BaseModel):
@@ -34,6 +40,7 @@ class RouterConfig(BaseModel):
     max_tools: int = 16
     confirm_ttl_seconds: int = 900
     taint_mode: Literal["turn", "window", "off"] = "turn"
+    persona: str | None = None
 
 
 class WebConfig(BaseModel):
