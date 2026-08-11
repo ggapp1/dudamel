@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -64,6 +65,52 @@ def _tool_error_text(name: str, e: Exception) -> str:
     if isinstance(e, UnknownToolOutcome):
         return f"tool {name} did not report a definite outcome: {e}"
     return f"tool {name} raised {type(e).__name__}: {e}"
+
+
+def _latest_user_text(history: list[Message]) -> str:
+    """The most recent user message's text, or "" if none -- the query
+    tool-subset ranking scores against."""
+    for m in reversed(history):
+        if m.role == "user":
+            return m.text or ""
+    return ""
+
+
+def _tokenize(text: str) -> set[str]:
+    """Case-folded token set, split on runs of non-alphanumerics. A dumb,
+    deterministic overlap key -- not relevance search."""
+    return {t for t in re.split(r"[^a-z0-9]+", text.casefold()) if t}
+
+
+def select_tool_subset(
+    tools: dict[str, Tool], *, max_tools: int, query: str, must_keep: set[str]
+) -> list[str]:
+    """Pick at most `max_tools` tool names to offer the model this turn.
+
+    Ranks tools by lexical overlap between `query` (the latest user message)
+    and each tool's `name + description`: overlap score descending, then
+    name ascending for stability when scores tie. Always retains all
+    native-origin tools -- the operator's own code -- and every name in
+    `must_keep` (tools already referenced earlier in the same turn, which
+    must stay visible for follow-up calls) regardless of score, even if that
+    alone exceeds `max_tools`. Only mcp-origin tools not in `must_keep` are
+    ever candidates for exclusion.
+
+    Deterministic: same inputs always produce the same subset.
+    """
+    query_tokens = _tokenize(query)
+    retained = {
+        name for name, tool in tools.items() if tool.origin == "native" or name in must_keep
+    }
+    candidates = sorted(
+        (name for name in tools if name not in retained),
+        key=lambda n: (
+            -len(query_tokens & _tokenize(f"{tools[n].name} {tools[n].description}")),
+            n,
+        ),
+    )
+    slots = max(max_tools - len(retained), 0)
+    return sorted(retained | set(candidates[:slots]))
 
 
 def _confirmed_error_text(name: str, e: Exception) -> str:
@@ -126,31 +173,29 @@ class Router:
         actually reach the model instead of silently existing only in
         `registry.tools`.
 
-        If mounting pushed the tool count past the ceiling, the excess
-        mcp-origin tools are DROPPED with a warning rather than raised over.
-        A mounted server's tool count is not something the operator controls,
-        and mcp mounting must never be able to take down startup. Native
-        over-registration still raises, in `__init__` -- that is the
-        operator's own code, and fixable.
+        If mounting pushed the tool count past the ceiling, nothing is
+        dropped: every tool stays registered, and `_loop` subsets which ones
+        are offered on each turn (see `select_tool_subset`). A mounted
+        server's tool count is not something the operator controls, and mcp
+        mounting must never be able to take down startup or permanently
+        discard a server's tool. Native over-registration still raises, in
+        `__init__` -- that is the operator's own code, and fixable.
+
+        This method only warns, once at mount time, that not every turn will
+        see every tool; the per-turn WARN naming which tools were left out
+        of a given turn is emitted by `_loop`.
         """
         excess = len(self._registry.tools) - self._config.max_tools
         if excess > 0:
-            droppable = [
-                name for name, tool in self._registry.tools.items() if tool.origin == "mcp"
-            ]
-            # Most recently added first: earlier mounts already won every
-            # name collision, so they keep winning here too.
-            to_drop = droppable[-excess:] if excess <= len(droppable) else droppable
-            for name in to_drop:
-                del self._registry.tools[name]
             logger.warning(
-                "%d tool(s) registered but router max_tools is %d — dropped %d mcp tool(s): "
-                "%s. Small models' tool selection collapses past this ceiling; raise "
+                "%d tool(s) registered but router max_tools is %d — no single turn "
+                "will be offered more than %d; each turn now selects a relevant "
+                "subset instead of any tool being dropped permanently. Small "
+                "models' tool selection collapses past this ceiling; raise "
                 "[router].max_tools deliberately or mount fewer servers.",
-                len(self._registry.tools) + len(to_drop),
+                len(self._registry.tools),
                 self._config.max_tools,
-                len(to_drop),
-                ", ".join(sorted(to_drop)),
+                self._config.max_tools,
             )
         self._specs = [ToolSpec.from_tool(t) for t in self._registry.tools.values()]
 
@@ -225,6 +270,7 @@ class Router:
         start_iteration: int,
         executed_any: bool,
         initial_taint: bool = False,
+        resumed_offered_tools: list[str] | None = None,
     ) -> ChatReply:
         # Seeded from the suspended turn's stored taint flag rather than
         # reset to False, so MCP-origin taint survives a confirm-gate
@@ -232,6 +278,13 @@ class Router:
         # already seen untrusted output and let a later native mutating call
         # skip the taint-forced confirm gate.
         turn_tainted = initial_taint
+        # Tools this call to _loop has itself invoked -- a tool the model
+        # just called must stay visible in later iterations for follow-up
+        # calls. Deliberately NOT seeded from pre-suspension calls on a
+        # resumed turn: the persisted `resumed_offered_tools` already covers
+        # the one iteration that must reproduce exactly what the model saw,
+        # and after that ranking resumes live.
+        called_tool_names: set[str] = set()
         for iteration in range(start_iteration, self._config.iteration_cap):
             history = await self._convo.recent(conv_id)
             window = [self._system_message()] + build_window(
@@ -249,9 +302,39 @@ class Router:
                 )
             if self._config.taint_mode == "window":
                 turn_tainted = turn_tainted or self._window_tainted(window)
+            if iteration == start_iteration and resumed_offered_tools is not None:
+                # Rebuilt from the persisted names, not re-ranked: re-ranking
+                # against a (possibly stale-relative-to-now) user message
+                # could swap the tool set out from under a resumed turn. A
+                # tool a server dropped between suspension and resume is
+                # skipped rather than fatal.
+                offered_names = [n for n in resumed_offered_tools if n in self._registry.tools]
+                specs = [ToolSpec.from_tool(self._registry.tools[n]) for n in offered_names]
+            elif len(self._registry.tools) > self._config.max_tools:
+                query = _latest_user_text(history)
+                offered_names = select_tool_subset(
+                    self._registry.tools,
+                    max_tools=self._config.max_tools,
+                    query=query,
+                    must_keep=called_tool_names,
+                )
+                not_offered = sorted(set(self._registry.tools) - set(offered_names))
+                if not_offered:
+                    logger.warning(
+                        "conversation %s: %d tool(s) not offered this turn "
+                        "(past router max_tools %d): %s",
+                        conv_id,
+                        len(not_offered),
+                        self._config.max_tools,
+                        ", ".join(not_offered),
+                    )
+                specs = [ToolSpec.from_tool(self._registry.tools[n]) for n in offered_names]
+            else:
+                offered_names = list(self._registry.tools)
+                specs = self._specs
             try:
                 completion = await self._llm.complete(
-                    window, tier=tier, tools=self._specs, conversation_id=conv_id
+                    window, tier=tier, tools=specs, conversation_id=conv_id
                 )
             except BudgetExceededError as e:
                 return ChatReply(text=str(e))
@@ -266,6 +349,7 @@ class Router:
             if not msg.tool_calls:
                 await self._convo.append(conv_id, msg)
                 return ChatReply(text=msg.text or "(no reply)")
+            called_tool_names |= {c.name for c in msg.tool_calls}
             outcome = await self._execute_batch(conv_id, msg.tool_calls, turn_tainted=turn_tainted)
             executed_any = executed_any or outcome.executed_any
             turn_tainted = turn_tainted or outcome.saw_mcp_result
@@ -279,6 +363,7 @@ class Router:
                     user_id=user_id,
                     executed_any=executed_any,
                     turn_tainted=turn_tainted,
+                    offered_tools=offered_names,
                 )
             await self._convo.append_many(conv_id, [msg, *outcome.results])
         return ChatReply(
@@ -456,6 +541,7 @@ class Router:
         user_id: str,
         executed_any: bool,
         turn_tainted: bool,
+        offered_tools: list[str],
     ) -> ChatReply:
         call = outcome.pending_call
         assert call is not None
@@ -480,6 +566,10 @@ class Router:
                         # suspension gap rather than silently losing it.
                         "executed_any": executed_any,
                         "turn_tainted": turn_tainted,
+                        # The exact tool names offered when the model made
+                        # this call, so resume shows the identical set
+                        # instead of re-ranking against a stale message.
+                        "offered_tools": offered_tools,
                     },
                     status="pending",
                     expires_at=_utcnow() + timedelta(seconds=self._config.confirm_ttl_seconds),
@@ -585,6 +675,7 @@ class Router:
             stored_executed_any = state.get("executed_any", False)
             results_have_success = any(not d.get("is_error", False) for d in state["results"])
             initial_taint = state.get("turn_tainted", False)
+            offered_tools = state.get("offered_tools")
             if expired:
                 await self._close_suspended_turn(row, note="declined (expired)")
                 await log_activity(
@@ -612,6 +703,7 @@ class Router:
                     start_iteration=state["iteration"] + 1,
                     executed_any=stored_executed_any or results_have_success,
                     initial_taint=initial_taint,
+                    resumed_offered_tools=offered_tools,
                 )
             # approved: execute now, then resume. Order matters — the tool
             # result is produced before the assistant turn + prior results +
@@ -640,6 +732,7 @@ class Router:
                 start_iteration=state["iteration"] + 1,
                 executed_any=executed_any,
                 initial_taint=initial_taint,
+                resumed_offered_tools=offered_tools,
             )
 
     async def _execute_confirmed(self, conv_id: int, call: ToolCall) -> Message:

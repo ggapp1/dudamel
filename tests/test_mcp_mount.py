@@ -665,17 +665,18 @@ async def test_env_passthrough_absent_var_stays_absent_without_config(
         await rt.stop()
 
 
-# -- post-mount max_tools ceiling drops mcp tools, never crashes -------------
+# -- post-mount max_tools ceiling subsets per turn, never drops or crashes ---
 # The ceiling exists because small models' tool selection collapses past a
 # modest tool count. But a mounted server's tool count is not the operator's
 # to control -- it is whatever that server advertises today -- so enforcing
 # the ceiling by raising would let any server take the whole assistant down,
-# which is precisely what this module promises can never happen. Excess
-# mcp tools are therefore dropped with a warning. Native over-registration
-# still raises, in Router.__init__: that IS the operator's own code.
+# which is precisely what this module promises can never happen. Excess mcp
+# tools all stay registered; each turn is offered a relevant subset instead
+# (see dudamel.router.select_tool_subset). Native over-registration still
+# raises, in Router.__init__: that IS the operator's own code.
 
 
-async def test_mount_exceeding_max_tools_drops_mcp_tools_instead_of_crashing(
+async def test_mount_exceeding_max_tools_keeps_every_mcp_tool_registered(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     orc = Orchestrator(apps=[], mcp=[FIXTURE_CMD])  # fixture mounts 4 tools
@@ -684,7 +685,7 @@ async def test_mount_exceeding_max_tools_drops_mcp_tools_instead_of_crashing(
     with caplog.at_level(logging.WARNING, logger="dudamel.router"):
         await rt.start()
     try:
-        assert len(orc.registry.tools) == 1
+        assert len(orc.registry.tools) == 4  # nothing dropped, despite max_tools=1
         assert all(t.origin == "mcp" for t in orc.registry.tools.values())
         assert "max_tools" in caplog.text
     finally:
@@ -693,8 +694,9 @@ async def test_mount_exceeding_max_tools_drops_mcp_tools_instead_of_crashing(
 
 async def test_native_tools_are_never_dropped_for_mcp_tools(tmp_path: Path) -> None:
     """The operator's own app is what they actually asked for; a mounted
-    server's tools are opportunistic. When the ceiling forces a choice, the
-    native ones survive."""
+    server's tools are opportunistic. Registration keeps every mcp tool too
+    -- what changes past the ceiling is what a given turn is offered, not
+    what's registered."""
     app = App("gym", description="d")
 
     @app.tool
@@ -709,7 +711,7 @@ async def test_native_tools_are_never_dropped_for_mcp_tools(tmp_path: Path) -> N
     try:
         names = set(orc.registry.tools)
         assert "log_workout" in names
-        assert len(names) == 2
+        assert len(names) == 5  # 1 native + 4 mcp -- none dropped
     finally:
         await rt.stop()
 
