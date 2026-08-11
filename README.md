@@ -230,6 +230,10 @@ it (core and app schemas), not apply-only.
 - **Token budgets**: `[llm.budget] daily_tokens` in `dudamel.toml` sets a
   hard per-day ceiling per tier, enforced before each call — a runaway
   loop or a misbehaving job can't spend past it.
+- **Persona**: `[router] persona` in `dudamel.toml` customizes the assistant's
+  system prompt identity line (the "You are..." part). The installed apps
+  block and tool-use instructions are always present — a persona cannot
+  disable tool use by accident. Leave unset for the default identity.
 - Every `/api/*` route requires a bearer token or an authenticated session
   cookie; `/health` is intentionally unauthenticated (it exists for
   infrastructure checks) and never returns anything beyond up/down status.
@@ -309,6 +313,13 @@ Two `[mcp]` settings in `dudamel.toml` control how long this is allowed to
 take: `call_timeout` (default 30 seconds) bounds a single tool call, and
 `mount_timeout` (default 15 seconds) bounds connecting to and listing
 tools from a server at startup and on each reconnect.
+
+## Breaking changes for next release
+
+- `[llm.budget] daily_usd` has been removed and is no longer accepted.
+  If your `dudamel.toml` sets this key, it will raise a validation error
+  on startup. Use `daily_tokens` for budget enforcement — it is the only
+  enforced limit in v1 and later.
 
 ## Testing your apps
 

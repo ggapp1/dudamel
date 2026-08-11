@@ -120,6 +120,30 @@ async def test_tool_call_roundtrip_with_string_coercion(tmp_path) -> None:
     await db.dispose()
 
 
+def test_persona_replaces_identity_line_but_never_the_apps_or_tool_instruction(tmp_path) -> None:
+    """The persona swaps only who the assistant says it is; the installed-apps
+    block and the tool-use instruction are structural and always present, so a
+    persona cannot disable tool use by accident."""
+    config = RouterConfig(iteration_cap=8)
+    config.persona = "You are Jeeves, a butler."
+    router, fp, db = make_router(tmp_path, [fake_text("ok")], config=config)
+    msg = router._system_message()
+    assert "You are Jeeves, a butler." in msg.text
+    assert "Installed apps:" in msg.text
+    assert "gym:" in msg.text
+    assert "Use the available tools" in msg.text
+    assert "You are dudamel" not in msg.text
+
+
+def test_persona_default_keeps_the_original_identity_line(tmp_path) -> None:
+    """When persona is None or not set, the original identity line is used."""
+    router, fp, db = make_router(tmp_path, [fake_text("ok")], config=RouterConfig())
+    msg = router._system_message()
+    assert "You are dudamel, a personal assistant orchestrator." in msg.text
+    assert "Installed apps:" in msg.text
+    assert "Use the available tools" in msg.text
+
+
 async def test_unknown_tool_fed_back(tmp_path) -> None:
     script = [fake_tool_call("ghost_tool", {}), fake_text("sorry")]
     router, fp, db = make_router(tmp_path, script)

@@ -51,6 +51,7 @@ class Activity(CoreBase):
     args: Mapped[dict] = mapped_column(JSON)
     status: Mapped[str] = mapped_column(String(32))  # ok|error|declined|confirmed
     result_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # reserved; never populated
     tokens_in: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tokens_out: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)

@@ -251,10 +251,11 @@ class Router:
 
     def _system_message(self) -> Message:
         apps = "\n".join(f"- {a.name}: {a.description}" for a in self._registry.apps.values())
+        identity = self._config.persona or "You are dudamel, a personal assistant orchestrator."
         return Message(
             role="system",
             text=(
-                "You are dudamel, a personal assistant orchestrator.\n"
+                f"{identity}\n"
                 f"Installed apps:\n{apps}\n"
                 "Use the available tools to act or fetch data; otherwise answer "
                 "directly and concisely."

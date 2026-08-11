@@ -1,6 +1,9 @@
 from pathlib import Path
 
-from dudamel.config import Settings
+import pytest
+from pydantic import ValidationError
+
+from dudamel.config import BudgetConfig, Settings
 
 TOML = """
 [llm.tiers.standard]
@@ -29,7 +32,6 @@ def test_llm_sections_parsed(tmp_path: Path) -> None:
     assert s.llm_tiers["standard"].base_url == "http://localhost:11434/v1"
     assert s.llm_tiers["deep"].max_tokens == 2048
     assert s.llm_budget.daily_tokens == 2_000_000
-    assert s.llm_budget.daily_usd is None
     assert s.router.iteration_cap == 4
     assert s.router.window_tokens == 8000  # default survives partial section
 
@@ -48,3 +50,26 @@ def test_existing_precedence_untouched(tmp_path: Path, monkeypatch) -> None:
     s = Settings.load(tmp_path)
     assert s.database_url == "sqlite+aiosqlite:///env.db"
     assert s.llm_tiers["standard"].model == "qwen3.5:9b"
+
+
+def test_daily_usd_raises_an_actionable_error_at_config_load() -> None:
+    """A key that parses but does nothing is a silent hole in the operator's
+    intended spend ceiling; rejecting it names the enforced alternative."""
+    with pytest.raises(ValidationError, match="daily_usd is not enforced; use daily_tokens"):
+        BudgetConfig(daily_usd=5.0)
+
+
+def test_daily_usd_in_toml_surfaces_the_validation_error(tmp_path: Path) -> None:
+    """Settings.load() must surface the BudgetConfig error for TOML [llm.budget]."""
+    toml_with_daily_usd = """
+[llm.tiers.standard]
+provider = "openai-compatible"
+base_url = "http://localhost:11434/v1"
+model = "qwen3.5:9b"
+
+[llm.budget]
+daily_usd = 5.0
+"""
+    (tmp_path / "dudamel.toml").write_text(toml_with_daily_usd)
+    with pytest.raises(ValidationError, match="daily_usd is not enforced; use daily_tokens"):
+        Settings.load(tmp_path)
