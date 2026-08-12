@@ -41,6 +41,7 @@ from dudamel.exceptions import DudamelError
 from dudamel.interfaces.telegram import resolve_token as resolve_telegram_token
 from dudamel.llm.probe import probe_tool_calling
 from dudamel.migrate import (
+    _sqlite_path,
     current_heads,
     ensure_app_migrations,
     generate_app_migration,
@@ -264,15 +265,22 @@ def _line(ok: bool, label: str, detail: str) -> str:
     return f"{'✓' if ok else '✗'} {label}: {detail}"
 
 
+def _sqlite_file_path(db_url: str) -> Path | None:
+    """The on-disk file a SQLite URL names, or None for a non-SQLite or
+    in-memory URL. Reuses `migrate._sqlite_path` (which owns the URL-parsing
+    rules and raises for in-memory) so doctor's existence checks and the
+    backup path can never disagree about what file a URL names."""
+    try:
+        return _sqlite_path(db_url)
+    except DudamelError:
+        return None  # :memory: / path-less sqlite -- nothing on disk to check
+
+
 def _check_db_connect(db_url: str) -> tuple[bool, str]:
     # For SQLite, check if the database file exists before trying to connect
-    if db_url.startswith("sqlite"):
-        if "///" in db_url:
-            raw_path = db_url.split("///", 1)[1].split("?", 1)[0]
-            if raw_path and raw_path != ":memory:":
-                path = Path(raw_path)
-                if not path.exists():
-                    return False, "not created yet (run `dudamel run` first)"
+    path = _sqlite_file_path(db_url)
+    if path is not None and not path.exists():
+        return False, "not created yet (run `dudamel run` first)"
     try:
         engine = create_engine(sync_url(db_url))
         try:
@@ -288,16 +296,12 @@ def _check_db_connect(db_url: str) -> tuple[bool, str]:
 def _check_core_migrations(db_url: str) -> tuple[bool, str]:
     # For SQLite, check if database file exists before trying to connect
     # (avoid creating an empty database file when just running doctor)
-    if db_url.startswith("sqlite"):
-        if "///" in db_url:
-            raw_path = db_url.split("///", 1)[1].split("?", 1)[0]
-            if raw_path and raw_path != ":memory:":
-                path = Path(raw_path)
-                if not path.exists():
-                    return (
-                        False,
-                        "not yet applied — run `dudamel run` or `dudamel db migrate -m <msg>` once",
-                    )
+    path = _sqlite_file_path(db_url)
+    if path is not None and not path.exists():
+        return (
+            False,
+            "not yet applied — run `dudamel run` or `dudamel db migrate -m <msg>` once",
+        )
     try:
         heads = script_heads(str(files("dudamel") / "migrations"))
         current = current_heads(db_url, "alembic_version_core")
