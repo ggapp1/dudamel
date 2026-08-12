@@ -1129,3 +1129,76 @@ async def test_concurrent_turns_on_one_conversation_share_a_lock(tmp_path) -> No
     assert CALLS == ["probe:start", "probe:end", "probe:start", "probe:end"]
     assert router._locks == {}  # and both turns released the shared entry
     await db.dispose()
+
+
+async def test_cancelling_a_turn_mid_batch_leaves_no_tool_task_running(tmp_path) -> None:
+    """SIGTERM (or a dropped request) cancels the Router task while it is
+    awaiting the first tool of a batch. The siblings created alongside it
+    must be cancelled and awaited before the cancellation propagates —
+    otherwise they keep running detached and write activity rows against an
+    engine `Runtime.stop()` is already disposing.
+
+    Synchronized with events, never sleeps: each tool announces it has
+    started, then blocks forever on an event nothing sets."""
+    started_a, started_b = asyncio.Event(), asyncio.Event()
+    blocked = asyncio.Event()  # never set
+    cancelled: list[str] = []
+
+    app = App("slow", description="d")
+
+    @app.tool(read_only=True, timeout=30.0)
+    async def slow_a() -> str:
+        """First tool of the batch."""
+        started_a.set()
+        await blocked.wait()
+        return "a"
+
+    @app.tool(read_only=True, timeout=30.0)
+    async def slow_b() -> str:
+        """Sibling that must not be left running."""
+        started_b.set()
+        try:
+            await blocked.wait()
+        except asyncio.CancelledError:
+            cancelled.append("b")
+            raise
+        return "b"
+
+    batch = Completion(
+        message=Message(
+            role="assistant",
+            tool_calls=[
+                ToolCall(id="a", name="slow_a", args={}),
+                ToolCall(id="b", name="slow_b", args={}),
+            ],
+        ),
+        usage=Usage(1, 1),
+        stop_reason="tool_calls",
+    )
+    url = f"sqlite+aiosqlite:///{tmp_path}/cancel.db"
+    upgrade_core(url)
+    db = Database(url)
+    fp = FakeProvider([batch, fake_text("done")])
+    llm = LLMClient(
+        tiers={"standard": Tier(name="standard", provider=fp, model="f", max_tokens=64)},
+        db=db,
+        budget=BudgetConfig(),
+    )
+    router = Router(
+        llm=llm,
+        registry=Registry([app]),
+        convo=ConversationStore(db),
+        db=db,
+        config=RouterConfig(),
+    )
+    turn = asyncio.create_task(router.handle(channel="t:1", text="go", user_id="u1"))
+    await started_a.wait()
+    await started_b.wait()
+    turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    assert cancelled == ["b"]  # the sibling was cancelled, not abandoned
+    leaked = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+    assert leaked == []
+    await db.dispose()
