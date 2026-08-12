@@ -55,3 +55,14 @@ class ProviderRequestError(LLMError):
 
 class BudgetExceededError(DudamelError):
     """The configured daily LLM budget is exhausted; hard stop."""
+
+
+class AlreadyRunningError(DudamelError, RuntimeError):
+    """Another `serve()` already holds the instance lock for this data_dir.
+
+    A DudamelError so `dudamel run` prints it as a clean, actionable one-liner
+    (like every other operator condition) rather than framing this expected
+    situation as an internal crash with a "re-run with --debug" traceback
+    invitation. Also a `RuntimeError`, so callers/tests that predate the typed
+    exception and match on `RuntimeError` keep working unchanged.
+    """

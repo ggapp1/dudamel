@@ -24,6 +24,7 @@ from sqlalchemy import select
 from dudamel import App, Orchestrator, Runtime
 from dudamel.config import Settings, TierConfig, WebConfig
 from dudamel.db import Database
+from dudamel.exceptions import AlreadyRunningError, DudamelError
 from dudamel.llm.testing import FakeProvider
 from dudamel.models_core import JobRun
 from dudamel.scheduler import JobScheduler
@@ -61,6 +62,7 @@ def make_settings(tmp_path: Path) -> Settings:
     return Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/serve.db",
         data_dir=tmp_path,
+        project_dir=tmp_path,
         llm_tiers={"standard": TierConfig(provider="fake", model="f")},
         web=WebConfig(host="127.0.0.1", port=0),
     )
@@ -597,13 +599,20 @@ def test_instance_lock_exclusive_until_released(tmp_path: Path) -> None:
     """flock exclusivity (IMPORTANT finding): a second acquire() must fail
     while the first is genuinely held, and succeed again once it's
     released -- no TOCTOU window between "check" and "take" the way the old
-    pid-heuristic reclaim had."""
+    pid-heuristic reclaim had.
+
+    The raised error is `AlreadyRunningError`: a `DudamelError` (so `dudamel
+    run` prints a clean one-liner for this expected operator condition) that
+    still subclasses `RuntimeError` (preserving the historical contract).
+    """
     lockfile = tmp_path / ".dudamel.lock"
     first = _InstanceLock(lockfile)
     first.acquire()
     try:
-        with pytest.raises(RuntimeError, match="already running"):
+        with pytest.raises(RuntimeError, match="already running") as exc_info:
             _InstanceLock(lockfile).acquire()
+        assert isinstance(exc_info.value, AlreadyRunningError)
+        assert isinstance(exc_info.value, DudamelError)
     finally:
         first.release()
 
