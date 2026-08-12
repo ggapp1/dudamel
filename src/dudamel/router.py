@@ -496,6 +496,16 @@ class Router:
                     window, tier=tier, tools=specs, conversation_id=conv_id
                 )
             except BudgetExceededError as e:
+                # Same executed_any honesty the LLMError branch below has:
+                # the budget check is PRE-call, so it can trip between two
+                # iterations of a turn whose earlier batch already mutated
+                # something. Reporting only "budget exhausted" would leave the
+                # user to re-issue the request once the budget resets and run
+                # that mutation a second time.
+                if executed_any:
+                    return ChatReply(
+                        text=f"I completed the action(s), but couldn't produce a summary — {e}."
+                    )
                 return ChatReply(text=str(e))
             except LLMError as e:
                 if executed_any:
