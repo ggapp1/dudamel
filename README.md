@@ -262,6 +262,12 @@ start instead of upgrading, and tells you to run `dudamel db migrate -m
 <message>` — which both autogenerates the pending migration and applies
 it (core and app schemas), not apply-only.
 
+App migrations resolve from `project_dir` (a `dudamel.toml`/`Settings` key,
+default the current directory) — the same `migrations/` that `dudamel db
+migrate` writes — not from `data_dir` (where the SQLite database and other
+runtime state live). Keep them the same unless you deliberately split them:
+migrations placed under `data_dir` are ignored.
+
 ## Security
 
 - **Confirm gates**: a tool registered with `confirm=True` always stops

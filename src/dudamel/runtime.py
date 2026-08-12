@@ -187,6 +187,23 @@ class Runtime:
         # auto_migrate gate below cannot be hollowed out by a data_dir that
         # differs from the project root.
         project_dir = self._settings.project_dir
+        # A programmatic embedder who builds Settings(data_dir=X) directly
+        # (not via Settings.load) and drops app migrations under data_dir
+        # gets them silently ignored -- resolution is from project_dir, and
+        # with auto_migrate=False the gate below sees no pending app
+        # migrations and passes. Warn so this isn't a silent no-op.
+        if (
+            (self._settings.data_dir / "migrations").exists()
+            and self._settings.data_dir != project_dir
+            and not (project_dir / "migrations").exists()
+        ):
+            logger.warning(
+                "app migrations found under data_dir (%s) but are resolved from "
+                "project_dir (%s), which has none -- they will be ignored; move "
+                "migrations/ under project_dir or set project_dir to data_dir",
+                self._settings.data_dir,
+                project_dir,
+            )
         if self._settings.auto_migrate:
             await asyncio.to_thread(upgrade_core, url)
             migrations_dir = project_dir / "migrations"

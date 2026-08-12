@@ -266,6 +266,18 @@ async def test_no_dropped_span_returns_none_without_calling_the_model(tmp_path: 
     await db.dispose()
 
 
+async def test_watermark_id_returns_none_for_zero_dropped(tmp_path: Path) -> None:
+    """`_watermark_id` must never index `history[dropped - 1]` when
+    `dropped` is 0 -- that `[-1]` would name the NEWEST row as the
+    watermark, marking the whole history covered. It returns None, the
+    function's own no-op sentinel, so nothing is watermarked."""
+    compactor, fp, db, conv_id = await _make(tmp_path, [])
+    history = await _seed_messages(db, conv_id, 5)
+    assert await compactor._watermark_id(conv_id, history, dropped=0) is None
+    assert fp.calls == []
+    await db.dispose()
+
+
 async def test_newest_n_pruning_keeps_only_the_latest_rows(tmp_path: Path) -> None:
     """Writing more than _KEEP_PER_CONVERSATION summaries deletes the
     oldest, keeping only the newest N."""
