@@ -1,6 +1,8 @@
 import json
 import logging
 
+import pytest
+
 from dudamel.llm.prompted_tools import (
     PromptedToolsProvider,
     _fence_close,
@@ -91,6 +93,16 @@ def test_unparseable_output_degrades_to_plain_text() -> None:
     assert _parse_calls('{"tool_calls": "not a list"}', cap=8) is None
 
 
+def test_a_well_formed_envelope_with_no_calls_is_distinct_from_prose() -> None:
+    """None means "this was never a call envelope, treat it as prose"; an
+    empty list means "this WAS an envelope but asked for nothing runnable".
+    The two must not collapse into one another -- the caller replies with
+    the model's own text in the first case and must not in the second."""
+    assert _parse_calls('{"tool_calls": []}', cap=8) == []
+    # every entry invalid: a non-object, and an object with no usable name
+    assert _parse_calls('{"tool_calls": ["nope", {"arguments": {}}]}', cap=8) == []
+
+
 def test_call_count_cap_truncation_is_logged(caplog) -> None:
     envelope = json.dumps({"tool_calls": [{"name": f"t{i}", "arguments": {}} for i in range(20)]})
     with caplog.at_level(logging.INFO, logger="dudamel.llm.prompted_tools"):
@@ -145,6 +157,8 @@ async def test_wrapper_produces_a_tool_call_from_prompted_json() -> None:
 
 
 async def test_wrapper_degrades_to_text_when_reply_is_unparseable() -> None:
+    """Prose the model meant as an answer still reaches the user verbatim --
+    the neutral-text substitution below must not swallow this case."""
     inner = FakeProvider([fake_text("sure, here's a normal answer")])
     wrapped = PromptedToolsProvider(inner)
     tools = [ToolSpec(name="search", description="search stuff", json_schema={"type": "object"})]
@@ -154,3 +168,34 @@ async def test_wrapper_degrades_to_text_when_reply_is_unparseable() -> None:
     assert completion.stop_reason == "end"
     assert completion.message.text == "sure, here's a normal answer"
     assert completion.message.tool_calls == []
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        json.dumps({"tool_calls": []}),
+        json.dumps({"tool_calls": ["not-a-dict", {"arguments": {"q": "x"}}]}),
+    ],
+    ids=["empty-list", "all-entries-invalid"],
+)
+async def test_envelope_with_no_runnable_calls_never_shows_the_user_raw_json(
+    envelope: str, caplog
+) -> None:
+    """The model tried to call a tool and botched it. Handing its JSON back
+    as the assistant's reply shows the user machinery they never asked to
+    see, so the wrapper substitutes a neutral apology and records WHY at
+    WARNING -- the raw envelope belongs in the log, not in the chat."""
+    inner = FakeProvider([fake_text(envelope)])
+    wrapped = PromptedToolsProvider(inner)
+    tools = [ToolSpec(name="search", description="search stuff", json_schema={"type": "object"})]
+    with caplog.at_level(logging.WARNING, logger="dudamel.llm.prompted_tools"):
+        completion = await wrapped.complete(
+            model="m", messages=[Message(role="user", text="find cats")], tools=tools
+        )
+    assert completion.stop_reason == "end"
+    assert completion.message.tool_calls == []
+    # nothing of the envelope survives into what the user reads
+    assert "tool_calls" not in completion.message.text
+    assert completion.message.text.strip()  # a real sentence, not an empty reply
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "tool" in warnings[0].getMessage()

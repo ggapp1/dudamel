@@ -155,7 +155,11 @@ Trust caveats:
 - The fallback is more permissive about malformed output than a native
   backend would ever produce: expect it to occasionally reply in plain
   prose instead of calling a tool it should have. That degrades to a
-  normal text reply, never a crash.
+  normal text reply, never a crash. If instead it emits a well-formed
+  envelope that asks for nothing runnable — an empty call list, or entries
+  missing a tool name — the reply you see is a short neutral apology rather
+  than the model's raw JSON; the envelope and the reason are logged at
+  WARNING for the operator.
 
 ## Remote access
 

@@ -56,6 +56,12 @@ logger = logging.getLogger("dudamel.llm.prompted_tools")
 # take to reach anyway, just collapsed into a single parse.
 _MAX_CALLS = 8
 
+# What the user sees when the model emitted a call envelope that requested
+# nothing runnable. Deliberately free of JSON, tool names, and the word
+# "envelope": the failure is ours to log, not theirs to debug, and the one
+# thing they can usefully do about it is say the request again.
+_DEGRADED_TEXT = "I tried to call a tool but produced an invalid request; please try again."
+
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 # Matches the whole (already think-stripped, whitespace-trimmed) completion
 # as exactly one fenced code block -- fullmatch via ^...$, not a search, so
@@ -139,9 +145,20 @@ def _with_instructions(messages: list[Message], tools: list[ToolSpec]) -> list[M
 
 
 def _parse_calls(text: str, *, cap: int) -> list[ToolCall] | None:
-    """Parse tool calls out of one fresh completion's text, or return None
-    if it doesn't contain a well-formed call envelope (the caller then
-    treats the completion as a plain text reply).
+    """Parse tool calls out of one fresh completion's text.
+
+    Three outcomes, and the difference between the last two is what keeps
+    machinery out of the user's chat:
+
+    - a non-empty list: the model asked for these calls;
+    - `None`: this was never a call envelope (prose, an unfenced
+      non-JSON reply, JSON of the wrong shape), so the completion is the
+      model's actual answer and the caller passes its text through;
+    - an empty list: this WAS a well-formed envelope, but it requested
+      nothing runnable (no entries, or every entry malformed). The model
+      was trying to call a tool and failed at it, so its text is JSON
+      bookkeeping rather than an answer -- the caller must reply with
+      something neutral instead of echoing it.
 
     Tolerates a `<think>...</think>` block (stripped first) and a single
     markdown code fence wrapping the JSON. Otherwise strict: the envelope
@@ -178,8 +195,9 @@ def _parse_calls(text: str, *, cap: int) -> list[ToolCall] | None:
             len(raw_calls),
             cap,
         )
+    considered = raw_calls[:cap]
     calls: list[ToolCall] = []
-    for item in raw_calls[:cap]:
+    for item in considered:
         if not isinstance(item, dict):
             logger.debug("prompted-tools: skipping non-object tool_calls entry: %r", item)
             continue
@@ -194,7 +212,23 @@ def _parse_calls(text: str, *, cap: int) -> list[ToolCall] | None:
         # models emit duplicate ids across calls, which corrupts
         # `_drop_dangling_tool_calls`'s tool_call_id pairing on replay.
         calls.append(ToolCall(id=f"call_{uuid.uuid4().hex[:24]}", name=name, args=args))
-    return calls or None
+    if not calls:
+        # WARNING, not debug: unlike the `return None` paths above -- which
+        # are the ordinary "the model answered in prose" case and happen on
+        # most turns -- this one means a turn produced neither an action nor
+        # an answer, and the user gets an apology for it. The raw envelope
+        # is logged here precisely because it is about to be withheld from
+        # the reply, so the operator can still see what the model emitted.
+        reason = (
+            "empty tool_calls list" if not considered else f"all {len(considered)} entries invalid"
+        )
+        logger.warning(
+            "prompted-tools: call envelope requested no runnable tool call (%s); "
+            "replying with neutral text instead of the envelope: %r",
+            reason,
+            candidate[:200],
+        )
+    return calls
 
 
 class PromptedToolsProvider:
@@ -244,6 +278,19 @@ class PromptedToolsProvider:
         if calls is None:
             logger.debug("prompted-tools: no call envelope parsed, returning plain text reply")
             return completion  # unparseable (or no call requested): plain text reply
+        if not calls:
+            # A well-formed envelope that asked for nothing runnable. Its
+            # text is the model's failed attempt at machinery, not an
+            # answer, so it is replaced rather than forwarded -- the reason
+            # was already logged at WARNING inside `_parse_calls`. Usage is
+            # carried through unchanged: the tokens were really spent, and
+            # the budget ledger must not lose them just because the reply
+            # was unusable.
+            return Completion(
+                message=Message(role="assistant", text=_DEGRADED_TEXT),
+                usage=completion.usage,
+                stop_reason="end",
+            )
         return Completion(
             message=Message(role="assistant", text="", tool_calls=calls),
             usage=completion.usage,
