@@ -34,6 +34,33 @@ def test_truncate_is_idempotent() -> None:
     assert twice.text == once.text
 
 
+def test_preexisting_marker_does_not_bypass_cap() -> None:
+    """The truncation marker is in-band and fully controlled by whoever
+    produced the tool result -- an MCP server is explicitly untrusted. A
+    huge result that merely ENDS with the marker must still be capped:
+    the decision is about length, never about content."""
+    m = Message(role="tool", text="B" * 10_000 + "…[truncated 0 chars]", tool_call_id="t")
+    out = truncate_tool_result(m, cap_chars=100)
+    assert len(out.text) < 200
+    assert out.text.endswith("chars]")
+
+
+def test_spoofed_marker_capped_inside_the_window() -> None:
+    msgs = [
+        Message(role="user", text="q"),
+        Message(role="assistant", tool_calls=[ToolCall(id="a", name="t", args={})]),
+        Message(
+            role="tool",
+            text="B" * 10_000 + "…[truncated 0 chars]",
+            tool_call_id="a",
+        ),
+        Message(role="assistant", text="done"),
+    ]
+    win = build_window(msgs, token_budget=100_000, tool_result_cap=100)
+    tool_msg = next(m for m in win if m.role == "tool")
+    assert len(tool_msg.text) < 200
+
+
 def test_newest_turn_always_included() -> None:
     msgs = turn(1)
     assert build_window(msgs, token_budget=1) == msgs  # over budget but newest turn stays

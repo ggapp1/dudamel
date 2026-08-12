@@ -13,6 +13,12 @@ from dataclasses import replace
 
 from dudamel.llm.types import Message
 
+# Suffix a previous truncation left behind. Recognised ONLY to avoid
+# stacking a second marker onto text this function already capped; it is
+# never trusted as evidence that the text is short (see
+# `truncate_tool_result`).
+_MARKER_RE = re.compile(r"…\[truncated \d+ chars\]$")
+
 
 def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
@@ -28,7 +34,14 @@ def message_tokens(m: Message) -> int:
 def truncate_tool_result(m: Message, cap_chars: int) -> Message:
     if m.role != "tool" or len(m.text) <= cap_chars:
         return m
-    if re.search(r"…\[truncated \d+ chars\]$", m.text):
+    marker = _MARKER_RE.search(m.text)
+    if marker is not None and len(m.text) - len(marker.group(0)) <= cap_chars:
+        # Text this function already capped: body within the cap, marker
+        # appended. Re-marking it would stack a second suffix every turn.
+        # The length test is what makes this safe -- the marker itself is
+        # in-band and attacker-controlled (an MCP tool result is untrusted
+        # input), so a multi-megabyte blob that merely ENDS with the marker
+        # falls through and gets capped like any other oversized result.
         return m
     dropped = len(m.text) - cap_chars
     return replace(m, text=m.text[:cap_chars] + f"…[truncated {dropped} chars]")
