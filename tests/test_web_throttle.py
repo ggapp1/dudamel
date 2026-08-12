@@ -57,6 +57,18 @@ def test_clients_are_bounded_by_lru_eviction() -> None:
     assert len(t._failures) <= MAX_TRACKED_CLIENTS
 
 
+def test_per_key_stamp_list_is_bounded() -> None:
+    """Recording far more failures than the limit within one window must not
+    grow a single key's stamp list without bound (the login endpoint gates on
+    is_throttled first, but the component must bound itself regardless)."""
+    t = FailedAuthThrottle(now=lambda: 1000.0)
+    for _ in range(10_000):
+        t.record_failure("1.2.3.4")
+    assert len(t._failures["1.2.3.4"]) <= MAX_FAILURES
+    assert t.is_throttled("1.2.3.4") is True
+    assert 0 < t.retry_after("1.2.3.4") <= int(WINDOW_SECONDS)
+
+
 def test_retry_after_is_positive_while_throttled() -> None:
     t = FailedAuthThrottle()
     for _ in range(MAX_FAILURES):

@@ -47,6 +47,14 @@ class FailedAuthThrottle:
     def record_failure(self, key: str) -> None:
         stamps = self._fresh(key)
         stamps.append(self._now())
+        # Bound the per-key list too, not just the client count. Reaching the
+        # limit is enough to throttle; beyond it, only the MAX_FAILURES most
+        # recent stamps matter (is_throttled compares against the count,
+        # retry_after against the oldest kept). Keeping every failure would let
+        # a client that bypasses the is_throttled gate grow one list without
+        # bound within a single window.
+        if len(stamps) > MAX_FAILURES:
+            del stamps[:-MAX_FAILURES]
         self._failures[key] = stamps
         self._failures.move_to_end(key)
         while len(self._failures) > MAX_TRACKED_CLIENTS:
