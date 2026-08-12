@@ -324,6 +324,17 @@ calling the model again. A summarization failure (including a budget
 error) is logged and the turn proceeds with the uncompacted window; it
 never fails the turn.
 
+**Cost**: each summarizer call condenses the whole dropped span from
+scratch, not "the previous summary plus the new turns". Once a
+conversation has outgrown its budget the span grows every turn, so
+compaction adds one model call per turn whose prompt grows with the span:
+measured on a simulated steady state, roughly 2k characters of prompt by
+turn 10 and 16k by turn 60 with small tool results, and ~66k and ~479k
+respectively when tool results run at the full `tool_result_cap`. The
+200-message horizon bounds the worst case near 1.6 MB (~400k tokens),
+which can exceed a provider's context limit — that failure is logged and
+the turn proceeds uncompacted, like any other summarizer failure.
+
 A summarized turn's taint (whether it saw output from a less-trusted MCP
 tool) is computed from the summarized rows' own provenance, never from the
 summarizer's output, and is carried forward: a new turn seeds its taint

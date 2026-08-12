@@ -13,6 +13,23 @@ Scope: `ConversationStore.recent()` (convo.py) reads at most the newest 200
 messages per conversation. `Compactor` only ever sees, and only ever
 covers, that same window -- anything older than the 200-message horizon is
 gone regardless of compaction.
+
+Known cost: each summarizer call re-reads the WHOLE dropped span from
+scratch (`history[:dropped]` verbatim, never "previous summary plus the
+new turns"). The reuse check below only skips the call while the newest
+summary already covers the span, and in steady state the span grows every
+turn, so a conversation past its budget pays one summarizer call per turn
+whose prompt grows linearly with the span. Measured on a simulated steady
+state (three messages per turn, one of them a tool result, the newest two
+turns kept): with 200-char tool results the prompt is ~2.2k chars at turn
+10 and ~15.8k at turn 60; with results at the 8192-char `tool_result_cap`
+it is ~66k chars (~17k tokens) at turn 10 and ~479k chars (~120k tokens)
+at turn 60, and the 200-message horizon caps the worst case near 1.6 MB
+(~400k tokens) -- large enough that the summarizer call itself can fail
+against a provider's context limit, which fails open (logged, turn
+proceeds uncompacted). Accepted for now: feeding the prior summary back in
+would trade this for summary-of-summary drift and a taint flag no longer
+derived purely from the rows it covers.
 """
 
 from __future__ import annotations
