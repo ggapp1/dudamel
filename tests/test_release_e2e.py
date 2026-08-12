@@ -29,16 +29,22 @@ from dudamel.serve import serve
 REPO_ROOT = Path(__file__).parent.parent
 
 # Runs INSIDE the scaffolded project's resolved environment and prints the
-# version plus a digest over the installed `dudamel` package's own `.py`
-# files. Kept in lockstep with `_wheel_payload_digest` below, which computes
-# the same digest over the wheel this test built -- equal digests mean the
-# files under test are the ones this checkout produced.
+# installed version plus a digest over every file shipped in the `dudamel`
+# package -- modules AND package data (templates, static assets), since a
+# release can differ in either. `__pycache__` is skipped: it is generated
+# after install, so it is not part of what the wheel shipped. Kept in
+# lockstep with `_wheel_payload_digest` below, which computes the same
+# digest over the wheel this test built -- equal digests mean the files
+# under test are the ones this checkout produced.
 _ORIGIN_PROBE = """
 import hashlib, importlib.metadata as md, pathlib
 d = md.distribution("dudamel")
 root = pathlib.Path(str(d.locate_file("dudamel")))
+paths = sorted(
+    p for p in root.rglob("*") if p.is_file() and "__pycache__" not in p.relative_to(root).parts
+)
 h = hashlib.sha256()
-for p in sorted(root.rglob("*.py")):
+for p in paths:
     h.update(p.relative_to(root).as_posix().encode())
     h.update(hashlib.sha256(p.read_bytes()).digest())
 print(d.version, h.hexdigest())
@@ -49,7 +55,7 @@ def _wheel_payload_digest(wheel: Path) -> str:
     """The `_ORIGIN_PROBE` digest, computed over a built wheel's contents."""
     h = hashlib.sha256()
     with zipfile.ZipFile(wheel) as z:
-        names = sorted(n for n in z.namelist() if n.startswith("dudamel/") and n.endswith(".py"))
+        names = sorted(n for n in z.namelist() if n.startswith("dudamel/") and not n.endswith("/"))
         for name in names:
             h.update(name[len("dudamel/") :].encode())
             h.update(hashlib.sha256(z.read(name)).digest())
@@ -152,7 +158,7 @@ def test_quickstart_runs_via_real_uv_run_subprocess_in_scaffolded_project(
     real index and the wheel built here, and if the index wins this test
     would validate the PUBLISHED package rather than the one being released.
     The final step below rules that out by CONTENT rather than by version:
-    it hashes the `.py` payload of the wheel built above and requires the
+    it hashes the shipped payload of the wheel built above and requires the
     installed distribution's files to hash identically. That is what a
     version comparison cannot do -- a working tree at the same version as
     the published release (the ordinary state between releases) resolves to
