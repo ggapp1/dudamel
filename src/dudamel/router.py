@@ -299,6 +299,7 @@ class Router:
         executed_any: bool,
         initial_taint: bool = False,
         resumed_offered_tools: list[str] | None = None,
+        resumed_called_tools: list[str] | None = None,
     ) -> ChatReply:
         # Seeded from the suspended turn's stored taint flag rather than
         # reset to False, so MCP-origin taint survives a confirm-gate
@@ -322,13 +323,19 @@ class Router:
         # summary eating window budget and causing more dropping next
         # iteration -- a feedback loop.
         turn_key = uuid.uuid4().hex
-        # Tools this call to _loop has itself invoked -- a tool the model
-        # just called must stay visible in later iterations for follow-up
-        # calls. Deliberately NOT seeded from pre-suspension calls on a
-        # resumed turn: the persisted `resumed_offered_tools` already covers
-        # the one iteration that must reproduce exactly what the model saw,
-        # and after that ranking resumes live.
-        called_tool_names: set[str] = set()
+        # Every tool this TURN has invoked, across a confirm-gate suspension
+        # -- a tool the model just called must stay visible in later
+        # iterations for follow-up calls, and a confirm gate splitting the
+        # turn into two calls into _loop must not reset that. The persisted
+        # `resumed_offered_tools` only pins the single iteration that has to
+        # reproduce exactly what the model saw; from the iteration after it,
+        # ranking resumes live, and without this seed a tool used before the
+        # suspension could then be ranked out from under the model mid-task
+        # (by a server that mounted while the user was deciding, say).
+        # Stale names -- a tool that vanished during the gap -- are harmless:
+        # `select_tool_subset` only ever intersects `must_keep` with the
+        # tools it was handed.
+        called_tool_names: set[str] = set(resumed_called_tools or ())
         # The "these tools were left out" WARN is a per-turn notice (as the
         # README describes it), not a per-model-call one: an iteration-heavy
         # turn would otherwise repeat the same line up to `iteration_cap`
@@ -479,6 +486,7 @@ class Router:
                     executed_any=executed_any,
                     turn_tainted=turn_tainted,
                     offered_tools=offered_names,
+                    called_tools=called_tool_names,
                 )
             await self._convo.append_many(conv_id, [msg, *outcome.results])
         return ChatReply(
@@ -664,6 +672,7 @@ class Router:
         executed_any: bool,
         turn_tainted: bool,
         offered_tools: list[str],
+        called_tools: set[str],
     ) -> ChatReply:
         call = outcome.pending_call
         assert call is not None
@@ -692,6 +701,12 @@ class Router:
                         # this call, so resume shows the identical set
                         # instead of re-ranking against a stale message.
                         "offered_tools": offered_tools,
+                        # Everything the turn had already called by the time
+                        # it suspended, so the iterations that re-rank after
+                        # the resume keep offering them (see
+                        # `called_tool_names` in _loop). Sorted only to keep
+                        # the stored JSON stable across runs.
+                        "called_tools": sorted(called_tools),
                     },
                     status="pending",
                     expires_at=_utcnow() + timedelta(seconds=self._config.confirm_ttl_seconds),
@@ -798,6 +813,12 @@ class Router:
             results_have_success = any(not d.get("is_error", False) for d in state["results"])
             initial_taint = state.get("turn_tainted", False)
             offered_tools = state.get("offered_tools")
+            # .get, not [...]: a confirmation written by an older build --
+            # one still pending across an upgrade -- has no such key, and
+            # resuming it must not blow up. Missing simply means the resumed
+            # half re-ranks from scratch, the behavior that key was added to
+            # improve on.
+            called_tools = state.get("called_tools")
             if expired:
                 await self._close_suspended_turn(row, note="declined (expired)")
                 await log_activity(
@@ -826,6 +847,7 @@ class Router:
                     executed_any=stored_executed_any or results_have_success,
                     initial_taint=initial_taint,
                     resumed_offered_tools=offered_tools,
+                    resumed_called_tools=called_tools,
                 )
             # approved: execute now, then resume. Order matters — the tool
             # result is produced before the assistant turn + prior results +
@@ -855,6 +877,7 @@ class Router:
                 executed_any=executed_any,
                 initial_taint=initial_taint,
                 resumed_offered_tools=offered_tools,
+                resumed_called_tools=called_tools,
             )
 
     async def _execute_confirmed(self, conv_id: int, call: ToolCall) -> Message:

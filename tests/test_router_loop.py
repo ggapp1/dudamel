@@ -628,6 +628,85 @@ async def test_resumed_turn_sees_the_same_subset_it_was_shown(tmp_path) -> None:
     await db.dispose()
 
 
+async def test_tools_called_before_a_confirm_resume_stay_offered_after_it(tmp_path) -> None:
+    """A confirm gate splits one turn across two calls into the loop. The
+    "a tool this turn already used stays visible" rule has to survive that
+    split: the model that resumes is mid-task, and losing the tool it was
+    working with -- to a newly mounted server that merely ranks higher --
+    strands it exactly where it needs a follow-up call.
+
+    Ranking here is hand-computed against the query "banana fetch":
+    mcp_used scores 1 (banana), mcp_alt 0, and mcp_new -- which only
+    appears during the suspension -- scores 2 (banana, fetch). With three
+    slots and two always-retained native tools, one slot is up for grabs,
+    so after the resume mcp_new outranks mcp_used for it.
+    """
+    app = App("gym", description="d")
+
+    @app.tool(confirm=True)
+    async def wipe_log(reason: str) -> str:
+        """Delete the whole workout log."""
+        return "wiped"
+
+    @app.tool(read_only=True)
+    async def status() -> str:
+        """Report status."""
+        return "ok"
+
+    registry = Registry([app])  # 2 native tools -- fits under max_tools=3 at construction
+
+    url = f"sqlite+aiosqlite:///{tmp_path}/reseed.db"
+    upgrade_core(url)
+    db = Database(url)
+    # One batch calling an mcp tool and the confirm-gated native tool, then
+    # (after the resume) a native call to force a further subsetting
+    # iteration, then the closing text.
+    batch = Completion(
+        message=Message(
+            role="assistant",
+            tool_calls=[
+                ToolCall(id="tc1", name="mcp_used", args={}),
+                ToolCall(id="tc2", name="wipe_log", args={"reason": "go"}),
+            ],
+        ),
+        usage=Usage(tokens_in=10, tokens_out=5),
+        stop_reason="tool_calls",
+    )
+    fp = FakeProvider([batch, fake_tool_call("status", {}), fake_text("all done")])
+    llm = LLMClient(
+        tiers={"standard": Tier(name="standard", provider=fp, model="f", max_tokens=64)},
+        db=db,
+        budget=BudgetConfig(),
+    )
+    router = Router(
+        llm=llm,
+        registry=registry,
+        convo=ConversationStore(db),
+        db=db,
+        config=RouterConfig(max_tools=3),
+    )
+    registry.tools["mcp_used"] = _mcp_tool("mcp_used", "banana zephyr log")
+    registry.tools["mcp_alt"] = _mcp_tool("mcp_alt", "quux irrelevant thing")
+    router.refresh_tool_specs()
+
+    r1 = await router.handle(channel="t:1", text="banana fetch", user_id="u1")
+    assert r1.pending_confirmation_id is not None
+    assert {s.name for s in fp.calls[0]["tools"]} == {"wipe_log", "status", "mcp_used"}
+
+    # A server mounts (or reconnects) while the user is deciding, bringing a
+    # tool that outranks the one the turn is already working with.
+    registry.tools["mcp_new"] = _mcp_tool("mcp_new", "banana fetch supreme")
+
+    r2 = await router.resolve_confirmation(r1.pending_confirmation_id, approved=True, user_id="u1")
+    assert r2.text == "all done"
+    # Iteration after the resume replays the persisted subset verbatim.
+    assert {s.name for s in fp.calls[1]["tools"]} == {"wipe_log", "status", "mcp_used"}
+    # The one after that re-ranks live -- and must still carry mcp_used,
+    # which this turn called before the confirm gate suspended it.
+    assert {s.name for s in fp.calls[2]["tools"]} == {"wipe_log", "status", "mcp_used"}
+    await db.dispose()
+
+
 async def test_vanished_tool_in_persisted_subset_is_skipped_not_fatal(tmp_path) -> None:
     """A server can drop a tool between suspension and resume; the resumed
     turn proceeds with the survivors instead of failing."""
