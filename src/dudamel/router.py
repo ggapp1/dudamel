@@ -536,6 +536,17 @@ class Router:
                     called_tools=called_tool_names,
                 )
             await self._convo.append_many(conv_id, [msg, *outcome.results])
+        # Same executed_any honesty as the budget and LLMError branches. It
+        # matters most on a RESUMED turn: a suspension on the last allowed
+        # iteration resumes with an empty iteration range, so an approved
+        # mutation runs and then falls straight through to here without a
+        # single model call -- the reply would otherwise deny all progress
+        # for an action the user explicitly approved.
+        if executed_any:
+            return ChatReply(
+                text="I completed the action(s), but ran out of steps to summarize them "
+                "— the request may be too complex; try narrowing it."
+            )
         return ChatReply(
             text="I couldn't finish within the step limit — the request may be "
             "too complex; try narrowing it."

@@ -230,7 +230,9 @@ async def test_iteration_cap(tmp_path) -> None:
     ]
     router, fp, db = make_router(tmp_path, script, RouterConfig(iteration_cap=2))
     reply = await router.handle(channel="t:1", text="x", user_id="u1")
-    assert "couldn't finish" in reply.text and len(fp.calls) == 2
+    # Every iteration ran the tool, so the cap message discloses that rather
+    # than reporting a bare failure (see the no-side-effects case below).
+    assert "ran out of steps" in reply.text and len(fp.calls) == 2
     await db.dispose()
 
 
@@ -1047,4 +1049,51 @@ async def test_budget_exhausted_before_any_action_reports_only_the_budget(tmp_pa
     router, fp, db = make_router(tmp_path, [fake_text("hi")], budget=BudgetConfig(daily_tokens=0))
     reply = await router.handle(channel="t:1", text="hi", user_id="u1")
     assert "budget" in reply.text and "completed the action" not in reply.text
+    await db.dispose()
+
+
+async def test_step_limit_with_no_side_effects_reports_only_the_limit(tmp_path) -> None:
+    """Nothing ran, so the step-limit reply must not claim otherwise."""
+    script = [fake_tool_call("ghost_tool", {}, id=f"i{n}") for n in range(4)]
+    router, fp, db = make_router(tmp_path, script, RouterConfig(iteration_cap=2))
+    reply = await router.handle(channel="t:1", text="x", user_id="u1")
+    assert "couldn't finish" in reply.text and "completed the action" not in reply.text
+    await db.dispose()
+
+
+async def test_resume_at_the_final_iteration_reports_the_approved_tool_ran(tmp_path) -> None:
+    """A turn that suspends on its LAST allowed iteration resumes with an
+    empty iteration range: zero model calls, straight to the step-limit
+    reply. The user spent an approval and the mutation landed, so denying
+    all progress is the same dishonesty executed_any exists to prevent."""
+    app = App("gym", description="d")
+
+    @app.tool(confirm=True)
+    async def wipe_log(reason: str) -> str:
+        """Delete the whole workout log."""
+        CALLS.append(f"wipe:{reason}")
+        return "wiped"
+
+    url = f"sqlite+aiosqlite:///{tmp_path}/last.db"
+    upgrade_core(url)
+    db = Database(url)
+    fp = FakeProvider([fake_tool_call("wipe_log", {"reason": "x"})])
+    llm = LLMClient(
+        tiers={"standard": Tier(name="standard", provider=fp, model="f", max_tokens=64)},
+        db=db,
+        budget=BudgetConfig(),
+    )
+    router = Router(
+        llm=llm,
+        registry=Registry([app]),
+        convo=ConversationStore(db),
+        db=db,
+        config=RouterConfig(iteration_cap=1),  # suspends at iteration 0 == cap - 1
+    )
+    r1 = await router.handle(channel="t:1", text="wipe it", user_id="u1")
+    assert r1.pending_confirmation_id is not None
+    r2 = await router.resolve_confirmation(r1.pending_confirmation_id, approved=True, user_id="u1")
+    assert CALLS == ["wipe:x"]  # the approved tool really ran
+    assert len(fp.calls) == 1  # and the resume made no model call at all
+    assert "completed the action" in r2.text
     await db.dispose()
