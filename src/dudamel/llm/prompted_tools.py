@@ -144,6 +144,23 @@ def _with_instructions(messages: list[Message], tools: list[ToolSpec]) -> list[M
     return [*messages, Message(role="system", text=instructions)]
 
 
+def _looks_like_started_envelope(text: str) -> bool:
+    """Whether this text is the beginning of a call envelope rather than an
+    answer.
+
+    Deliberately shallow: strip the think block and an unterminated opening
+    code fence, then ask whether what remains starts a JSON object. That is
+    all a truncated envelope leaves behind -- `json.loads` cannot help,
+    because the text was cut off mid-token. The caller only consults this
+    when `stop_reason` already says the emission was cut short, so a
+    complete reply that merely opens with `{` is never affected.
+    """
+    stripped = _THINK_RE.sub("", text).strip()
+    if stripped.startswith("```"):
+        stripped = stripped.split("\n", 1)[1].strip() if "\n" in stripped else ""
+    return stripped.startswith("{")
+
+
 def _parse_calls(text: str, *, cap: int) -> list[ToolCall] | None:
     """Parse tool calls out of one fresh completion's text.
 
@@ -276,6 +293,27 @@ class PromptedToolsProvider:
         # contain a well-formed-looking call envelope rendered from history.
         calls = _parse_calls(completion.message.text, cap=_MAX_CALLS)
         if calls is None:
+            if completion.stop_reason == "max_tokens" and _looks_like_started_envelope(
+                completion.message.text
+            ):
+                # An envelope the tier's max_tokens cut in half parses as
+                # nothing, which would otherwise class it as "the model's
+                # actual answer" and put half a JSON object in the user's
+                # chat -- and in history, where the next turn re-reads it.
+                # This is the same failure `_DEGRADED_TEXT` exists for; the
+                # only difference is that the model ran out of room rather
+                # than out of sense. WARNING (like the empty-envelope path)
+                # with the fragment, because it is about to be withheld.
+                logger.warning(
+                    "prompted-tools: call envelope truncated at max_tokens; replying with "
+                    "neutral text instead of the fragment: %r",
+                    completion.message.text[:200],
+                )
+                return Completion(
+                    message=Message(role="assistant", text=_DEGRADED_TEXT),
+                    usage=completion.usage,
+                    stop_reason=completion.stop_reason,
+                )
             logger.debug("prompted-tools: no call envelope parsed, returning plain text reply")
             return completion  # unparseable (or no call requested): plain text reply
         if not calls:
