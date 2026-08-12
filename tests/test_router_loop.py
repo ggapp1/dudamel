@@ -3,6 +3,7 @@ import logging
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 
 from dudamel import App
 from dudamel.compaction import Compactor
@@ -997,4 +998,27 @@ async def test_compaction_recompute_gap_still_taints(tmp_path) -> None:
     # confirm-gated.
     assert reply.pending_confirmation_id is not None
     assert CALLS == []  # log_workout did not run
+    await db.dispose()
+
+
+async def test_activity_log_failure_after_a_successful_tool_does_not_kill_the_turn(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """A DB hiccup writing the activity row lands AFTER the side effect: the
+    tool already ran, so raising there would leave no assistant/tool messages
+    in history and invite the model to run the mutation again next turn. The
+    turn must complete and report the tool's real outcome."""
+    script = [fake_tool_call("log_workout", {"exercise": "bench", "reps": 5}), fake_text("Done!")]
+    router, fp, db = make_router(tmp_path, script)
+
+    async def boom(*a, **k):
+        raise OperationalError("INSERT INTO activity", {}, Exception("database is locked"))
+
+    monkeypatch.setattr("dudamel.router.log_activity", boom)
+    with caplog.at_level(logging.WARNING, logger="dudamel.router"):
+        reply = await router.handle(channel="t:1", text="log it", user_id="u1")
+    assert reply.text == "Done!" and CALLS == ["log:bench:5"]
+    tool_msgs = [m for m in fp.calls[1]["messages"] if m.role == "tool"]
+    assert tool_msgs and "logged bench x5" in tool_msgs[0].text and not tool_msgs[0].is_error
+    assert any("activity" in r.message.lower() for r in caplog.records)
     await db.dispose()

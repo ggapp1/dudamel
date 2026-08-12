@@ -2,6 +2,7 @@ from datetime import timedelta
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 
 from dudamel import App
 from dudamel.config import BudgetConfig, RouterConfig
@@ -467,3 +468,25 @@ def test_unconfirmed_tool_error_message_does_not_announce_an_unknown_outcome_as_
     # Every other tool error keeps the wording it has always had.
     ordinary = _tool_error_text("wipe_log", RuntimeError("disk is on fire"))
     assert ordinary == "tool wipe_log raised RuntimeError: disk is on fire"
+
+
+async def test_activity_log_failure_after_a_confirmed_tool_does_not_strand_the_turn(
+    tmp_path, monkeypatch
+) -> None:
+    """Same shield on the confirm path: the approved tool has already run and
+    the confirmation row is already 'confirmed' (unrecoverable), so a DB
+    hiccup logging the activity row must not leave the suspended turn's
+    messages unpersisted and the user without a reply."""
+    script = [fake_tool_call("wipe_log", {"reason": "x"}), fake_text("All wiped!")]
+    router, fp, db, convo, _ = build(tmp_path, script)
+    r1 = await router.handle(channel="t:1", text="wipe", user_id="u1")
+
+    async def boom(*a, **k):
+        raise OperationalError("INSERT INTO activity", {}, Exception("database is locked"))
+
+    monkeypatch.setattr("dudamel.router.log_activity", boom)
+    r2 = await router.resolve_confirmation(r1.pending_confirmation_id, approved=True, user_id="u1")
+    assert r2.text == "All wiped!" and DELETED == ["x"]
+    cid = await convo.get_or_create("t:1")
+    assert [m.role for m in await convo.recent(cid)] == ["user", "assistant", "tool", "assistant"]
+    await db.dispose()

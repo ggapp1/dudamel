@@ -11,6 +11,7 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from sqlalchemy import select
 
@@ -262,6 +263,42 @@ class Router:
             )
 
     # -- internals ------------------------------------------------------------
+    async def _log_activity(
+        self,
+        *,
+        tool: str,
+        args: dict[str, Any],
+        status: str,
+        result_preview: str | None = None,
+        conversation_id: int | None = None,
+    ) -> None:
+        """Write an activity row, never letting the write itself break a turn.
+
+        Every call site here sits AFTER a tool has been dispatched -- often
+        after a mutation has already landed. Letting a DB hiccup ("database
+        is locked") propagate would abandon the turn between the side effect
+        and the persistence of its assistant/tool messages: the mutation
+        happened, history shows nothing, and next turn the model plausibly
+        runs it again. Losing an audit row is the far smaller loss, so it is
+        logged and the turn continues -- the same trade `LLMClient.complete`
+        already makes for its usage row.
+
+        Broad on purpose: bookkeeping must not be able to destroy a turn for
+        ANY reason, not just the OperationalError we can name today.
+        `BaseException` (cancellation) still propagates.
+        """
+        try:
+            await log_activity(
+                self._db,
+                tool=tool,
+                args=args,
+                status=status,
+                result_preview=result_preview,
+                conversation_id=conversation_id,
+            )
+        except Exception as e:  # noqa: BLE001 — bookkeeping must never kill a turn
+            logger.warning("failed to record activity row for tool %s: %s", tool, e)
+
     async def _lock_for(self, conv_id: int) -> asyncio.Lock:
         async with self._locks_guard:
             if conv_id not in self._locks:
@@ -596,8 +633,7 @@ class Router:
             try:
                 kwargs = tool.schema.validate(call.args)
             except ToolValidationError as e:
-                await log_activity(
-                    self._db,
+                await self._log_activity(
                     tool=call.name,
                     args=call.args,
                     status="error",
@@ -612,8 +648,7 @@ class Router:
                 result = await asyncio.wait_for(tool.fn(**kwargs), tool.timeout)
             except TimeoutError:
                 detail = f"tool {call.name} timed out after {tool.timeout}s"
-                await log_activity(
-                    self._db,
+                await self._log_activity(
                     tool=call.name,
                     args=call.args,
                     status="error",
@@ -626,8 +661,7 @@ class Router:
                 )
             except Exception as e:  # tool bugs must not kill the conversation
                 detail = _tool_error_text(call.name, e)
-                await log_activity(
-                    self._db,
+                await self._log_activity(
                     tool=call.name,
                     args=call.args,
                     status="error",
@@ -639,8 +673,7 @@ class Router:
                     self._config.tool_result_cap,
                 )
             text = result if isinstance(result, str) else json.dumps(json_safe(result))
-            await log_activity(
-                self._db,
+            await self._log_activity(
                 tool=call.name,
                 args=call.args,
                 status="ok",
@@ -765,8 +798,7 @@ class Router:
                 row.status = "expired" if row.expires_at < _utcnow() else "declined"
         for row in rows:
             await self._close_suspended_turn(row, note="declined (superseded)")
-            await log_activity(
-                self._db,
+            await self._log_activity(
                 tool=row.tool,
                 args=row.args,
                 status=row.status,
@@ -844,8 +876,7 @@ class Router:
             called_tools = state.get("called_tools")
             if expired:
                 await self._close_suspended_turn(row, note="declined (expired)")
-                await log_activity(
-                    self._db,
+                await self._log_activity(
                     tool=row.tool,
                     args=row.args,
                     status="declined",
@@ -855,8 +886,7 @@ class Router:
                 return ChatReply(text="That confirmation expired; nothing was done.")
             if not approved:
                 await self._close_suspended_turn(row, note="declined by user")
-                await log_activity(
-                    self._db,
+                await self._log_activity(
                     tool=row.tool,
                     args=row.args,
                     status="declined",
@@ -930,8 +960,7 @@ class Router:
             result = await asyncio.wait_for(tool.fn(**kwargs), tool.timeout)
         except Exception as e:  # noqa: BLE001 — surfaced to the model, never fatal
             detail = _confirmed_error_text(call.name, e)
-            await log_activity(
-                self._db,
+            await self._log_activity(
                 tool=call.name,
                 args=call.args,
                 status="error",
@@ -943,8 +972,7 @@ class Router:
                 self._config.tool_result_cap,
             )
         text = result if isinstance(result, str) else json.dumps(json_safe(result))
-        await log_activity(
-            self._db,
+        await self._log_activity(
             tool=call.name,
             args=call.args,
             status="confirmed",
