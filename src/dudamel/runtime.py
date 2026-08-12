@@ -8,6 +8,7 @@ import json
 import logging
 import os
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select
@@ -127,11 +128,12 @@ class Runtime:
                 name=name, provider=provider, model=cfg.model, max_tokens=cfg.max_tokens
             )
         for name in overrides:
-            if name not in tiers:  # override for a tier absent from config
-                cfg = self._settings.llm_tiers.get(name)
-                model = cfg.model if cfg else "override"
+            if name not in tiers:
+                # An override for a tier absent from config -- `tiers` already
+                # holds every configured tier, so there is no config-backed
+                # model to read here; the name exists only as an override.
                 tiers[name] = Tier(
-                    name=name, provider=overrides[name], model=model, max_tokens=1024
+                    name=name, provider=overrides[name], model="override", max_tokens=1024
                 )
         return tiers
 
@@ -239,12 +241,31 @@ class Runtime:
             confirmation_id, approved=approved, user_id=user_id
         )
 
-    async def list_pending_confirmations(self, channel: str | None = None) -> list[dict[str, Any]]:
+    async def list_pending_confirmations(
+        self, channel: str | None = None, *, include_expired: bool = True
+    ) -> list[dict[str, Any]]:
+        """Pending confirmations, newest last. Confirmations expire lazily --
+        the router only flips a past-TTL row to "expired" when the conversation
+        is next touched (router.py) -- so a row can sit at status="pending"
+        indefinitely after its `expires_at`.
+
+        `include_expired=False` filters those out, for callers that must not
+        present a dead confirmation as actionable (the dashboard chat page's
+        approve/deny buttons -- clicking an expired one only yields "that
+        confirmation expired; nothing was done"). `/api/pending` keeps the
+        default True: it lists expired entries deliberately and marks them
+        `resolvable=False` for its external cross-channel consumers.
+        """
         stmt = (
             select(PendingConfirmation, Conversation.channel)
             .join(Conversation, Conversation.id == PendingConfirmation.conversation_id)
             .where(PendingConfirmation.status == "pending")
         )
+        if not include_expired:
+            # Boundary matches /api/pending's `resolvable` (expires_at >= now):
+            # a row exactly at `now` is still live.
+            now = datetime.now(UTC).replace(tzinfo=None)
+            stmt = stmt.where(PendingConfirmation.expires_at >= now)
         if channel is not None:
             stmt = stmt.where(Conversation.channel == channel)
         stmt = stmt.order_by(PendingConfirmation.created_at)
