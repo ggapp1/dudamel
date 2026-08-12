@@ -347,6 +347,21 @@ async def test_stranger_gets_id_reply_once_then_silence_within_hour(
     await rt.stop()
 
 
+async def test_stranger_reply_dict_is_bounded_under_flood(
+    tmp_path: Path, token_env: str
+) -> None:
+    """A flood of distinct strangers within the cooldown window must not grow
+    the tracking dict without bound: age-based pruning alone can't shrink it
+    (every entry is fresh), so LRU eviction has to cap it."""
+    from dudamel.interfaces.telegram import _MAX_STRANGER_ENTRIES
+
+    rt, interface = await build(tmp_path, [])
+    for uid in range(_MAX_STRANGER_ENTRIES + 500):
+        interface._rate_limited_stranger(uid)
+    assert len(interface._last_stranger_reply) <= _MAX_STRANGER_ENTRIES
+    await rt.stop()
+
+
 # --- group rejection ---------------------------------------------------------------
 
 
@@ -684,9 +699,15 @@ async def test_error_handler_logs_handler_exceptions(
         error = RuntimeError("boom")
 
     await interface._on_error(None, _StubContext())  # type: ignore[arg-type]
-    assert any(
-        "telegram handler error" in r.message and "boom" in r.message for r in caplog.records
-    )
+    matching = [
+        r
+        for r in caplog.records
+        if "telegram handler error" in r.message and "boom" in r.message
+    ]
+    assert matching
+    # The traceback must be attached (exc_info), not just the str(exc) --
+    # a bare message hides where the failure came from.
+    assert any(r.exc_info is not None for r in matching)
     await rt.stop()
 
 
