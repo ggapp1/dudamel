@@ -68,13 +68,34 @@ class ConversationStore:
                     )
                 )
         except IntegrityError:
-            # Lost a race with a concurrent append carrying the same
-            # (conversation_id, client_msg_id): the DB-level unique index
+            # An IntegrityError here MIGHT be the dedupe backstop: we lost a
+            # race with a concurrent append carrying the same
+            # (conversation_id, client_msg_id) and the DB-level unique index
             # (see migration 0003) rejected our insert on commit. The
-            # pre-check above is a fast path, not a guarantee -- this is
-            # the backstop that makes dedupe airtight under races.
+            # pre-check above is a fast path, not a guarantee.
+            #
+            # But it might equally be a foreign-key violation or any future
+            # constraint, and reporting THAT as "duplicate" drops the message
+            # in silence -- callers ignore this return value. So confirm the
+            # duplicate actually exists before claiming one; anything else
+            # propagates, as it already does from `append_many`.
+            if client_msg_id is None or not await self._has_client_msg_id(
+                conversation_id, client_msg_id
+            ):
+                raise
             return False
         return True
+
+    async def _has_client_msg_id(self, conversation_id: int, client_msg_id: str) -> bool:
+        async with self._db.session() as s:
+            return (
+                await s.execute(
+                    select(MessageRow.id).where(
+                        MessageRow.conversation_id == conversation_id,
+                        MessageRow.client_msg_id == client_msg_id,
+                    )
+                )
+            ).first() is not None
 
     async def append_many(self, conversation_id: int, messages: list[Message]) -> None:
         """Append several messages in ONE transaction.
