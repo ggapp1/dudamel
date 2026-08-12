@@ -507,13 +507,20 @@ async def test_reconnect_attempts_counts_real_connection_attempts(
 
         monkeypatch.setattr(server, "_connect", counting_connect)
 
-        # A burst that fails outright: every attempt is spent and counted.
+        # Coalesced: five simultaneously-failing calls, one connection built.
+        await _kill_and_wait(await _wait_for_pid(f"flaky_copy.py {name}"))
+        await asyncio.gather(*(echo.fn(text=f"c{i}") for i in range(5)))
+        assert server.reconnect_attempts == 1
+        assert connects == 1
+
+        # Exhausted: a burst against a server that cannot come back spends
+        # every attempt, and each one is a connection actually built.
         script.write_text("import sys\n\nsys.exit(1)\n")
         await _kill_and_wait(await _wait_for_pid(f"flaky_copy.py {name}"))
         with pytest.raises(RuntimeError):
             await echo.fn(text="down")
         spent = server.reconnect_attempts
-        assert spent == server.max_reconnect_attempts
+        assert spent == 1 + server.max_reconnect_attempts
         assert connects == spent
     finally:
         await mount.close()
@@ -550,10 +557,10 @@ async def test_configured_backoff_and_cooldown_replace_the_module_defaults(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The other two configured values, measured against a stubbed bring-up so
-    the assertions are about the budget arithmetic alone. A configured value
-    wins over the module constant; what is NOT configured still falls back to
-    it (the autouse fixture's zeroed backoff is what the second burst below
-    would otherwise pay)."""
+    the assertions are about the budget arithmetic alone. The configured
+    backoff wins over the module constant -- which this module's autouse
+    fixture has zeroed, so a delay of 0.25 can only have come from the
+    configured value."""
     delays: list[float] = []
 
     async def fake_sleep(seconds: float, *args: Any, **kwargs: Any) -> Any:
