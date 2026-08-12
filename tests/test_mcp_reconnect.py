@@ -483,10 +483,10 @@ async def test_reconnect_attempts_counts_real_connection_attempts(
     it is pinned against the connections actually built: `_connect` is what
     performs one, and the counter must agree with how many times it ran.
 
-    Both directions matter. Counting a coalesced caller that did no work would
-    over-report; missing an attempt made through `_submit`'s resubmit (which
-    re-issues a request the supervisor lost *without* running it, so it is one
-    attempt and not two) would under-report.
+    Two shapes are checked: a burst of simultaneous failures coalesced into a
+    single connection (counting each caller would over-report), and a burst
+    against a server that cannot come back, where every attempt spent is a
+    connection actually built.
     """
     name = "counts-real"
     script = tmp_path / "flaky_copy.py"
