@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from dudamel import Orchestrator, Runtime
+from dudamel import Orchestrator, Runtime, mcp_mount
 from dudamel.config import McpConfig, RouterConfig, Settings, TierConfig
 from dudamel.llm.testing import FakeProvider, fake_text
 from dudamel.mcp_mount import MCPMount, MCPServerConfig
@@ -85,6 +85,43 @@ async def test_unreachable_url_yields_no_tools_and_never_raises(
     assert any(
         "failed to mount" in r.message and "127.0.0.1:9" in r.message for r in caplog.records
     )
+
+
+async def test_headers_reach_the_http_client_and_never_the_logs(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The auth path, end to end at the seam that matters: `headers` exists so
+    a bare URL can reach an authenticated server, and the only thing that makes
+    that work is `create_mcp_http_client(headers=...)` receiving the dict
+    unchanged. The same secret must never come back out in a log line -- the
+    URL is unreachable here, so the mount-failure warning fires and pins the
+    redaction for the HTTP transport specifically.
+    """
+    headers = {"Authorization": "Bearer sk-secret-789", "X-Tenant": "acme"}
+    captured: list[dict[str, str] | None] = []
+    real_client = mcp_mount.create_mcp_http_client
+
+    def capturing_client(*args: object, **kwargs: object) -> object:
+        captured.append(kwargs.get("headers"))  # type: ignore[arg-type]
+        return real_client(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(mcp_mount, "create_mcp_http_client", capturing_client)
+    # Port 9 (discard) refuses, so the mount degrades -- after the transport
+    # has already been built with these headers.
+    mount = MCPMount([MCPServerConfig(url="http://127.0.0.1:9/mcp", headers=headers)])
+    tools = await mount.mount()
+    await mount.close()
+    assert tools == []
+    assert captured == [headers]
+    # Verbatim: the same pairs, not a re-cased or filtered copy.
+    assert captured[0] is not None and dict(captured[0]) == headers
+    assert not any("sk-secret-789" in r.message for r in caplog.records)
+    assert not any("Authorization" in r.message for r in caplog.records)
+    assert any(
+        "failed to mount" in r.message and "127.0.0.1:9" in r.message for r in caplog.records
+    )
+    labelled = MCPServerConfig(url="http://127.0.0.1:9/mcp", headers=headers)
+    assert "sk-secret-789" not in labelled.label
 
 
 async def test_empty_string_entry_degrades_instead_of_crashing_construction(
