@@ -251,11 +251,21 @@ def create_api(runtime: Runtime, settings: Settings) -> FastAPI:
         resolve_confirmation flips the row to "expired" and reports nothing
         was done instead of applying approve/decline, even for a matching
         user_id). It marks the entries this caller can actually act on right
-        now, so the dashboard can show the rest as read-only instead of
-        offering a button that will always be refused or silently no-op.
+        now, so a client can show the rest as read-only instead of offering a
+        button that will always be refused or silently no-op.
         The third ground resolve_confirmation checks, status != "pending",
         never applies here: this list is already filtered to status ==
         "pending".
+
+        The flag is deliberately API-only: it exists for an external consumer
+        of this unscoped, cross-channel endpoint (which surfaces other
+        channels' confirmations, e.g. Telegram's, whose user_id is never
+        "web" and so are not resolvable from here). The bundled HTML dashboard
+        does not consume it -- its /chat page renders straight from
+        `list_pending_confirmations("web:default")`, and every confirmation on
+        that channel has user_id == "web" and a live TTL, so `resolvable`
+        would be unconditionally True there. Wiring it into that view would be
+        dead logic, not a real consumer.
         """
         now = _utcnow()
         entries = await runtime.list_pending_confirmations(channel)
