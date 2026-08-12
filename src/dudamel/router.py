@@ -427,12 +427,17 @@ class Router:
         subset_warned = False
         for iteration in range(start_iteration, self._config.iteration_cap):
             history = await self._convo.recent(conv_id)
-            window_body = build_window(
+            built = build_window(
                 history,
                 token_budget=self._config.window_tokens,
                 tool_result_cap=self._config.tool_result_cap,
             )
-            dropped = len(history) - len(window_body)
+            # `dropped` comes from the build, never from a length
+            # difference: the crash-window sanitizer removes messages from
+            # inside the kept span too, and counting those as dropped
+            # history would make the compactor summarize -- and permanently
+            # watermark as covered -- messages the window still shows.
+            window_body, dropped = built.messages, built.dropped
             summary_message = None
             if self._compactor is not None and dropped > 0:
                 dropped_tainted = self._dropped_tainted(history[:dropped])
@@ -478,12 +483,12 @@ class Router:
                     remaining_budget = max(
                         self._config.window_tokens - estimate_tokens(summary_message.text), 0
                     )
-                    window_body = build_window(
+                    rebuilt = build_window(
                         history,
                         token_budget=remaining_budget,
                         tool_result_cap=self._config.tool_result_cap,
                     )
-                    dropped = len(history) - len(window_body)
+                    window_body, dropped = rebuilt.messages, rebuilt.dropped
                     if self._config.taint_mode != "off":
                         turn_tainted = turn_tainted or self._dropped_tainted(history[:dropped])
             window = [self._system_message()]
