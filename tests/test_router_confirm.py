@@ -13,7 +13,7 @@ from dudamel.llm.client import LLMClient, Tier
 from dudamel.llm.testing import FakeProvider, fake_text, fake_tool_call
 from dudamel.llm.types import Completion, Message, ToolCall, Usage
 from dudamel.migrate import upgrade_core
-from dudamel.models_core import PendingConfirmation
+from dudamel.models_core import Activity, PendingConfirmation
 from dudamel.registry import Registry
 from dudamel.router import ChatReply, Router, _confirmed_error_text, _tool_error_text, _utcnow
 
@@ -489,4 +489,26 @@ async def test_activity_log_failure_after_a_confirmed_tool_does_not_strand_the_t
     assert r2.text == "All wiped!" and DELETED == ["x"]
     cid = await convo.get_or_create("t:1")
     assert [m.role for m in await convo.recent(cid)] == ["user", "assistant", "tool", "assistant"]
+    await db.dispose()
+
+
+async def test_both_expiry_paths_log_the_same_activity_status(tmp_path) -> None:
+    """One real-world event — a confirmation that timed out — must land under
+    one status whichever code path notices it: the lazy check inside
+    resolve_confirmation (a late click) or the sweep on the next user message.
+    Otherwise an operator querying status='expired' sees only half of them."""
+    router, fp, db, convo, _ = build(
+        tmp_path, [fake_tool_call("wipe_log", {"reason": "a"}), fake_text("hi")]
+    )
+    r1 = await router.handle(channel="t:1", text="wipe", user_id="u1")
+    async with db.session() as s:
+        row = (await s.execute(select(PendingConfirmation))).scalar_one()
+        row.expires_at = _utcnow() - timedelta(seconds=1)
+    await router.resolve_confirmation(r1.pending_confirmation_id, approved=True, user_id="u1")
+
+    async with db.session() as s:
+        conf_row = (await s.execute(select(PendingConfirmation))).scalar_one()
+        acts = (await s.execute(select(Activity))).scalars().all()
+    assert conf_row.status == "expired"
+    assert [a.status for a in acts] == ["expired"]  # not "declined"
     await db.dispose()

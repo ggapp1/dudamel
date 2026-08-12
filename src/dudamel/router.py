@@ -900,7 +900,13 @@ class Router:
                 await self._log_activity(
                     tool=row.tool,
                     args=row.args,
-                    status="declined",
+                    # row.status, not a literal "declined": `_auto_decline_pending`
+                    # logs the same event under the confirmation's own status, and
+                    # an expiry noticed by a late click is the same event as one
+                    # swept by the next user message. Logging it under two
+                    # different statuses hides half of them from an operator
+                    # querying the activity table.
+                    status=row.status,
                     result_preview="expired",
                     conversation_id=row.conversation_id,
                 )
