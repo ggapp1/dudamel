@@ -309,7 +309,11 @@ class Router:
                 conversation_id=conversation_id,
             )
         except Exception as e:  # noqa: BLE001 — bookkeeping must never kill a turn
-            logger.warning("failed to record activity row for tool %s: %s", tool, e)
+            # With the traceback: the catch is broad, so what lands here may
+            # be a genuine bug (a json_safe or model defect) rather than the
+            # DB hiccup this shield was written for, and that bug's only
+            # remaining trace is this line.
+            logger.warning("failed to record activity row for tool %s: %s", tool, e, exc_info=True)
 
     @asynccontextmanager
     async def _conversation_lock(self, conv_id: int) -> AsyncIterator[None]:

@@ -1024,7 +1024,10 @@ async def test_activity_log_failure_after_a_successful_tool_does_not_kill_the_tu
     assert reply.text == "Done!" and CALLS == ["log:bench:5"]
     tool_msgs = [m for m in fp.calls[1]["messages"] if m.role == "tool"]
     assert tool_msgs and "logged bench x5" in tool_msgs[0].text and not tool_msgs[0].is_error
-    assert any("activity" in r.message.lower() for r in caplog.records)
+    # Logged WITH the traceback: the shield catches broadly, so what it
+    # swallows may be a real bug and this record is its only trace.
+    failures = [r for r in caplog.records if "activity" in r.message.lower()]
+    assert failures and all(r.exc_info is not None for r in failures)
     await db.dispose()
 
 
