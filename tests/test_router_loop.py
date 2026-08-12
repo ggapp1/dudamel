@@ -360,13 +360,38 @@ def test_native_tools_are_never_dropped_by_subsetting() -> None:
 
 
 def test_select_tool_subset_ranks_by_overlap_then_name() -> None:
+    """Overlap decides who gets a slot; the name is only the tie-break.
+
+    Hand-computed against the query tokens {citrus, harvest, schedule},
+    scoring each tool's own name + description:
+
+        mcp_gamma  citrus harvest schedule planner  -> 3
+        mcp_beta   citrus only                      -> 1
+        mcp_delta  citrus mentioned once            -> 1
+        mcp_alpha  zephyr unrelated content         -> 0
+
+    Ranked, that is gamma, beta, delta, alpha -- beta ahead of delta purely
+    on name, gamma ahead of both on score. The alphabetical order is a
+    different one (alpha, beta, delta, gamma), so taking the top three by
+    rank keeps gamma and drops alpha, while taking the top three by name
+    would do the exact opposite. The two orders cannot be confused here.
+    """
     tools = {
-        "mcp_low": _mcp_tool("mcp_low", "zephyr unrelated content"),
-        "mcp_high": _mcp_tool("mcp_high", "banana banana query match"),
-        "mcp_mid": _mcp_tool("mcp_mid", "banana appears once here"),
+        "mcp_alpha": _mcp_tool("mcp_alpha", "zephyr unrelated content"),
+        "mcp_gamma": _mcp_tool("mcp_gamma", "citrus harvest schedule planner"),
+        "mcp_beta": _mcp_tool("mcp_beta", "citrus only"),
+        "mcp_delta": _mcp_tool("mcp_delta", "citrus mentioned once"),
     }
-    selected = select_tool_subset(tools, max_tools=2, query="banana banana", must_keep=set())
-    assert selected == ["mcp_high", "mcp_mid"]
+    selected = select_tool_subset(
+        tools, max_tools=3, query="citrus harvest schedule", must_keep=set()
+    )
+    # The return value is name-sorted for stability, so this asserts WHICH
+    # three the ranking chose, not the ranking's own order.
+    assert selected == ["mcp_beta", "mcp_delta", "mcp_gamma"]
+    # Two slots would cut at the tie: gamma on score, then beta on name.
+    assert select_tool_subset(
+        tools, max_tools=2, query="citrus harvest schedule", must_keep=set()
+    ) == ["mcp_beta", "mcp_gamma"]
 
 
 async def test_mcp_overflow_subsets_per_turn_instead_of_deleting(tmp_path, caplog) -> None:
