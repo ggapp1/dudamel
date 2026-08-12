@@ -47,10 +47,11 @@ from dudamel.migrate import (
     generate_app_migration,
     script_heads,
     sync_url,
-    upgrade_apps,
+    upgrade_all,
     upgrade_core,
 )
 from dudamel.orchestrator import Orchestrator
+from dudamel.resolve import resolve_apps
 from dudamel.runtime import build_provider
 from dudamel.serve import serve
 from dudamel.web.api import resolve_cookie_secure
@@ -230,7 +231,19 @@ def cmd_run(args: argparse.Namespace) -> int:
     _load_dotenv_into_environ(project_dir)
     settings = Settings.load(project_dir)
     orchestrator = _load_orchestrator(project_dir, args.module)
-    asyncio.run(serve(orchestrator, settings))
+    # strict: a misconfigured [apps.*] block must stop a real run rather than
+    # start an assistant that quietly lacks the app the operator asked for.
+    resolution = resolve_apps(orchestrator, settings, strict=True)
+    asyncio.run(
+        serve(
+            # Everything that resolved -- suite apps plus the project's own.
+            # `mcp` is carried over because it belongs to the project's
+            # orchestrator, not to any app.
+            Orchestrator(apps=resolution.apps, mcp=orchestrator.mcp),
+            settings,
+            suite_lanes=resolution.suite_lanes,
+        )
+    )
     return 0
 
 
@@ -241,10 +254,15 @@ def cmd_db_migrate(args: argparse.Namespace) -> int:
     project_dir = Path.cwd()
     settings = Settings.load(project_dir)
     orchestrator = _load_orchestrator(project_dir, _DEFAULT_MODULE)
+    resolution = resolve_apps(orchestrator, settings, strict=True)
     # Apply core migrations first to ensure schema is ready for app autogenerate
     upgrade_core(settings.database_url)
+    # LOCAL apps only. A suite app's revisions ship in the wheel, so its tables
+    # must never enter the project's own autogenerate diff: otherwise every
+    # user mints a private revision for shipped code, and the shipped lane's
+    # CREATE TABLE later collides with the table their own lane already made.
     path = generate_app_migration(
-        orchestrator,
+        Orchestrator(apps=resolution.local_apps),
         settings.database_url,
         args.message,
         project_dir,
@@ -252,8 +270,9 @@ def cmd_db_migrate(args: argparse.Namespace) -> int:
     )
     # Always bring the project db to head, whether or not this call produced
     # a new revision -- a previously-generated-but-unapplied migration file
-    # must not require a second `db migrate` invocation to take effect.
-    upgrade_apps(settings.database_url, project_dir)
+    # must not require a second `db migrate` invocation to take effect. Each
+    # enabled suite app's own lane goes up with it.
+    upgrade_all(settings.database_url, project_dir, resolution.suite_lanes)
     print(str(path) if path is not None else "no changes")
     return 0
 

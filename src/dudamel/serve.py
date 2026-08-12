@@ -74,7 +74,7 @@ import fcntl
 import logging
 import os
 import signal
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Sequence
 from pathlib import Path
 
 import uvicorn
@@ -226,6 +226,7 @@ async def serve(
     settings: Settings,
     *,
     providers: dict[str, Provider] | None = None,
+    suite_lanes: Sequence[tuple[str, Path]] = (),
 ) -> None:
     """Run dudamel as a single process until stopped (SIGTERM/SIGINT, or
     this coroutine's own task being cancelled — both shut down the same
@@ -237,11 +238,15 @@ async def serve(
     caller holding the same `settings` object can read it — after polling
     for it to become nonzero, since that happens only once this coroutine
     (typically run as a background task) actually gets to run.
+
+    `suite_lanes` is the `(app name, versions dir)` list from app resolution;
+    it is passed straight to `Runtime`, whose startup migration gate applies
+    and checks those lanes alongside the project's own.
     """
     lock = _InstanceLock(settings.data_dir / _LOCKFILE_NAME)
     lock.acquire()
     try:
-        runtime = Runtime(orchestrator, settings, providers=providers)
+        runtime = Runtime(orchestrator, settings, providers=providers, suite_lanes=suite_lanes)
         stop_event = asyncio.Event()
         loop = asyncio.get_running_loop()
         signals_installed = _install_signal_handlers(loop, stop_event)

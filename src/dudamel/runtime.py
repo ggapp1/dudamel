@@ -7,8 +7,9 @@ import asyncio
 import json
 import logging
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import select
@@ -25,7 +26,7 @@ from dudamel.llm.prompted_tools import PromptedToolsProvider
 from dudamel.llm.provider import Provider
 from dudamel.llm.types import Message
 from dudamel.mcp_mount import MCPMount
-from dudamel.migrate import pending_migrations, upgrade_apps, upgrade_core
+from dudamel.migrate import pending_migrations, upgrade_all, upgrade_core
 from dudamel.models_core import Activity, Conversation, JobRun, PendingConfirmation
 from dudamel.orchestrator import Orchestrator
 from dudamel.router import ChatReply, Router
@@ -79,8 +80,13 @@ class Runtime:
         settings: Settings,
         *,
         providers: dict[str, Provider] | None = None,
+        suite_lanes: Sequence[tuple[str, Path]] = (),
     ) -> None:
         self._settings = settings
+        # (app name, versions dir) for each enabled suite app. Resolution owns
+        # which apps those are; Runtime only needs their lanes so start()'s
+        # migration gate judges the same set of tiers `dudamel doctor` does.
+        self._suite_lanes = list(suite_lanes)
         self._db = Database(settings.database_url)
         self._registry = orchestrator.registry
         self._mcp_commands = list(orchestrator.mcp)
@@ -206,11 +212,16 @@ class Runtime:
             )
         if self._settings.auto_migrate:
             await asyncio.to_thread(upgrade_core, url)
-            migrations_dir = project_dir / "migrations"
-            if migrations_dir.exists():
-                await asyncio.to_thread(upgrade_apps, url, project_dir)
+            # Not gated on migrations/ alone: a project with no lane of its own
+            # can still have enabled suite apps whose lanes must be applied.
+            # Skipped entirely when there is nothing to apply, so a plain
+            # project does not pay for a database backup on every start.
+            if self._suite_lanes or (project_dir / "migrations").exists():
+                await asyncio.to_thread(upgrade_all, url, project_dir, self._suite_lanes)
         else:
-            pending = await asyncio.to_thread(pending_migrations, url, project_dir)
+            pending = await asyncio.to_thread(
+                pending_migrations, url, project_dir, self._suite_lanes
+            )
             if pending:
                 raise DudamelError(
                     "refusing to start: "
