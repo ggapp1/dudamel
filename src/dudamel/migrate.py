@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import shutil
 import sqlite3
+from collections.abc import Sequence
 from importlib.resources import files
 from pathlib import Path
 
@@ -123,6 +124,62 @@ def _app_config(db_url: str, project_dir: Path) -> Config:
     cfg.set_main_option("script_location", str(project_dir / "migrations"))
     cfg.set_main_option("sqlalchemy.url", sync_url(db_url))
     return cfg
+
+
+def suite_version_table(app_name: str) -> str:
+    """One bookkeeping table per suite app, so enabling or disabling one app
+    can never disturb another's recorded revision."""
+    return f"alembic_version_app_{app_name}"
+
+
+def _suite_lane_config(db_url: str, app_name: str, versions_dir: Path) -> Config:
+    cfg = Config()
+    cfg.set_main_option("script_location", str(files("dudamel") / "migrations_suite_lane"))
+    # Without this, Alembic splits version_locations on spaces and commas, so a
+    # project path containing either would silently resolve to no revisions.
+    cfg.set_main_option("path_separator", "os")
+    cfg.set_main_option("version_locations", str(versions_dir))
+    cfg.set_main_option("version_table", suite_version_table(app_name))
+    cfg.set_main_option("sqlalchemy.url", sync_url(db_url))
+    return cfg
+
+
+def _lane_heads(versions_dir: Path) -> set[str]:
+    """Heads of one lane's revisions. They live in `version_locations`, not in
+    the shared script directory, so `script_heads` cannot read them."""
+    cfg = Config()
+    cfg.set_main_option("script_location", str(files("dudamel") / "migrations_suite_lane"))
+    cfg.set_main_option("path_separator", "os")
+    cfg.set_main_option("version_locations", str(versions_dir))
+    return set(ScriptDirectory.from_config(cfg).get_heads())
+
+
+def upgrade_suite_app(db_url: str, app_name: str, versions_dir: Path) -> None:
+    """Bring one suite app's lane to head. No backup here -- upgrade_all takes
+    a single backup before touching any lane."""
+    command.upgrade(_suite_lane_config(db_url, app_name, versions_dir), "head")
+
+
+def upgrade_all(db_url: str, project_dir: Path, suite_lanes: Sequence[tuple[str, Path]]) -> None:
+    """Apply every suite lane in name order, then the project's own lane.
+
+    Sequential, not atomic. A lane that fails leaves earlier lanes applied and
+    stops the rest from running; the raised error names the lane, and re-running
+    after the fix is safe because a lane already at head is a no-op.
+    """
+    _backup_sqlite(db_url)
+    for app_name, versions_dir in sorted(suite_lanes):
+        try:
+            upgrade_suite_app(db_url, app_name, versions_dir)
+        except Exception as e:
+            raise DudamelError(
+                f"migration lane for app {app_name!r} failed: {e}; "
+                "lanes applied before it remain applied, later lanes did not run"
+            ) from e
+    # The project's own lane only exists once the user has generated a
+    # revision; a project with no migrations/ directory has nothing to apply.
+    if (project_dir / "migrations").exists():
+        command.upgrade(_app_config(db_url, project_dir), "head")
 
 
 def _combined_metadata(orc: Orchestrator) -> MetaData:
@@ -258,10 +315,15 @@ def upgrade_apps(db_url: str, project_dir: Path) -> None:
     command.upgrade(_app_config(db_url, project_dir), "head")
 
 
-def pending_migrations(db_url: str, project_dir: Path) -> list[str]:
+def pending_migrations(
+    db_url: str,
+    project_dir: Path,
+    suite_lanes: Sequence[tuple[str, Path]] = (),
+) -> list[str]:
     """Which migration tiers are behind their scripts' heads.
 
-    Empty means the schema is current and starting up will not change it.
+    Reported in apply order: core, then each suite lane, then the project's own
+    lane. Empty means the schema is current and starting up will not change it.
     Used both by `dudamel doctor` and by the startup gate, so the two can
     never disagree about what "up to date" means.
     """
@@ -270,6 +332,11 @@ def pending_migrations(db_url: str, project_dir: Path) -> list[str]:
     core_scripts = script_heads(str(files("dudamel") / "migrations"))
     if core_scripts and current_heads(db_url, "alembic_version_core") != core_scripts:
         pending.append("core schema is behind head")
+
+    for app_name, versions_dir in sorted(suite_lanes):
+        lane_scripts = _lane_heads(versions_dir)
+        if lane_scripts and current_heads(db_url, suite_version_table(app_name)) != lane_scripts:
+            pending.append(f"app {app_name!r} schema is behind head")
 
     migrations_dir = project_dir / "migrations"
     if migrations_dir.exists():
