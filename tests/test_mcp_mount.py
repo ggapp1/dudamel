@@ -10,6 +10,7 @@ excluded from the default run; they run every time with the rest of the suite.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import shlex
 import sys
@@ -292,8 +293,10 @@ async def test_unreachable_command_warns_and_yields_no_tools(
 ) -> None:
     mount = MCPMount(["nonexistent-cmd-xyz --flag"])
     tools = await mount.mount()
-    assert tools == []
+    # close() first, assert after: a failing assertion before it would leak
+    # whatever the mount is holding and hang teardown instead of reporting.
     await mount.close()  # must not raise even though nothing connected
+    assert tools == []
     assert any("failed to mount" in r.message for r in caplog.records)
 
 
@@ -851,8 +854,8 @@ async def test_mount_failure_warning_redacts_a_malformed_string_entry(
     redaction has to be applied to the raw string entry too."""
     mount = MCPMount(["nonexistent-cmd-xyz --api-key sk-secret-456"])
     tools = await mount.mount()
-    assert tools == []
     await mount.close()
+    assert tools == []
     assert any("failed to mount" in r.message for r in caplog.records)
     assert not any("sk-secret-456" in r.message for r in caplog.records)
     assert any("nonexistent-cmd-xyz" in r.message for r in caplog.records)
@@ -873,8 +876,14 @@ async def test_close_returns_when_the_supervisor_never_acks_stop(
     server = _MountedServer(MCPServerConfig(command="unused"))
     # A supervisor that is alive but never reads `self._requests` -- close()
     # must not be able to wait on it forever.
-    server._supervisor = asyncio.ensure_future(asyncio.sleep(3600))
+    wedged = asyncio.ensure_future(asyncio.sleep(3600))
+    server._supervisor = wedged
     start = time.monotonic()
     await server.close()
     elapsed = time.monotonic() - start
+    # close() cancels it, but a cancelled task that is never awaited leaves a
+    # pending task behind for the loop to complain about at teardown; awaiting
+    # it here is what actually retires it.
+    with contextlib.suppress(asyncio.CancelledError):
+        await wedged
     assert elapsed < 5.0
