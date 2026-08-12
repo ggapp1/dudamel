@@ -747,6 +747,32 @@ class Router:
             for idx, (call, action) in enumerate(plan)
             if action == "run"
         }
+        try:
+            await self._collect_batch(plan, tasks, outcome)
+        except BaseException:
+            # The realistic trigger is this Router task being cancelled --
+            # serve() shutting down, an interface dropping the request --
+            # while it awaits an earlier tool. The later tasks would
+            # otherwise keep running detached, executing side effects and
+            # writing rows against an engine `Runtime.stop()` is disposing,
+            # and surface as "exception never retrieved" at teardown. Cancel
+            # them and await their unwinding before the failure propagates,
+            # so nothing outlives this call.
+            for task in tasks.values():
+                task.cancel()
+            await asyncio.gather(*tasks.values(), return_exceptions=True)
+            raise
+        return outcome
+
+    async def _collect_batch(
+        self,
+        plan: list[tuple[ToolCall, str]],
+        tasks: dict[int, asyncio.Task[Message]],
+        outcome: _BatchOutcome,
+    ) -> None:
+        """Await the running tools IN PLAN ORDER and fill in the results for
+        the calls that never ran, so `outcome.results` mirrors the batch the
+        model asked for rather than completion order."""
         for idx, (call, action) in enumerate(plan):
             if action == "run":
                 outcome.results.append(await tasks[idx])
@@ -771,7 +797,6 @@ class Router:
                 )
             # "pending" gets its result at resolution time, once the user
             # approves or declines it (see resolve_confirmation() below).
-        return outcome
 
     async def _suspend(
         self,
