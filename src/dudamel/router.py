@@ -281,6 +281,14 @@ class Router:
             ),
         )
 
+    def _specs_for(self, names: list[str]) -> list[ToolSpec]:
+        """Tool specs for an explicit subset of the registry, in the given
+        order. Every name must currently be in `self._registry.tools` --
+        callers that work from a list which may have gone stale (a resumed
+        turn's persisted names) filter it first, so a KeyError here means a
+        real bookkeeping bug rather than a vanished server."""
+        return [ToolSpec.from_tool(self._registry.tools[n]) for n in names]
+
     async def _loop(
         self,
         conv_id: int,
@@ -413,7 +421,7 @@ class Router:
                 # tool a server dropped between suspension and resume is
                 # skipped rather than fatal.
                 offered_names = [n for n in resumed_offered_tools if n in self._registry.tools]
-                specs = [ToolSpec.from_tool(self._registry.tools[n]) for n in offered_names]
+                specs = self._specs_for(offered_names)
             elif len(self._registry.tools) > self._config.max_tools:
                 query = _latest_user_text(history)
                 offered_names = select_tool_subset(
@@ -433,8 +441,10 @@ class Router:
                         self._config.max_tools,
                         ", ".join(not_offered),
                     )
-                specs = [ToolSpec.from_tool(self._registry.tools[n]) for n in offered_names]
+                specs = self._specs_for(offered_names)
             else:
+                # Whole registry: the prebuilt list, which is exactly what
+                # `_specs_for(list(self._registry.tools))` would rebuild.
                 offered_names = list(self._registry.tools)
                 specs = self._specs
             try:
