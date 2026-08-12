@@ -368,9 +368,15 @@ tool a server annotates `destructiveHint: true` is registered with
 native tool registered that way. A mounted server asking dudamel for
 sampling, elicitation, or roots gets an explicit refusal rather than a
 hang or a silent no-op. If a mounted server pushes the tool count past
-`[router] max_tools`, the excess MCP tools — even ones you explicitly
-configured — are dropped from the model's tool list with only a log line,
-rather than failing startup.
+`[router] max_tools`, nothing is dropped permanently: every native tool
+stays offered on every turn, and each turn instead picks a relevant
+subset of the mcp-origin tools — ranked by overlap between the tool's
+name/description and the current message, plus any mcp tool already
+called earlier in the same turn — to fill the remaining slots. Startup
+still refuses to start if *native* tool registration alone exceeds
+`max_tools`, since that's the operator's own code to fix; a busy mcp
+mount just means a given turn won't see every mounted tool, logged once
+at mount time and per-turn when a tool is left out.
 
 A server whose connection dies is reconnected automatically, but only
 within limits: a bounded number of attempts with growing backoff. If that
@@ -401,6 +407,12 @@ tools from a server at startup and on each reconnect.
   If your `dudamel.toml` sets this key, it will raise a validation error
   on startup. Use `daily_tokens` for budget enforcement — it is the only
   enforced limit in v1 and later.
+- An MCP tool a server annotates `destructiveHint: true` is now
+  registered with `confirm=True` automatically, so it gets a confirm
+  prompt on every call the same as a native tool registered that way.
+  Previously this annotation was ignored. If you rely on such a tool
+  running without a confirmation step, register it explicitly or adjust
+  the server's annotations.
 
 ## Testing your apps
 

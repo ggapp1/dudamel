@@ -9,11 +9,20 @@
 provider = "openai-compatible"
 base_url = "http://localhost:11434/v1"
 model = "qwen3.5:9b"
+# If this model rejects requests with `tools` or never emits a tool call,
+# uncomment the next line to switch to the prompted-JSON fallback, then
+# run `dudamel doctor --probe-tools` to confirm it actually works:
+# tool_calling = "prompted"
 
 [llm.tiers.fast]
 provider = "openai-compatible"
 base_url = "http://localhost:11434/v1"
 model = "qwen3.5:1.5b"
+
+# [router]
+# Customize the assistant's system-prompt identity line ("You are...").
+# Leave commented out for the default identity.
+# persona = "a terse, no-nonsense workshop assistant"
 
 [web]
 host = "127.0.0.1"
