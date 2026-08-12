@@ -136,7 +136,17 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="DUDAMEL_", extra="ignore")
 
     database_url: str = "sqlite+aiosqlite:///dudamel.db"
+    # Where dudamel keeps runtime state (currently just the single-instance
+    # lockfile). Distinct from `project_dir`: state need not live in the
+    # source tree.
     data_dir: Path = Path(".")
+    # The project's source directory -- where `dudamel new`/`dudamel db
+    # migrate` create and read `migrations/`. Set by `Settings.load` to the
+    # directory it loaded from (the CWD for every CLI command), so `Runtime`
+    # and the CLI resolve app migrations from ONE place even when `data_dir`
+    # points elsewhere. Resolving them anywhere else would let the
+    # auto_migrate startup gate miss a pending app migration.
+    project_dir: Path = Path(".")
     # When false, `Runtime.start()` refuses to start against a schema that is
     # behind its migration scripts, instead of upgrading it in place. Set this
     # in production: a process restart should never silently mutate a schema.
@@ -171,4 +181,7 @@ class Settings(BaseSettings):
             data["llm_tiers"] = llm["tiers"]
         if "budget" in llm:
             data["llm_budget"] = llm["budget"]
+        # Record where we loaded from so migrations resolve consistently with
+        # the CLI (an explicit [project_dir] in the toml still wins).
+        data.setdefault("project_dir", project_dir)
         return cls(_env_file=project_dir / ".env", **data)
