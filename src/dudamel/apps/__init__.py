@@ -1,0 +1,53 @@
+"""The first-party app suite: a closed registry of apps that ship in the wheel.
+
+`dudamel.toml`'s [apps.*] can activate only the names in `SUITE_APPS`, so
+configuration never causes an arbitrary import path to be imported. Entries are
+self-describing: `dudamel apps list` and the dependency preflight answer from
+this metadata alone, without importing an app's module and dragging in its
+optional dependencies.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+from dataclasses import dataclass
+from importlib.resources import files
+from pathlib import Path
+
+
+@dataclass(frozen=True)
+class SuiteApp:
+    name: str
+    module: str
+    summary: str
+    # The pip extra that installs this app's dependencies (`dudamel[papers]`),
+    # or None for a self-contained app.
+    extra: str | None = None
+    # Importable module names that `extra` provides. Checked -- not imported --
+    # to decide whether the app can be loaded at all.
+    requires: tuple[str, ...] = ()
+    # Tests point this at a temp directory; real entries leave it None and get
+    # the packaged location below.
+    versions_dir: Path | None = None
+
+
+# Deliberately empty: the machinery ships before the apps do.
+SUITE_APPS: dict[str, SuiteApp] = {}
+
+
+def suite_versions_dir(entry: SuiteApp) -> Path:
+    """Where this app's Alembic revisions live.
+
+    Resolved from the `dudamel.apps` package plus pure path arithmetic, so a
+    disabled or uninstallable app's lane can still be located without importing
+    the app itself.
+    """
+    if entry.versions_dir is not None:
+        return entry.versions_dir
+    return Path(str(files("dudamel.apps"))) / entry.name / "migrations" / "versions"
+
+
+def missing_requirements(entry: SuiteApp) -> tuple[str, ...]:
+    """Declared requirements that are not importable. Uses find_spec so a
+    missing dependency is detected without executing any app code."""
+    return tuple(m for m in entry.requires if importlib.util.find_spec(m) is None)
