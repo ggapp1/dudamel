@@ -277,6 +277,21 @@ def test_doctor_sees_a_pending_suite_lane(
     assert "✓ pending migrations" in out
 
 
+def test_doctor_survives_an_assistant_that_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The project's own code raising at import is reported, not fatal: the
+    checks that have nothing to do with assistant.py must still run."""
+    register(monkeypatch)
+    project = write_project(tmp_path, "", assistant="raise ValueError('boom')\n")
+    monkeypatch.chdir(project)
+    assert main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "boom" in out
+    assert "database connection" in out
+    assert "app resolution: 0 enabled, 0 error(s)" in out
+
+
 def test_doctor_does_not_create_a_missing_sqlite_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

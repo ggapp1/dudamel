@@ -1,5 +1,5 @@
 """`dudamel` command-line entry point — the product's front door: `dudamel
-new/run/db migrate/doctor/token rotate`.
+new/run/db migrate/doctor/apps list/token rotate`.
 
 argparse only (no click/typer dependency). Every command below operates on
 the project in the CURRENT working directory (`new` is the one exception —
@@ -500,15 +500,24 @@ def _render_tool_table(orchestrator: Orchestrator) -> str:
     return "\n".join(rows)
 
 
-def _load_orchestrator_for_diagnosis(project_dir: Path) -> tuple[Orchestrator, DudamelError | None]:
-    """The project's orchestrator, or an empty stand-in plus the error that
-    stopped it loading. `doctor` and `apps list` describe projects that may not
-    import at all, so a missing or broken `assistant.py` has to become a
-    reported line rather than an abort."""
+def _load_orchestrator_for_diagnosis(project_dir: Path) -> tuple[Orchestrator, str | None]:
+    """The project's orchestrator, or an empty stand-in plus the message that
+    explains why there isn't one.
+
+    `doctor` and `apps list` describe projects that may not import at all, so a
+    missing or broken `assistant.py` has to become a reported line rather than
+    an abort. `SystemExit` is named alongside `Exception` because it is not
+    one: a module calling `sys.exit()` at import would otherwise take the whole
+    diagnosis down. `KeyboardInterrupt` is deliberately still allowed through.
+    """
     try:
         return _load_orchestrator(project_dir, _DEFAULT_MODULE), None
     except DudamelError as e:
-        return Orchestrator(apps=[]), e
+        return Orchestrator(apps=[]), str(e)
+    except (Exception, SystemExit) as e:
+        # The project's own code raised; report it verbatim instead of dying
+        # before the unrelated checks have had a chance to run.
+        return Orchestrator(apps=[]), f"{_DEFAULT_MODULE}.py raised on import: {e!r}"
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -573,7 +582,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print()
 
     if import_error is not None:
-        print(_line(False, f"app import ({_DEFAULT_MODULE})", str(import_error)))
+        print(_line(False, f"app import ({_DEFAULT_MODULE})", import_error))
     else:
         print(_render_tool_table(orchestrator))
         # `doctor` never starts the orchestrator, so MCP-mounted tools (only
@@ -686,7 +695,7 @@ def cmd_apps_list(args: argparse.Namespace) -> int:
 
     if import_error is not None:
         print()
-        print(_line(False, f"app import ({_DEFAULT_MODULE})", str(import_error)))
+        print(_line(False, f"app import ({_DEFAULT_MODULE})", import_error))
     if resolution.errors:
         print()
         for err in resolution.errors:
