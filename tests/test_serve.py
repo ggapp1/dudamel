@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import logging
 import os
 import signal
@@ -234,8 +235,13 @@ async def test_cancelling_serve_task_shuts_down_cleanly(
     task.cancel()
     await asyncio.wait_for(task, timeout=5.0)  # must COMPLETE, not raise
 
-    assert not lockfile.exists()
     assert len(disposed) > disposed_before  # Runtime.stop() disposed its engine
+    # The lockfile persists (flock on a persistent file is the guarantee), but
+    # the flock was released: a fresh acquire() succeeds again.
+    assert lockfile.exists()
+    reacquire = _InstanceLock(lockfile)
+    reacquire.acquire()
+    reacquire.release()
 
 
 # --- clean shutdown: second cancellation during scheduler drain (regression) ---
@@ -287,8 +293,12 @@ async def test_second_cancellation_during_scheduler_drain_still_runs_runtime_sto
     task.cancel()  # first cancellation: unblocks stop_event.wait(), enters teardown
     await asyncio.wait_for(task, timeout=5.0)  # must COMPLETE, not raise
 
-    assert not lockfile.exists()
     assert len(disposed) > disposed_before  # Runtime.stop() still ran despite the 2nd cancel
+    # Lock released (file persists): a fresh acquire() succeeds.
+    assert lockfile.exists()
+    reacquire = _InstanceLock(lockfile)
+    reacquire.acquire()
+    reacquire.release()
 
 
 # --- clean shutdown: SIGTERM ---------------------------------------------------
@@ -305,7 +315,11 @@ async def test_sigterm_shuts_down_cleanly(tmp_path: Path) -> None:
     os.kill(os.getpid(), signal.SIGTERM)
     await asyncio.wait_for(task, timeout=5.0)  # must COMPLETE, not raise
 
-    assert not lockfile.exists()
+    # Lock released (file persists): a fresh acquire() succeeds.
+    assert lockfile.exists()
+    reacquire = _InstanceLock(lockfile)
+    reacquire.acquire()
+    reacquire.release()
     async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as c:
         with pytest.raises(httpx.ConnectError):
             await c.get("/health", timeout=1.0)
@@ -389,7 +403,12 @@ def test_double_sigterm_50ms_apart_does_not_hard_kill_mid_shutdown(tmp_path: Pat
 
         exit_code = proc.wait(timeout=5.0)
         assert exit_code == 0
-        assert not lockfile.exists()
+        # Clean shutdown ran to completion: the lockfile persists but the
+        # process released its flock, so a fresh acquire() here succeeds.
+        assert lockfile.exists()
+        reacquire = _InstanceLock(lockfile)
+        reacquire.acquire()
+        reacquire.release()
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -518,7 +537,11 @@ async def test_telegram_start_failure_does_not_prevent_web_from_serving(
         await cancel_and_await(task)
 
     assert fake.calls == ["start"]
-    assert not lockfile.exists()
+    # Lock released (file persists): a fresh acquire() succeeds.
+    assert lockfile.exists()
+    reacquire = _InstanceLock(lockfile)
+    reacquire.acquire()
+    reacquire.release()
 
 
 # --- _InstanceLock unit coverage ----------------------------------------------
@@ -530,7 +553,44 @@ def test_instance_lock_acquire_release_roundtrip(tmp_path: Path) -> None:
     lock.acquire()
     assert lockfile.read_text().strip() == str(os.getpid())
     lock.release()
-    assert not lockfile.exists()
+    # The lockfile persists across a release -- flock on a *persistent* file is
+    # the whole guarantee (see the overlap regression below); a released lock
+    # just means a fresh acquire() succeeds again, not that the file is gone.
+    assert lockfile.exists()
+    again = _InstanceLock(lockfile)
+    again.acquire()
+    again.release()
+
+
+def test_release_does_not_break_single_instance_under_overlap(tmp_path: Path) -> None:
+    """Regression (CONFIRMED finding): `release()` must NOT unlink the
+    lockfile. If it does, the file's identity is destroyed on every restart:
+    an acquirer that already opened the file before the release keeps its
+    flock on the now-unlinked inode, while the NEXT acquirer's `os.open(...,
+    O_CREAT)` makes a brand-new inode at the same path and locks THAT -- two
+    live holders of "the" lock at once, exactly the overlapping-restart race
+    the single-instance guarantee exists to prevent. Not unlinking keeps
+    every acquirer contending on one stable inode.
+    """
+    lockfile = tmp_path / ".dudamel.lock"
+    holder = _InstanceLock(lockfile)
+    holder.acquire()
+
+    # A concurrent restart (process B) opens the same path -- same inode --
+    # while `holder` is still up, then blocks until `holder` releases.
+    fd_b = os.open(lockfile, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        holder.release()
+        # B now takes the lock on the inode it opened before the release.
+        fcntl.flock(fd_b, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # A fresh acquirer must contend with B and be refused -- it must never
+        # slip through by creating a second, independent inode at the path.
+        with pytest.raises(RuntimeError, match="already running"):
+            _InstanceLock(lockfile).acquire()
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd_b, fcntl.LOCK_UN)
+        os.close(fd_b)
 
 
 def test_instance_lock_exclusive_until_released(tmp_path: Path) -> None:

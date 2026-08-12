@@ -38,9 +38,10 @@ business logic, zero LLM calls. `serve()`:
   6. Waits for a stop signal (SIGTERM/SIGINT, or this coroutine's own task
      being cancelled), then shuts everything down in the mandated order —
      Telegram -> uvicorn -> scheduler -> Runtime (DB dispose) — releasing
-     the lockfile last, in an outer `finally`, so a failure at any step
-     (including during startup) can never leave a stale lock a live process
-     still needs to hold.
+     the instance lock last, in an outer `finally`, so a failure at any step
+     (including during startup) can never leave the lock held after the
+     process is done with it. The lockfile itself is left on disk (see
+     `_InstanceLock.release`); only the `flock` is dropped.
 
 Deliberately does NOT call `uvicorn.Server.serve()`: that method wraps its
 entire body in a `capture_signals()` context manager which installs its OWN
@@ -139,13 +140,21 @@ class _InstanceLock:
         self._fd = fd
 
     def release(self) -> None:
+        # Drop the flock and close the fd, but DELIBERATELY leave the lockfile
+        # on disk. Unlinking it here would defeat the single-instance
+        # guarantee under an overlapping restart: an acquirer that opened the
+        # file just before this release keeps its flock on the (now unlinked)
+        # inode, while the next acquirer's `os.open(..., O_CREAT)` creates a
+        # FRESH inode at the same path and locks that instead -- two live
+        # holders of "the" lock at once. flock on a *persistent* file is the
+        # whole guarantee: a leftover file from a dead holder is harmless (the
+        # kernel already dropped its flock), and a fresh acquire() against it
+        # just succeeds.
         if self._fd is not None:
             fd, self._fd = self._fd, None
             with contextlib.suppress(OSError):
                 fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
-            with contextlib.suppress(FileNotFoundError):
-                self._path.unlink()
 
 
 def _install_signal_handlers(
