@@ -42,5 +42,16 @@ class LLMError(DudamelError):
         self.retryable = retryable
 
 
+class ProviderRequestError(LLMError):
+    """The provider rejected the REQUEST itself — a 4xx it will keep
+    rejecting (malformed messages, an unusable tool schema, a bad key).
+
+    A subclass rather than a flag on `LLMError` so the router can word the
+    two causes apart without matching on prose: an outage is something a
+    user can usefully wait out, a rejected request never is. `retryable`
+    stays False for every instance — retrying is exactly what does not help.
+    """
+
+
 class BudgetExceededError(DudamelError):
     """The configured daily LLM budget is exhausted; hard stop."""

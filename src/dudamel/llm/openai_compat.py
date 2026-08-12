@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from dudamel.exceptions import LLMError
+from dudamel.exceptions import LLMError, ProviderRequestError
 from dudamel.llm.provider import ToolSpec
 from dudamel.llm.types import Completion, Message, ToolCall, Usage
 
@@ -101,10 +101,17 @@ class OpenAICompatProvider:
         except httpx.HTTPError as e:
             raise LLMError(f"LLM endpoint unreachable: {e}", retryable=True) from e
         if resp.status_code >= 400:
-            raise LLMError(
-                f"LLM endpoint returned HTTP {resp.status_code}: {self._redact(resp.text[:300])}",
-                retryable=resp.status_code in _RETRYABLE,
+            detail = (
+                f"LLM endpoint returned HTTP {resp.status_code}: {self._redact(resp.text[:300])}"
             )
+            if resp.status_code in _RETRYABLE:
+                raise LLMError(detail, retryable=True)
+            # Same classification as the anthropic provider: a 4xx this
+            # endpoint will keep rejecting is a request problem, not an
+            # outage, and the router words the two differently.
+            if resp.status_code < 500:
+                raise ProviderRequestError(detail)
+            raise LLMError(detail)
         try:
             body = resp.json()
         except json.JSONDecodeError as e:

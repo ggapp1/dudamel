@@ -7,7 +7,7 @@ from typing import Any
 
 import httpx
 
-from dudamel.exceptions import LLMError
+from dudamel.exceptions import LLMError, ProviderRequestError
 from dudamel.llm.provider import ToolSpec
 from dudamel.llm.types import Completion, Message, ToolCall, Usage
 
@@ -104,10 +104,16 @@ class AnthropicProvider:
         except httpx.HTTPError as e:
             raise LLMError(f"LLM endpoint unreachable: {e}", retryable=True) from e
         if resp.status_code >= 400:
-            raise LLMError(
-                f"anthropic returned HTTP {resp.status_code}: {self._redact(resp.text[:300])}",
-                retryable=resp.status_code in _RETRYABLE,
-            )
+            detail = f"anthropic returned HTTP {resp.status_code}: {self._redact(resp.text[:300])}"
+            if resp.status_code in _RETRYABLE:
+                raise LLMError(detail, retryable=True)
+            # A non-retryable 4xx means this exact request will be refused
+            # again — an empty text block, an unusable tool schema, a bad
+            # key. Typed so the router says so instead of reporting an
+            # outage the user could wait out (see `_loop`).
+            if resp.status_code < 500:
+                raise ProviderRequestError(detail)
+            raise LLMError(detail)
         try:
             body = resp.json()
         except json.JSONDecodeError as e:

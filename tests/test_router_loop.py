@@ -12,7 +12,7 @@ from dudamel.contract.schema import ToolSchema
 from dudamel.contract.types import Tool
 from dudamel.convo import ConversationStore
 from dudamel.db import Database
-from dudamel.exceptions import LLMError, RegistryError
+from dudamel.exceptions import LLMError, ProviderRequestError, RegistryError
 from dudamel.llm.client import LLMClient, Tier
 from dudamel.llm.testing import FakeProvider, fake_text, fake_tool_call
 from dudamel.llm.types import Completion, Message, ToolCall, Usage
@@ -1201,4 +1201,32 @@ async def test_cancelling_a_turn_mid_batch_leaves_no_tool_task_running(tmp_path)
     assert cancelled == ["b"]  # the sibling was cancelled, not abandoned
     leaked = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
     assert leaked == []
+    await db.dispose()
+
+
+async def test_a_rejected_request_is_not_reported_as_the_model_being_unavailable(
+    tmp_path,
+) -> None:
+    """A provider that rejected the REQUEST (an empty message, a bad tool
+    schema, a revoked key) will reject it identically forever. Calling that
+    "the model is unavailable" points the user at a transient cause they
+    can only wait out, and the wait never helps."""
+    router, fp, db = make_router(tmp_path, [ProviderRequestError("anthropic returned HTTP 400")])
+    reply = await router.handle(channel="t:1", text="hi", user_id="u1")
+    assert "unavailable" not in reply.text
+    assert "rejected" in reply.text and "HTTP 400" in reply.text
+    await db.dispose()
+
+
+async def test_a_rejected_request_after_a_side_effect_still_discloses_the_action(
+    tmp_path,
+) -> None:
+    """Classification must not cost the executed_any honesty."""
+    script = [
+        fake_tool_call("log_workout", {"exercise": "bench", "reps": 5}),
+        ProviderRequestError("anthropic returned HTTP 400"),
+    ]
+    router, fp, db = make_router(tmp_path, script)
+    reply = await router.handle(channel="t:1", text="log it", user_id="u1")
+    assert CALLS == ["log:bench:5"] and "completed the action" in reply.text
     await db.dispose()

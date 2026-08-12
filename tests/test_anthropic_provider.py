@@ -3,7 +3,7 @@ import json
 import httpx
 import pytest
 
-from dudamel.exceptions import LLMError
+from dudamel.exceptions import LLMError, ProviderRequestError
 from dudamel.llm.anthropic import AnthropicProvider
 from dudamel.llm.provider import ToolSpec
 from dudamel.llm.types import Message, ToolCall
@@ -178,3 +178,57 @@ async def test_empty_assistant_message_renders_placeholder_block() -> None:
     assert assistant_msg["role"] == "assistant"
     assert len(assistant_msg["content"]) == 1
     assert assistant_msg["content"][0] == {"type": "text", "text": "(no content)"}
+
+
+async def test_empty_user_text_is_reported_as_a_rejected_request_not_an_outage() -> None:
+    """An empty `text` block is what the web API's `ChatRequest(text="")`
+    produces, and Anthropic answers it with a 400 `invalid_request_error`.
+    Mapping that to a plain LLMError makes the router tell the user "the
+    model is unavailable" — a transient-sounding cause for a permanent
+    request problem, which is the wrong thing to wait out. It must classify
+    as a rejected request instead."""
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen["body"] = body
+        blocks = [b for m in body["messages"] for b in m["content"]]
+        if any(b.get("type") == "text" and b["text"] == "" for b in blocks):
+            return httpx.Response(
+                400,
+                json={
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": (
+                            "messages.0.content.0.text: text content blocks must be non-empty"
+                        ),
+                    },
+                },
+            )
+        return httpx.Response(200, json={"content": [], "stop_reason": "end_turn"})
+
+    with pytest.raises(ProviderRequestError) as exc:
+        await make_provider(handler).complete(model="m", messages=[Message(role="user", text="")])
+    assert exc.value.retryable is False
+    assert "non-empty" in str(exc.value)  # the provider's own reason survives
+    assert seen["body"]["messages"][0]["content"][0]["text"] == ""
+
+
+@pytest.mark.parametrize(
+    "status,expect_request_error,retryable",
+    [(400, True, False), (401, True, False), (429, False, True), (529, False, True)],
+)
+async def test_status_classification(
+    status: int, expect_request_error: bool, retryable: bool
+) -> None:
+    """Only a 4xx the provider will keep rejecting is a request error; an
+    overload or rate limit stays a plain (retryable) LLMError."""
+
+    def handler(_r: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"error": {"message": "nope"}})
+
+    with pytest.raises(LLMError) as exc:
+        await make_provider(handler).complete(model="m", messages=[])
+    assert isinstance(exc.value, ProviderRequestError) is expect_request_error
+    assert exc.value.retryable is retryable
