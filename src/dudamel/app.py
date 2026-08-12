@@ -3,14 +3,16 @@ from __future__ import annotations
 import asyncio
 import inspect
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager
 from typing import TYPE_CHECKING, Any
+
+from pydantic import BaseModel, ValidationError
 
 from dudamel.contract.renderers import RENDERERS
 from dudamel.contract.schema import ToolSchema
 from dudamel.contract.types import TOOL_NAME_RE, Job, Tool, Widget
-from dudamel.exceptions import RegistryError, RuntimeNotBoundError
+from dudamel.exceptions import AppSettingsError, RegistryError, RuntimeNotBoundError
 
 if TYPE_CHECKING:
     from sqlalchemy import MetaData
@@ -21,8 +23,21 @@ if TYPE_CHECKING:
 APP_NAME_RE = re.compile(r"^[a-z][a-z0-9]{0,31}$")
 
 
+class _EmptySettings(BaseModel):
+    """Bound marker for an app that declares no settings model."""
+
+
+_EMPTY_SETTINGS = _EmptySettings()
+
+
 class App:
-    def __init__(self, name: str, *, description: str) -> None:
+    def __init__(
+        self,
+        name: str,
+        *,
+        description: str,
+        settings: type[BaseModel] | None = None,
+    ) -> None:
         if not APP_NAME_RE.match(name):
             raise RegistryError(
                 f"app name {name!r} must start with [a-z] and contain only [a-z0-9];"
@@ -37,6 +52,8 @@ class App:
         self._notify: Callable[..., Awaitable[None]] | None = None  # bound by Runtime at run time
         self._database: Any | None = None  # bound by tests, or by Runtime at run time
         self._model_base: type | None = None
+        self.settings_model = settings
+        self._settings: BaseModel | None = None  # bound by config resolution, not at import
 
     # --- tools -------------------------------------------------------------
     def tool(
@@ -167,6 +184,46 @@ class App:
 
     async def to_thread(self, fn: Callable, *args: Any, **kwargs: Any) -> Any:
         return await asyncio.to_thread(fn, *args, **kwargs)
+
+    # --- settings ------------------------------------------------------------
+    @property
+    def settings(self) -> Any:
+        """This app's validated settings. Bound during config resolution, not at
+        import time -- reading it before then is a wiring bug, so it fails
+        loudly instead of handing back a None to trip over later."""
+        if self._settings is None:
+            raise RuntimeNotBoundError(f"app {self.name!r}: settings accessed before load")
+        return self._settings
+
+    def bind_settings(self, values: Mapping[str, Any]) -> None:
+        """Validate a raw config block for this app and bind the result.
+
+        Unknown keys are rejected here rather than by the model's own
+        `extra="forbid"`: pydantic ignores extras by default, so leaving this to
+        app authors would make a typo'd setting silently do nothing.
+        """
+        if self.settings_model is None:
+            if values:
+                raise AppSettingsError(
+                    f"app {self.name!r} takes no settings, got: " + ", ".join(sorted(values))
+                )
+            self._settings = _EMPTY_SETTINGS
+            return
+        known: set[str] = set()
+        for field_name, field in self.settings_model.model_fields.items():
+            known.add(field_name)
+            if field.alias is not None:
+                known.add(field.alias)
+        unknown = sorted(set(values) - known)
+        if unknown:
+            raise AppSettingsError(
+                f"app {self.name!r}: unknown setting(s) {', '.join(unknown)}; "
+                f"known: {', '.join(sorted(known))}"
+            )
+        try:
+            self._settings = self.settings_model.model_validate(values)
+        except ValidationError as e:
+            raise AppSettingsError(f"app {self.name!r}: {e}") from e
 
     # --- database ------------------------------------------------------------
     def bind_database(self, database: Database) -> None:
