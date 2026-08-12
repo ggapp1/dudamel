@@ -203,6 +203,78 @@ async def test_window_mode_taints_across_turns(tmp_path) -> None:
     await db.dispose()
 
 
+async def test_window_mode_taints_when_the_tool_is_gone_from_the_registry(tmp_path) -> None:
+    """History outlives the registry: an operator drops an MCP server from the
+    config and restarts, but the calls that server answered are still in the
+    window, and the content they injected is still in front of the model. A
+    name the registry can no longer resolve therefore counts as untrusted --
+    unknown provenance is not the same as trusted provenance."""
+    script = [
+        fake_tool_call("web__fetch_page", {"url": "u"}, id="m1"),
+        fake_text("fetched"),
+        fake_tool_call("save_note", {"text": "later"}, id="m2"),
+    ]
+    router, fp, db = build(tmp_path, script, taint_mode="window")
+    await router.handle(channel="t:1", text="fetch", user_id="u1")
+    del router._registry.tools["web__fetch_page"]  # server unmounted since
+    reply = await router.handle(channel="t:1", text="now save", user_id="u1")
+    assert reply.pending_confirmation_id is not None and MUTATIONS == []
+    await db.dispose()
+
+
+async def test_window_mode_taints_on_an_unresolvable_tool_name(tmp_path) -> None:
+    """The cost of the rule above, pinned deliberately: a name that never
+    existed -- a model hallucinating a tool -- taints the window too. Window
+    mode cannot tell a hallucination apart from a vanished MCP server after
+    the fact, and it is the mode that trades friction for caution."""
+    script = [
+        fake_tool_call("no__such_tool", {"url": "u"}, id="m1"),
+        fake_text("couldn't"),
+        fake_tool_call("save_note", {"text": "later"}, id="m2"),
+    ]
+    router, fp, db = build(tmp_path, script, taint_mode="window")
+    await router.handle(channel="t:1", text="do something", user_id="u1")
+    reply = await router.handle(channel="t:1", text="now save", user_id="u1")
+    assert reply.pending_confirmation_id is not None and MUTATIONS == []
+    await db.dispose()
+
+
+async def test_unknown_tool_in_the_live_turn_does_not_taint(tmp_path) -> None:
+    """The other side of the unknown-name rule, and why it is scoped to
+    history: a name the registry doesn't know right now fetched nothing --
+    the only text it produced is the router's own "unknown tool" error -- so
+    the turn stays clean and a following native mutation runs unprompted."""
+    script = [
+        fake_tool_call("no__such_tool", {"url": "u"}, id="m1"),
+        fake_tool_call("save_note", {"text": "clean"}, id="m2"),
+        fake_text("saved"),
+    ]
+    router, fp, db = build(tmp_path, script, taint_mode="turn")
+    reply = await router.handle(channel="t:1", text="do it", user_id="u1")
+    assert reply.pending_confirmation_id is None and MUTATIONS == ["clean"]
+    await db.dispose()
+
+
+async def test_dropped_span_with_an_unresolvable_tool_is_tainted(tmp_path) -> None:
+    """The persisted half of the same rule: a Summary row's `tainted` column
+    is computed from the span about to be dropped, and that column seeds taint
+    for every later turn. A span whose mcp tool no longer resolves must still
+    be recorded as tainted, or the condensed injected content is trusted from
+    then on."""
+    router, fp, db = build(tmp_path, [], taint_mode="turn")
+    span = [
+        Message(
+            role="assistant",
+            tool_calls=[ToolCall(id="m1", name="web__fetch_page", args={"url": "u"})],
+        ),
+        Message(role="tool", text="PAGE CONTENT", tool_call_id="m1"),
+    ]
+    assert router._dropped_tainted(span) is True
+    del router._registry.tools["web__fetch_page"]
+    assert router._dropped_tainted(span) is True
+    await db.dispose()
+
+
 async def test_turn_mode_does_not_taint_across_turns(tmp_path) -> None:
     script = [
         fake_tool_call("web__fetch_page", {"url": "u"}, id="m1"),
