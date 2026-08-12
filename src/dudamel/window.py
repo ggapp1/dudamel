@@ -16,8 +16,13 @@ from dudamel.llm.types import Message
 # Suffix a previous truncation left behind. Recognised ONLY to avoid
 # stacking a second marker onto text this function already capped; it is
 # never trusted as evidence that the text is short (see
-# `truncate_tool_result`).
-_MARKER_RE = re.compile(r"…\[truncated \d+ chars\]$")
+# `truncate_tool_result`). The digit run is bounded because the marker is
+# attacker-supplied text, not a promise: a drop count this function writes
+# is a Python int's decimal length, never anywhere near 20 digits.
+_MARKER_RE = re.compile(r"…\[truncated \d{1,20} chars\]$")
+
+# Ceiling on a marker this function can produce, given the bound above.
+_MAX_MARKER_CHARS = len("…[truncated  chars]") + 20
 
 
 @dataclass(frozen=True)
@@ -53,14 +58,17 @@ def message_tokens(m: Message) -> int:
 def truncate_tool_result(m: Message, cap_chars: int) -> Message:
     if m.role != "tool" or len(m.text) <= cap_chars:
         return m
-    marker = _MARKER_RE.search(m.text)
-    if marker is not None and len(m.text) - len(marker.group(0)) <= cap_chars:
-        # Text this function already capped: body within the cap, marker
-        # appended. Re-marking it would stack a second suffix every turn.
-        # The length test is what makes this safe -- the marker itself is
-        # in-band and attacker-controlled (an MCP tool result is untrusted
-        # input), so a multi-megabyte blob that merely ENDS with the marker
-        # falls through and gets capped like any other oversized result.
+    if len(m.text) <= cap_chars + _MAX_MARKER_CHARS and _MARKER_RE.search(m.text):
+        # Text this function already capped: short enough to be a body
+        # within the cap plus one marker. Re-marking it would stack a second
+        # suffix every turn.
+        #
+        # The LENGTH ceiling is what makes this safe, and it is checked
+        # first: the marker is in-band and attacker-controlled (an MCP tool
+        # result is untrusted input), so nothing about the text's shape can
+        # buy an exemption. Anything longer than a capped body plus a marker
+        # gets capped, whether the excess sits in the body, in the marker's
+        # digits, or anywhere else.
         return m
     dropped = len(m.text) - cap_chars
     return replace(m, text=m.text[:cap_chars] + f"…[truncated {dropped} chars]")

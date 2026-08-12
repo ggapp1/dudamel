@@ -45,6 +45,44 @@ def test_preexisting_marker_does_not_bypass_cap() -> None:
     assert out.text.endswith("chars]")
 
 
+def test_marker_with_a_huge_digit_run_does_not_bypass_cap() -> None:
+    """The bypass survives a "body within the cap" test alone: size the body
+    to exactly `cap_chars` (8192 is the default, so no guessing is needed)
+    and put the payload in the marker's own DIGITS. A drop count never needs
+    20 digits, and no result this function produced can exceed the cap plus
+    one marker -- so length, not shape, has to be the thing that decides."""
+    marker = "…[truncated " + "9" * 1_000_000 + " chars]"
+    m = Message(role="tool", text="B" * 8192 + marker, tool_call_id="t")
+    out = truncate_tool_result(m, cap_chars=8192)
+    assert len(out.text) < 8192 + 100
+    assert out.text.endswith("chars]")
+
+
+def test_oversized_digit_run_capped_inside_the_window() -> None:
+    msgs = [
+        Message(role="user", text="q"),
+        Message(role="assistant", tool_calls=[ToolCall(id="a", name="t", args={})]),
+        Message(
+            role="tool",
+            text="B" * 100 + "…[truncated " + "9" * 1_000_000 + " chars]",
+            tool_call_id="a",
+        ),
+        Message(role="assistant", text="done"),
+    ]
+    win = build_window(msgs, token_budget=100_000, tool_result_cap=100).messages
+    tool_msg = next(m for m in win if m.role == "tool")
+    assert len(tool_msg.text) < 200
+
+
+def test_genuine_truncation_output_is_still_left_alone() -> None:
+    """The guard must keep doing its actual job: text this function already
+    capped is returned unchanged rather than gaining a second marker."""
+    m = Message(role="tool", text="A" * 50_000, tool_call_id="t")
+    once = truncate_tool_result(m, 8192)
+    assert once.text.count("truncated") == 1
+    assert truncate_tool_result(once, 8192).text == once.text
+
+
 def test_spoofed_marker_capped_inside_the_window() -> None:
     msgs = [
         Message(role="user", text="q"),
