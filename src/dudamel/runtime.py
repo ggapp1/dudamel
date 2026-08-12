@@ -84,8 +84,8 @@ class Runtime:
     ) -> None:
         self._settings = settings
         # (app name, versions dir) for each enabled suite app. Resolution owns
-        # which apps those are; Runtime only needs their lanes so start()'s
-        # migration gate judges the same set of tiers `dudamel doctor` does.
+        # which apps those are; Runtime only needs their lanes, so that start()
+        # applies and gates on exactly the migration tiers that will run.
         self._suite_lanes = list(suite_lanes)
         self._db = Database(settings.database_url)
         self._registry = orchestrator.registry
