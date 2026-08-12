@@ -180,6 +180,35 @@ def test_fake_tier_requires_override(tmp_path) -> None:
         Runtime(make_orc(), make_settings(tmp_path))  # fake tier, no providers=
 
 
+def test_compact_dropped_turns_requires_compaction_tier(tmp_path) -> None:
+    from dudamel.config import RouterConfig
+
+    settings = make_settings(tmp_path)
+    settings.router = RouterConfig(compact_dropped_turns=True)
+    with pytest.raises(RegistryError, match="compaction_tier"):
+        Runtime(make_orc(), settings, providers={"standard": FakeProvider([])})
+
+
+def test_compact_dropped_turns_rejects_an_unconfigured_tier(tmp_path) -> None:
+    from dudamel.config import RouterConfig
+
+    settings = make_settings(tmp_path)
+    settings.router = RouterConfig(compact_dropped_turns=True, compaction_tier="ghost")
+    with pytest.raises(RegistryError, match="unknown tier 'ghost'; configured tiers:.*standard"):
+        Runtime(make_orc(), settings, providers={"standard": FakeProvider([])})
+
+
+async def test_compact_dropped_turns_builds_a_compactor_for_a_configured_tier(tmp_path) -> None:
+    from dudamel.compaction import Compactor
+    from dudamel.config import RouterConfig
+
+    settings = make_settings(tmp_path)
+    settings.router = RouterConfig(compact_dropped_turns=True, compaction_tier="standard")
+    rt = Runtime(make_orc(), settings, providers={"standard": FakeProvider([])})
+    assert isinstance(rt._compactor, Compactor)
+    assert rt._router._compactor is rt._compactor
+
+
 def test_build_provider_wraps_a_prompted_tier() -> None:
     from dudamel.runtime import build_provider
 
