@@ -346,9 +346,13 @@ class Router:
                     # budget, so its cost -- the FRAMED message actually
                     # sent, not just the raw summary text -- is subtracted
                     # from the budget handed in, and the window is rebuilt
-                    # against what's left. That keeps (summary +
-                    # window_body) within window_tokens rather than
-                    # exceeding it by the summary's size.
+                    # against what's left. This keeps compaction from
+                    # adding headroom pressure beyond an uncompacted turn:
+                    # it does NOT guarantee (summary + window_body) stays
+                    # within window_tokens overall -- build_window always
+                    # includes the newest turn even when that turn alone
+                    # exceeds whatever budget it's given (window.py), with
+                    # or without a summary competing for the same budget.
                     remaining_budget = max(
                         self._config.window_tokens - estimate_tokens(summary_message.text), 0
                     )
