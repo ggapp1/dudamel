@@ -212,6 +212,9 @@ on the same host, a few settings need attention:
   to a loopback bind leaves `[web] host` at `127.0.0.1`, so the
   auto-derivation resolves to `False` even though the deployment is
   HTTPS end-to-end. In that setup, set `cookie_secure = true` explicitly.
+  `dudamel doctor` prints the resolved posture — the value, whether it was
+  set explicitly or derived, and (when derived) the remedy for the topology
+  it looks wrong for — right under the dashboard URL it judges it against.
 - **`trusted_proxies`** — only ever list a proxy's address here if you
   actually run it: anything in this list is a peer dudamel will believe
   can claim any client address via `X-Forwarded-For`. Leaving it empty
