@@ -479,6 +479,107 @@ async def test_tools_called_earlier_in_the_turn_stay_offered(tmp_path) -> None:
     await db.dispose()
 
 
+def _subset_warnings(caplog) -> list[str]:
+    """The "left out of this turn" WARN records only -- refresh_tool_specs()
+    emits its own, once at mount time, on the same logger."""
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and "not offered this turn" in r.getMessage()
+    ]
+
+
+async def test_subsetting_warns_once_per_turn_not_once_per_iteration(tmp_path, caplog) -> None:
+    """The WARN names which tools a turn left out. A turn takes as many
+    model calls as it needs; repeating the same notice for each of them
+    turns one operator-relevant fact into log noise proportional to how
+    tool-heavy the turn happened to be."""
+    app = App("gym", description="d")
+
+    @app.tool
+    async def log_workout(exercise: str) -> str:
+        """Record a workout."""
+        return "ok"
+
+    registry = Registry([app])  # 1 native tool -- fits under max_tools=2 at construction
+
+    url = f"sqlite+aiosqlite:///{tmp_path}/warnonce.db"
+    upgrade_core(url)
+    db = Database(url)
+    # tool call -> tool result -> second completion: two subsetting iterations.
+    fp = FakeProvider([fake_tool_call("log_workout", {"exercise": "run"}), fake_text("done")])
+    llm = LLMClient(
+        tiers={"standard": Tier(name="standard", provider=fp, model="f", max_tokens=64)},
+        db=db,
+        budget=BudgetConfig(),
+    )
+    router = Router(
+        llm=llm,
+        registry=registry,
+        convo=ConversationStore(db),
+        db=db,
+        config=RouterConfig(max_tools=2),
+    )
+    registry.tools["mcp_a"] = _mcp_tool("mcp_a", "banana fetch data alpha")
+    registry.tools["mcp_b"] = _mcp_tool("mcp_b", "completely unrelated beta")
+    router.refresh_tool_specs()
+
+    with caplog.at_level(logging.WARNING, logger="dudamel.router"):
+        reply = await router.handle(channel="t:1", text="banana fetch", user_id="u1")
+    assert reply.text == "done"
+    assert len(fp.calls) == 2  # the turn really did subset twice
+    warnings = _subset_warnings(caplog)
+    assert len(warnings) == 1 and "mcp_b" in warnings[0]
+    await db.dispose()
+
+
+async def test_at_the_ceiling_nothing_is_subset_and_nothing_warns(tmp_path, caplog) -> None:
+    """`len(tools) == max_tools` is the boundary the overflow check reads as
+    "fits": every tool is offered and the turn is silent. Only strictly
+    exceeding the ceiling starts leaving tools out."""
+    app = App("gym", description="d")
+
+    @app.tool
+    async def log_workout(exercise: str) -> str:
+        """Record a workout."""
+        return "ok"
+
+    @app.tool(read_only=True)
+    async def status() -> str:
+        """Report status."""
+        return "ok"
+
+    registry = Registry([app])  # 2 native tools
+
+    url = f"sqlite+aiosqlite:///{tmp_path}/ceiling.db"
+    upgrade_core(url)
+    db = Database(url)
+    fp = FakeProvider([fake_text("all good")])
+    llm = LLMClient(
+        tiers={"standard": Tier(name="standard", provider=fp, model="f", max_tokens=64)},
+        db=db,
+        budget=BudgetConfig(),
+    )
+    router = Router(
+        llm=llm,
+        registry=registry,
+        convo=ConversationStore(db),
+        db=db,
+        config=RouterConfig(max_tools=4),
+    )
+    registry.tools["mcp_a"] = _mcp_tool("mcp_a", "banana fetch data alpha")
+    registry.tools["mcp_b"] = _mcp_tool("mcp_b", "completely unrelated beta")
+    assert len(registry.tools) == 4  # exactly at max_tools, not past it
+
+    with caplog.at_level(logging.WARNING, logger="dudamel.router"):
+        router.refresh_tool_specs()
+        reply = await router.handle(channel="t:1", text="banana fetch", user_id="u1")
+    assert reply.text == "all good"
+    assert {s.name for s in fp.calls[0]["tools"]} == set(registry.tools)
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
+    await db.dispose()
+
+
 async def test_resumed_turn_sees_the_same_subset_it_was_shown(tmp_path) -> None:
     """Confirmation resume rebuilds the spec list from the persisted names,
     not by re-ranking -- re-ranking against a stale user message (or a

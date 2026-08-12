@@ -321,6 +321,17 @@ class Router:
         # the one iteration that must reproduce exactly what the model saw,
         # and after that ranking resumes live.
         called_tool_names: set[str] = set()
+        # The "these tools were left out" WARN is a per-turn notice (as the
+        # README describes it), not a per-model-call one: an iteration-heavy
+        # turn would otherwise repeat the same line up to `iteration_cap`
+        # times and bury the one operator-actionable fact -- the ceiling is
+        # too low for this registry -- under its own repetition. Scoped to
+        # this call to _loop, like `turn_key` and `called_tool_names` above;
+        # a turn that suspends on a confirm gate and later resumes gets one
+        # more notice, which is right: the resumed half is a separate
+        # user-visible exchange, and its subset can differ from the one the
+        # first half was shown.
+        subset_warned = False
         for iteration in range(start_iteration, self._config.iteration_cap):
             history = await self._convo.recent(conv_id)
             window_body = build_window(
@@ -412,7 +423,8 @@ class Router:
                     must_keep=called_tool_names,
                 )
                 not_offered = sorted(set(self._registry.tools) - set(offered_names))
-                if not_offered:
+                if not_offered and not subset_warned:
+                    subset_warned = True
                     logger.warning(
                         "conversation %s: %d tool(s) not offered this turn "
                         "(past router max_tools %d): %s",
