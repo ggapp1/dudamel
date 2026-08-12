@@ -180,6 +180,49 @@ def test_fake_tier_requires_override(tmp_path) -> None:
         Runtime(make_orc(), make_settings(tmp_path))  # fake tier, no providers=
 
 
+def test_build_provider_wraps_a_prompted_tier() -> None:
+    from dudamel.runtime import build_provider
+
+    cfg = TierConfig(
+        provider="openai-compatible", model="m", base_url="http://x", tool_calling="prompted"
+    )
+    provider = build_provider("standard", cfg)
+    assert provider.name == "prompted+openai-compatible"
+
+
+def test_build_provider_leaves_a_native_tier_unwrapped() -> None:
+    from dudamel.runtime import build_provider
+
+    cfg = TierConfig(provider="openai-compatible", model="m", base_url="http://x")
+    provider = build_provider("standard", cfg)
+    assert provider.name == "openai-compatible"
+
+
+async def test_prompted_tier_wraps_a_providers_override_end_to_end(tmp_path) -> None:
+    """A providers= override (how a test scripts a fake backend, and the
+    only way `provider="fake"` is usable at all) still gets wrapped when
+    the tier's config says tool_calling="prompted": scripted completion
+    emitting the prompted JSON envelope -> real tool executes -> scripted
+    final text closes the turn, exactly like a native tool-calling turn."""
+    orc = make_orc()
+    envelope = json.dumps(
+        {"tool_calls": [{"name": "log_workout", "arguments": {"exercise": "run"}}]}
+    )
+    settings = make_settings(
+        tmp_path,
+        standard=TierConfig(provider="fake", model="f", tool_calling="prompted"),
+    )
+    rt = Runtime(
+        orc,
+        settings,
+        providers={"standard": FakeProvider([fake_text(envelope), fake_text("done!")])},
+    )
+    await rt.start()
+    reply = await rt.chat("web:1", "log a run", user_id="u1")
+    assert reply.text == "done!"
+    await rt.stop()
+
+
 # --- Runtime extensions: pending confirmations, notify fallback, widgets ----
 
 

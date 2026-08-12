@@ -44,6 +44,40 @@ def test_defaults_without_sections(tmp_path: Path) -> None:
     assert s.router.taint_mode == "turn"
 
 
+def test_tool_calling_defaults_to_native_and_is_unaffected(tmp_path: Path) -> None:
+    """Every existing config keeps native tool calling with no changes."""
+    (tmp_path / "dudamel.toml").write_text(TOML)
+    s = Settings.load(tmp_path)
+    assert s.llm_tiers["standard"].tool_calling == "native"
+    assert s.llm_tiers["deep"].tool_calling == "native"
+
+
+def test_tool_calling_prompted_is_parsed(tmp_path: Path) -> None:
+    toml = """
+[llm.tiers.local]
+provider = "openai-compatible"
+base_url = "http://localhost:11434/v1"
+model = "qwen3.5:9b"
+tool_calling = "prompted"
+"""
+    (tmp_path / "dudamel.toml").write_text(toml)
+    s = Settings.load(tmp_path)
+    assert s.llm_tiers["local"].tool_calling == "prompted"
+
+
+def test_tool_calling_rejects_unknown_value(tmp_path: Path) -> None:
+    toml = """
+[llm.tiers.local]
+provider = "openai-compatible"
+base_url = "http://localhost:11434/v1"
+model = "qwen3.5:9b"
+tool_calling = "auto"
+"""
+    (tmp_path / "dudamel.toml").write_text(toml)
+    with pytest.raises(ValidationError):
+        Settings.load(tmp_path)
+
+
 def test_existing_precedence_untouched(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "dudamel.toml").write_text('database_url = "sqlite+aiosqlite:///toml.db"\n' + TOML)
     monkeypatch.setenv("DUDAMEL_DATABASE_URL", "sqlite+aiosqlite:///env.db")

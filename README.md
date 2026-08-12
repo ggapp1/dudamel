@@ -118,6 +118,45 @@ dashboard renders without touching the model at all, and a nightly job
 that summarizes the day and sends a notification. `dudamel db migrate`
 picks the model up automatically — no separate schema file.
 
+## Backends without native tool calling
+
+Some local models — especially smaller ones served through an
+OpenAI-compatible endpoint — either reject a request that includes `tools`
+or accept it and never emit a tool call. Set `tool_calling = "prompted"` on
+that tier:
+
+```toml
+[llm.tiers.standard]
+provider = "openai-compatible"
+base_url = "http://localhost:11434/v1"
+model = "some-small-model"
+tool_calling = "prompted"
+```
+
+This replaces the native wire format with a prompted fallback: tool
+descriptions and prior tool results are flattened into plain prompt text,
+and the model is instructed to reply with a small JSON envelope instead of
+a native tool call. Run `uv run dudamel doctor --probe-tools` after
+changing this — the probe wraps the same way the router will, so a passing
+probe means the prompted round-trip actually works for that model, not
+just that native tool calling is (as expected) absent.
+
+Trust caveats:
+
+- Tool *selection* is exactly as gated as the native path — a parsed call
+  still has to name a tool the registry knows about, and an MCP-origin
+  tool still taints the turn the same way whether the call arrived natively
+  or was parsed from prompted text. This setting changes how a call is
+  *recognized*, not what an accepted call is allowed to do.
+- A pending confirmation can never be approved by anything the model
+  outputs, prompted or native — approval is a separate, out-of-band step
+  the user takes through an interface, not something reachable from parsed
+  text.
+- The fallback is more permissive about malformed output than a native
+  backend would ever produce: expect it to occasionally reply in plain
+  prose instead of calling a tool it should have. That degrades to a
+  normal text reply, never a crash.
+
 ## Remote access
 
 The dashboard binds to `127.0.0.1` by default: reachable only from the
