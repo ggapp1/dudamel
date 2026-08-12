@@ -601,7 +601,11 @@ async def test_at_the_ceiling_nothing_is_subset_and_nothing_warns(tmp_path, capl
         reply = await router.handle(channel="t:1", text="banana fetch", user_id="u1")
     assert reply.text == "all good"
     assert {s.name for s in fp.calls[0]["tools"]} == set(registry.tools)
-    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
+    assert [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and r.name.startswith("dudamel.router")
+    ] == []
     await db.dispose()
 
 

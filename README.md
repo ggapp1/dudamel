@@ -384,8 +384,8 @@ still refuses to start if *native* tool registration alone exceeds
 `max_tools`, since that's the operator's own code to fix; a busy mcp
 mount just means a given turn won't see every mounted tool, logged once
 at mount time and once per turn when a tool is left out — a turn that
-suspends on a confirm prompt and later resumes logs once for each half,
-since the resumed half can be offered a different subset.
+suspends on a confirm prompt and later resumes logs at most once for each
+half, since the resumed half can be offered a different subset.
 
 A server whose connection dies is reconnected automatically, but only
 within limits: a bounded number of attempts with growing backoff. If that
