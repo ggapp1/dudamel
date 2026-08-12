@@ -333,6 +333,20 @@ def upgrade_apps(db_url: str, project_dir: Path) -> None:
     command.upgrade(_app_config(db_url, project_dir), "head")
 
 
+def suite_lane_pending(db_url: str, app_name: str, versions_dir: Path) -> bool:
+    """Whether one suite app's lane has revisions the database has not applied.
+
+    The per-lane comparison `pending_migrations` reports on, exposed on its own
+    so `dudamel apps list`'s per-app column cannot disagree with the startup
+    gate about whether that lane is behind. An app that ships no revisions at
+    all is never pending.
+    """
+    lane_scripts = _lane_heads(versions_dir)
+    if not lane_scripts:
+        return False
+    return current_heads(db_url, suite_version_table(app_name)) != lane_scripts
+
+
 def pending_migrations(
     db_url: str,
     project_dir: Path,
@@ -342,8 +356,9 @@ def pending_migrations(
 
     Reported in apply order: core, then each suite lane, then the project's own
     lane. Empty means the schema is current and starting up will not change it.
-    Used both by `dudamel doctor` and by the startup gate, so the two can
-    never disagree about what "up to date" means.
+    Called both by `dudamel doctor` (which reports the list) and by the startup
+    gate (which refuses to start on a non-empty one), so the two can never
+    disagree about what "up to date" means.
     """
     pending: list[str] = []
 
@@ -352,8 +367,7 @@ def pending_migrations(
         pending.append("core schema is behind head")
 
     for app_name, versions_dir in sorted(suite_lanes):
-        lane_scripts = _lane_heads(versions_dir)
-        if lane_scripts and current_heads(db_url, suite_version_table(app_name)) != lane_scripts:
+        if suite_lane_pending(db_url, app_name, versions_dir):
             pending.append(f"app {app_name!r} schema is behind head")
 
     migrations_dir = project_dir / "migrations"

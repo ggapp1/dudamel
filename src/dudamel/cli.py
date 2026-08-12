@@ -36,6 +36,8 @@ import httpx
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
+from dudamel import apps as suite
+from dudamel.apps import missing_requirements
 from dudamel.config import Settings, TierConfig
 from dudamel.exceptions import DudamelError
 from dudamel.interfaces.telegram import resolve_token as resolve_telegram_token
@@ -45,12 +47,19 @@ from dudamel.migrate import (
     current_heads,
     ensure_app_migrations,
     generate_app_migration,
+    pending_migrations,
     script_heads,
+    suite_lane_pending,
     sync_url,
     upgrade_all,
     upgrade_core,
 )
 from dudamel.orchestrator import Orchestrator
+
+# `_is_enabled` is the resolver's own "presence means enabled" rule, reused
+# rather than restated: a second copy that drifted would make `apps list`
+# describe a configuration different from the one that actually runs.
+from dudamel.resolve import _is_enabled as _suite_app_enabled
 from dudamel.resolve import resolve_apps
 from dudamel.runtime import build_provider
 from dudamel.serve import serve
@@ -345,6 +354,30 @@ def _check_app_migrations_dir(project_dir: Path) -> tuple[bool, str]:
     return True, f"present ({len(revisions)} revision{'s' if len(revisions) != 1 else ''})"
 
 
+def _check_pending_migrations(
+    db_url: str, project_dir: Path, suite_lanes: Sequence[tuple[str, Path]]
+) -> tuple[bool, str]:
+    """Every tier the startup gate would refuse to start on.
+
+    Deliberately the SAME call the gate makes (`migrate.pending_migrations`
+    with the resolved suite lanes), so doctor cannot report a green schema on
+    a project that then refuses to start -- which is exactly what an enabled
+    suite app whose shipped lane is unapplied would otherwise do.
+    """
+    path = _sqlite_file_path(db_url)
+    if path is not None and not path.exists():
+        # Connecting would CREATE the file; doctor must not be what creates a
+        # project's database (`_check_db_connect` already reported this).
+        return False, "not created yet — run `dudamel run` or `dudamel db migrate -m <msg>` once"
+    try:
+        pending = pending_migrations(db_url, project_dir, suite_lanes)
+    except Exception as e:
+        return False, f"could not read migration state ({e})"
+    if pending:
+        return False, "; ".join(pending) + " — run `dudamel db migrate -m <msg>`"
+    return True, "none — every lane is at head"
+
+
 def _check_tier(cfg: TierConfig) -> tuple[bool, str]:
     if cfg.provider == "openai-compatible":
         if not cfg.base_url:
@@ -467,10 +500,26 @@ def _render_tool_table(orchestrator: Orchestrator) -> str:
     return "\n".join(rows)
 
 
+def _load_orchestrator_for_diagnosis(project_dir: Path) -> tuple[Orchestrator, DudamelError | None]:
+    """The project's orchestrator, or an empty stand-in plus the error that
+    stopped it loading. `doctor` and `apps list` describe projects that may not
+    import at all, so a missing or broken `assistant.py` has to become a
+    reported line rather than an abort."""
+    try:
+        return _load_orchestrator(project_dir, _DEFAULT_MODULE), None
+    except DudamelError as e:
+        return Orchestrator(apps=[]), e
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     project_dir = Path.cwd()
     _load_dotenv_into_environ(project_dir)
     settings = Settings.load(project_dir)
+    # Resolved up front, non-strict: the migration check below needs the
+    # enabled suite apps' lanes, and a broken [apps.*] block must not stop
+    # doctor reaching any of its other checks.
+    orchestrator, import_error = _load_orchestrator_for_diagnosis(project_dir)
+    resolution = resolve_apps(orchestrator, settings, strict=False)
 
     ok, detail = _check_db_connect(settings.database_url)
     lines = [_line(ok, "database connection", detail)]
@@ -480,6 +529,21 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     ok, detail = _check_app_migrations_dir(project_dir)
     lines.append(_line(ok, "app migrations dir", detail))
+
+    lines.append(
+        _line(
+            not resolution.errors,
+            "app resolution",
+            f"{len(resolution.apps)} enabled, {len(resolution.errors)} error(s)",
+        )
+    )
+    for err in resolution.errors:
+        lines.append(_line(False, f"  app {err.app}", err.message))
+
+    ok, detail = _check_pending_migrations(
+        settings.database_url, project_dir, resolution.suite_lanes
+    )
+    lines.append(_line(ok, "pending migrations", detail))
 
     if settings.llm_tiers:
         for name, cfg in settings.llm_tiers.items():
@@ -508,10 +572,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print("\n".join(lines))
     print()
 
-    try:
-        orchestrator = _load_orchestrator(project_dir, _DEFAULT_MODULE)
-    except DudamelError as e:
-        print(_line(False, f"app import ({_DEFAULT_MODULE})", str(e)))
+    if import_error is not None:
+        print(_line(False, f"app import ({_DEFAULT_MODULE})", str(import_error)))
     else:
         print(_render_tool_table(orchestrator))
         # `doctor` never starts the orchestrator, so MCP-mounted tools (only
@@ -524,6 +586,111 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 f"ℹ {n} MCP server(s) configured — tools mount at run time; "
                 "safety flags visible then"
             )
+    return 0
+
+
+# --- apps list ---------------------------------------------------------------
+
+# The lane column for a row whose lane was never consulted. A disabled or
+# uninstallable app is described from registry metadata alone -- it is never
+# imported and its lane is never compared against the database -- so anything
+# other than a dash here would be a claim the command did not check. Local apps
+# share the project's own migrations/ lane, which `doctor` reports as one line.
+_NO_LANE = "—"
+
+_APPS_LIST_HEADERS = ("name", "origin", "state", "lane", "notes")
+
+
+def _app_state(name: str, *, enabled: bool, resolved: set[str], errored: set[str | None]) -> str:
+    if name in errored:
+        return "error"
+    if name in resolved:
+        return "enabled"
+    # Enabled but neither resolved nor blamed by name: not running either way.
+    return "disabled" if not enabled else "error"
+
+
+def _lane_status(db_url: str, app_name: str, versions_dir: Path) -> str:
+    """One suite lane's migration state as a column value.
+
+    Never raises and never connects to a database that does not exist yet:
+    `apps list` describes a configuration, so an unreadable lane is a value in
+    the table, not a failed command.
+    """
+    path = _sqlite_file_path(db_url)
+    if path is not None and not path.exists():
+        return "no db"
+    try:
+        return "pending" if suite_lane_pending(db_url, app_name, versions_dir) else "at head"
+    except Exception:
+        return "unknown"
+
+
+def _render_apps_table(rows: Sequence[tuple[str, str, str, str, str]]) -> str:
+    # Every column but the last (free-text notes) is padded to its widest cell.
+    widths = [max(len(row[i]) for row in (_APPS_LIST_HEADERS, *rows)) for i in range(4)]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths) + "  {}"
+    header = fmt.format(*_APPS_LIST_HEADERS)
+    return "\n".join([header, "-" * len(header), *(fmt.format(*row) for row in rows)])
+
+
+def cmd_apps_list(args: argparse.Namespace) -> int:
+    project_dir = Path.cwd()
+    _load_dotenv_into_environ(project_dir)
+    settings = Settings.load(project_dir)
+    orchestrator, import_error = _load_orchestrator_for_diagnosis(project_dir)
+    # Non-strict: listing a broken configuration is the whole point.
+    resolution = resolve_apps(orchestrator, settings, strict=False)
+    resolved = {app.name for app in resolution.apps}
+    errored: set[str | None] = {err.app for err in resolution.errors}
+    lanes = dict(resolution.suite_lanes)
+
+    rows: list[tuple[str, str, str, str, str]] = []
+    # Read through the module: tests (and any in-process override) replace the
+    # attribute itself, exactly as the resolver reads it.
+    suite_apps = suite.SUITE_APPS
+    for name, entry in sorted(suite_apps.items()):
+        note = entry.summary
+        missing = missing_requirements(entry)
+        if missing:
+            note += f" — needs pip install dudamel[{entry.extra or name}]"
+        rows.append(
+            (
+                name,
+                "suite",
+                _app_state(
+                    name,
+                    enabled=_suite_app_enabled(settings.apps, name),
+                    resolved=resolved,
+                    errored=errored,
+                ),
+                _lane_status(settings.database_url, name, lanes[name])
+                if name in lanes
+                else _NO_LANE,
+                note,
+            )
+        )
+    for name, app in sorted(orchestrator.registry.apps.items()):
+        if name in suite_apps:
+            continue  # the name collision is reported as an error below
+        # Opposite default from a suite app, matching the resolver: a local app
+        # is registered in Python, so it runs unless config switches it off.
+        enabled = bool(settings.apps.get(name, {}).get("enabled", True))
+        state = _app_state(name, enabled=enabled, resolved=resolved, errored=errored)
+        rows.append((name, "local", state, _NO_LANE, app.description))
+
+    if rows:
+        print(_render_apps_table(rows))
+    else:
+        print("no apps — none enabled from the suite, none registered in this project")
+
+    if import_error is not None:
+        print()
+        print(_line(False, f"app import ({_DEFAULT_MODULE})", str(import_error)))
+    if resolution.errors:
+        print()
+        for err in resolution.errors:
+            print(_line(False, f"app {err.app}", err.message))
     return 0
 
 
@@ -625,6 +792,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="probe each llm tier for native tool calling (spends real tokens; off by default)",
     )
     p_doctor.set_defaults(handler=cmd_doctor)
+
+    p_apps = sub.add_parser("apps", help="inspect the configured app suite")
+    apps_sub = p_apps.add_subparsers(dest="apps_command", required=True, metavar="command")
+    apps_sub.add_parser(
+        "list", help="list suite and local apps with their state", parents=[debug]
+    ).set_defaults(handler=cmd_apps_list)
 
     p_token = sub.add_parser("token", help="manage the web dashboard token")
     token_sub = p_token.add_subparsers(dest="token_command", required=True, metavar="command")
