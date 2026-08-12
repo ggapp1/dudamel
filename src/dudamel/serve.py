@@ -7,7 +7,7 @@ business logic, zero LLM calls. `serve()`:
 
   1. Acquires an exclusive instance lock at `data_dir/.dudamel.lock` via
      `fcntl.flock` on a persistent fd — a second `serve()` against the same
-     `data_dir` raises `RuntimeError` while the first is live. The kernel
+     `data_dir` raises `AlreadyRunningError` while the first is live. The kernel
      drops an `flock` unconditionally when the holding process exits, for
      any reason (clean shutdown or crash), so a leftover lockfile from a
      dead process is never mistaken for a live one and needs no pid-based
@@ -80,6 +80,7 @@ from pathlib import Path
 import uvicorn
 
 from dudamel.config import Settings
+from dudamel.exceptions import AlreadyRunningError
 from dudamel.interfaces.telegram import TelegramInterface
 from dudamel.interfaces.telegram import resolve_token as resolve_telegram_token
 from dudamel.llm.provider import Provider
@@ -115,8 +116,10 @@ class _InstanceLock:
     fresh `acquire()` against a dead holder's file just succeeds, the same
     way it would against a file that was never locked at all. A second
     `acquire()` while the first is genuinely live raises `BlockingIOError`
-    internally, translated to the same public `RuntimeError` this always
-    raised. The pid is still written into the file, but purely as an
+    internally, translated to `AlreadyRunningError` -- a `DudamelError` (so
+    `dudamel run` prints a clean one-liner) that also subclasses
+    `RuntimeError`, preserving the historical `RuntimeError` contract. The
+    pid is still written into the file, but purely as an
     operator diagnostic (`cat` the lockfile to see who holds it) — nothing
     here depends on reading it back for correctness.
     """
@@ -131,7 +134,7 @@ class _InstanceLock:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             os.close(fd)
-            raise RuntimeError(
+            raise AlreadyRunningError(
                 f"dudamel is already running against {self._path.parent} "
                 f"(lockfile {self._path} held by a live process)"
             ) from None
@@ -226,8 +229,8 @@ async def serve(
 ) -> None:
     """Run dudamel as a single process until stopped (SIGTERM/SIGINT, or
     this coroutine's own task being cancelled — both shut down the same
-    way). Raises `RuntimeError` if another `serve()` is already running
-    against `settings.data_dir`.
+    way). Raises `AlreadyRunningError` (a `DudamelError` and `RuntimeError`)
+    if another `serve()` is already running against `settings.data_dir`.
 
     For `port=0` callers (tests): once the web server is bound, the real
     OS-assigned port is written back into `settings.web.port` in place, so a
