@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager
 from typing import TYPE_CHECKING, Any
 
-from pydantic import AliasChoices, BaseModel, ValidationError
+from pydantic import AliasChoices, AliasPath, BaseModel, ValidationError
 
 from dudamel.contract.renderers import RENDERERS
 from dudamel.contract.schema import ToolSchema
@@ -42,23 +42,33 @@ def _accepted_keys(model: type[BaseModel]) -> set[str]:
     by_name = bool(config.get("validate_by_name") or config.get("populate_by_name"))
     keys: set[str] = set()
     for field_name, field in model.model_fields.items():
-        aliases: list[str] = []
-        # pydantic mirrors a plain `alias=` into `validation_alias`, so this
-        # branch covers both spellings; `alias` remains the fallback for any
-        # field that only carries the serialization-side name.
-        if isinstance(field.validation_alias, AliasChoices):
-            aliases = [
-                choice for choice in field.validation_alias.choices if isinstance(choice, str)
-            ]
-        elif isinstance(field.validation_alias, str):
-            aliases = [field.validation_alias]
+        # pydantic mirrors a plain `alias=` into `validation_alias`, so the
+        # first branch covers both spellings; `alias` remains the fallback for
+        # a field carrying only the serialization-side name.
+        if field.validation_alias is not None:
+            aliased = True
+            sources: list[Any] = (
+                list(field.validation_alias.choices)
+                if isinstance(field.validation_alias, AliasChoices)
+                else [field.validation_alias]
+            )
         elif field.alias is not None:
-            aliases = [field.alias]
-        if not aliases:
-            keys.add(field_name)
-            continue
-        keys.update(aliases)
-        if by_name:
+            aliased = True
+            sources = [field.alias]
+        else:
+            aliased = False
+            sources = []
+        for source in sources:
+            if isinstance(source, str):
+                keys.add(source)
+            elif isinstance(source, AliasPath) and source.path and isinstance(source.path[0], str):
+                # a path alias is looked up under its first path element
+                keys.add(source.path[0])
+        # An alias whose top-level key we cannot name still means the field name
+        # is not accepted. Falling back to it would advertise a spelling that
+        # validation rejects, which is the failure this function exists to
+        # prevent; refusing a key we cannot name fails closed instead.
+        if by_name or not aliased:
             keys.add(field_name)
     return keys
 
