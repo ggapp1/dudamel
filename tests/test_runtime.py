@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import time
 from pathlib import Path
 
@@ -38,6 +39,34 @@ def make_settings(tmp_path: Path, **tiers: TierConfig) -> Settings:
         project_dir=tmp_path,
         llm_tiers=tiers or {"standard": TierConfig(provider="fake", model="f")},
     )
+
+
+async def test_warns_when_migrations_live_under_data_dir_not_project_dir(tmp_path, caplog) -> None:
+    """A programmatic embedder who builds Settings(data_dir=X) directly
+    (not via Settings.load) and puts app migrations under X gets them
+    silently ignored -- start() resolves migrations from project_dir. Warn
+    so the operator sees why their migrations never ran."""
+    data_dir = tmp_path / "data"
+    project_dir = tmp_path / "project"
+    (data_dir / "migrations").mkdir(parents=True)
+    project_dir.mkdir()
+    database_url = f"sqlite+aiosqlite:///{tmp_path}/rt.db"
+    upgrade_core(database_url)  # so the auto_migrate=False gate passes cleanly
+    settings = Settings(
+        database_url=database_url,
+        data_dir=data_dir,
+        project_dir=project_dir,
+        auto_migrate=False,
+        llm_tiers={"standard": TierConfig(provider="fake", model="f")},
+    )
+    rt = Runtime(make_orc(), settings, providers={"standard": FakeProvider([])})
+    with caplog.at_level(logging.WARNING, logger="dudamel.runtime"):
+        await rt.start()
+    assert any(
+        "migrations" in r.message and "data_dir" in r.message and "project_dir" in r.message
+        for r in caplog.records
+    )
+    await rt.stop()
 
 
 async def test_chat_end_to_end_with_fake_provider(tmp_path) -> None:

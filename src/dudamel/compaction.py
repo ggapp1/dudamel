@@ -266,6 +266,12 @@ class Compactor:
         best-effort, so this turn proceeds uncompacted rather than writing a
         wrong watermark.
         """
+        if dropped < 1:
+            # Nothing was dropped, so nothing is watermarked. Guarding here
+            # keeps the public `maybe_compact` path from ever indexing
+            # `history[dropped - 1]` at `[-1]`, which would name the NEWEST
+            # row as the watermark and mark the whole history covered.
+            return None
         async with self._db.session() as s:
             rows = (
                 await s.execute(
