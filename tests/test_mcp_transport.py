@@ -63,6 +63,31 @@ def test_http_label_strips_userinfo_and_query() -> None:
     assert "host" in cfg.label
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://localhost:70000/mcp",  # port out of range 0-65535
+        "https://host:abc/mcp",  # port not an integer at all
+        "http://[::1/mcp",  # unterminated IPv6 literal: urlsplit itself fails
+        "http://user:pw@host:99999/mcp?token=sk-secret-456",  # bad port AND secrets
+    ],
+)
+def test_malformed_url_label_never_raises(url: str) -> None:
+    """`label` is interpolated into every mount/reconnect/teardown warning and
+    the supervisor task name, several of them inside except-BaseException
+    handlers, and `MCPMount.mount()` reads it before its own try block. So a
+    label that can raise is a boot crash from a one-character config typo --
+    against the module's contract that no MCP config may ever crash
+    `Runtime.start()`. `urlsplit(...).port` raises `ValueError` for a
+    non-numeric or out-of-range port, and `urlsplit` itself raises on a
+    malformed IPv6 literal; neither may reach a caller."""
+    label = MCPServerConfig(url=url).label
+    assert isinstance(label, str) and label
+    # Degrading must not degrade the redaction: no userinfo, no query.
+    assert "sk-secret-456" not in label
+    assert "pw" not in label
+
+
 def test_mcp_server_rejects_neither_command_nor_url() -> None:
     with pytest.raises(ValueError, match="exactly one of"):
         MCPServerConfig()
@@ -85,6 +110,18 @@ async def test_unreachable_url_yields_no_tools_and_never_raises(
     assert any(
         "failed to mount" in r.message and "127.0.0.1:9" in r.message for r in caplog.records
     )
+
+
+async def test_malformed_url_entry_degrades_instead_of_crashing_the_mount(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The whole point of the label being unraisable: a typo'd port is a
+    warn-and-skip like any other bad server config, not an exception out of
+    `mount()` (and therefore out of `Runtime.start()`)."""
+    mount = MCPMount([MCPServerConfig(url="http://localhost:70000/mcp")])
+    assert await mount.mount() == []
+    await mount.close()
+    assert any("failed to mount" in r.message for r in caplog.records)
 
 
 async def test_headers_reach_the_http_client_and_never_the_logs(

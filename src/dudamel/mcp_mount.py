@@ -285,12 +285,33 @@ def _redact_stdio_label(command: str) -> str:
 def _redact_url_label(url: str) -> str:
     """`scheme://host[:port]/path`, dropping userinfo and query -- both of
     which routinely carry secrets (`https://user:pw@host/mcp?token=...`).
-    Scheme, host and path are enough to identify a server in a log line."""
-    parts = urlsplit(url)
-    netloc = parts.hostname or ""
-    if parts.port is not None:
-        netloc = f"{netloc}:{parts.port}"
-    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+    Scheme, host and path are enough to identify a server in a log line.
+
+    Never raises, for the same reason `_redact_stdio_label` doesn't: this is
+    read by `MCPMount.mount()` before its per-server try block, and it is
+    interpolated into warnings raised from inside except-BaseException
+    handlers. A URL that cannot be parsed is a config typo, and a config typo
+    must degrade to a warn-and-skip, never crash `Runtime.start()`.
+    """
+    try:
+        parts = urlsplit(url)
+        netloc = parts.hostname or ""
+        try:
+            port = parts.port
+        except ValueError:
+            # `SplitResult.port` RAISES (rather than returning None) for a
+            # non-numeric or out-of-range port. The literal marker keeps the
+            # typo visible without echoing the raw netloc, which may carry
+            # userinfo this function exists to strip.
+            netloc = f"{netloc}:<invalid port>"
+        else:
+            if port is not None:
+                netloc = f"{netloc}:{port}"
+        return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+    except ValueError:
+        # `urlsplit` itself rejects some shapes outright (an unterminated
+        # IPv6 literal, say), so nothing above is safe to show.
+        return "<unparseable url>"
 
 
 @dataclass(frozen=True)
