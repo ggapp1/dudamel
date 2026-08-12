@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import subprocess
 import time
+import zipfile
 from pathlib import Path
 
 import httpx
@@ -25,6 +27,33 @@ from dudamel.llm.testing import FakeProvider
 from dudamel.serve import serve
 
 REPO_ROOT = Path(__file__).parent.parent
+
+# Runs INSIDE the scaffolded project's resolved environment and prints the
+# version plus a digest over the installed `dudamel` package's own `.py`
+# files. Kept in lockstep with `_wheel_payload_digest` below, which computes
+# the same digest over the wheel this test built -- equal digests mean the
+# files under test are the ones this checkout produced.
+_ORIGIN_PROBE = """
+import hashlib, importlib.metadata as md, pathlib
+d = md.distribution("dudamel")
+root = pathlib.Path(str(d.locate_file("dudamel")))
+h = hashlib.sha256()
+for p in sorted(root.rglob("*.py")):
+    h.update(p.relative_to(root).as_posix().encode())
+    h.update(hashlib.sha256(p.read_bytes()).digest())
+print(d.version, h.hexdigest())
+"""
+
+
+def _wheel_payload_digest(wheel: Path) -> str:
+    """The `_ORIGIN_PROBE` digest, computed over a built wheel's contents."""
+    h = hashlib.sha256()
+    with zipfile.ZipFile(wheel) as z:
+        names = sorted(n for n in z.namelist() if n.startswith("dudamel/") and n.endswith(".py"))
+        for name in names:
+            h.update(name[len("dudamel/") :].encode())
+            h.update(hashlib.sha256(z.read(name)).digest())
+    return h.hexdigest()
 
 
 @pytest.fixture(autouse=True)
@@ -119,18 +148,24 @@ def test_quickstart_runs_via_real_uv_run_subprocess_in_scaffolded_project(
     shells out for real, exactly as a reader following the README would.
 
     The scaffold declares an unbounded `dudamel` dependency and `--find-links`
-    is an ADDITIONAL source, not an override -- so `uv` resolves the highest
-    version it can see across the real index and the wheel built here. When
-    this checkout is behind the published version, the index wins and this
-    test would validate the PUBLISHED package rather than the one being
-    released. The final step below asserts the resolved version matches the
-    wheel built from this checkout: that check binds -- and would catch the
-    substitution -- whenever the working tree's version differs from the
-    currently published one, and is inert (true either way, substitution or
-    not) when the two happen to match. Slow (a wheel build plus real `uv`
-    subprocess invocations, each spinning up a project venv) but must always
-    run, not be skipped, since it is the one test that would catch a
-    packaging regression the in-process tests structurally cannot see.
+    is an ADDITIONAL source, not an override -- so `uv` resolves across the
+    real index and the wheel built here, and if the index wins this test
+    would validate the PUBLISHED package rather than the one being released.
+    The final step below rules that out by CONTENT rather than by version:
+    it hashes the `.py` payload of the wheel built above and requires the
+    installed distribution's files to hash identically. That is what a
+    version comparison cannot do -- a working tree at the same version as
+    the published release (the ordinary state between releases) resolves to
+    that version either way, so a version check is simply true regardless of
+    which wheel won, while the payload of an index build with local changes
+    on top of it is necessarily different. The only way this assertion can
+    hold on a substituted install is if the index's wheel is byte-identical
+    to the one built here, in which case there is nothing to catch.
+
+    Slow (a wheel build plus real `uv` subprocess invocations, each spinning
+    up a project venv) but must always run, not be skipped, since it is the
+    one test that would catch a packaging regression the in-process tests
+    structurally cannot see.
     """
     dist_dir = tmp_path / "dist"
     subprocess.run(
@@ -174,23 +209,23 @@ def test_quickstart_runs_via_real_uv_run_subprocess_in_scaffolded_project(
     built_version = wheels[0].name.split("-")[1]
 
     resolved_proc = subprocess.run(
-        [
-            "uv",
-            "run",
-            "--find-links",
-            str(dist_dir),
-            "python",
-            "-c",
-            "import dudamel; print(dudamel.__version__)",
-        ],
+        ["uv", "run", "--find-links", str(dist_dir), "python", "-c", _ORIGIN_PROBE],
         cwd=target,
         capture_output=True,
         text=True,
         timeout=120,
     )
     assert resolved_proc.returncode == 0, resolved_proc.stderr
-    assert resolved_proc.stdout.strip() == built_version, (
-        f"this test resolved dudamel {resolved_proc.stdout.strip()!r} but the wheel "
-        f"under test is {built_version!r} -- --find-links lost to the package index, "
-        "so the release candidate was never actually exercised"
+    # Measured, not assumed: resolving the same project WITHOUT --find-links
+    # yields the identical version string and a different payload digest --
+    # so the digest is what carries the signal here, and it is not weakened
+    # by the version happening to match. (uv leaves no `direct_url.json` for
+    # a --find-links install, so there is no installer-provided origin
+    # record to read instead.)
+    resolved_version, resolved_digest = resolved_proc.stdout.split()
+    assert resolved_digest == _wheel_payload_digest(wheels[0]), (
+        f"the scaffolded project resolved dudamel {resolved_version!r}, whose installed "
+        f"files do NOT match the wheel built from this checkout ({built_version!r}) -- "
+        "--find-links lost to the package index, so the release candidate was never "
+        "actually exercised"
     )
