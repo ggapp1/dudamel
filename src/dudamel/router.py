@@ -353,6 +353,24 @@ class Router:
                     # includes the newest turn even when that turn alone
                     # exceeds whatever budget it's given (window.py), with
                     # or without a summary competing for the same budget.
+                    #
+                    # This recompute can also DROP MORE than the span the
+                    # summary above actually covers: the summary was
+                    # produced against the ORIGINAL `dropped` count, but
+                    # `remaining_budget` is strictly smaller than the
+                    # budget the first `build_window` call got, so this
+                    # second call may push the cut point further back. Any
+                    # turns in that gap -- newer than what the summary
+                    # covers, older than what the rebuilt window keeps --
+                    # are invisible THIS turn: not in the window, and not
+                    # covered by the summary's own taint flag either. The
+                    # taint OR below is what closes that gap for THIS turn.
+                    # It self-heals starting next turn regardless: the
+                    # summary's `up_to_message_id` watermark is still the
+                    # smaller, original value, so `_compact_once`'s reuse
+                    # check (`newest.up_to_message_id >= watermark`) fails
+                    # against the next turn's larger `dropped`, forcing a
+                    # wider re-summarize that covers the gap for real.
                     remaining_budget = max(
                         self._config.window_tokens - estimate_tokens(summary_message.text), 0
                     )
@@ -362,6 +380,8 @@ class Router:
                         tool_result_cap=self._config.tool_result_cap,
                     )
                     dropped = len(history) - len(window_body)
+                    if self._config.taint_mode != "off":
+                        turn_tainted = turn_tainted or self._dropped_tainted(history[:dropped])
             window = [self._system_message()]
             if summary_message is not None:
                 window.append(summary_message)

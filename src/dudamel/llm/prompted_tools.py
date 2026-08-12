@@ -153,21 +153,39 @@ def _parse_calls(text: str, *, cap: int) -> list[ToolCall] | None:
     """
     stripped = _THINK_RE.sub("", text).strip()
     if not stripped:
+        logger.debug("prompted-tools: empty completion after <think> stripping; degrading to text")
         return None
     fence_match = _FENCE_RE.match(stripped)
     candidate = fence_match.group(1).strip() if fence_match else stripped
     try:
         envelope: Any = json.loads(candidate)
     except json.JSONDecodeError:
+        logger.debug(
+            "prompted-tools: completion is not a JSON call envelope, degrading to text: %r",
+            candidate[:80],
+        )
         return None
     if not isinstance(envelope, dict) or not isinstance(envelope.get("tool_calls"), list):
+        logger.debug(
+            "prompted-tools: parsed JSON lacks a 'tool_calls' list, degrading to text: %r",
+            candidate[:80],
+        )
         return None
+    raw_calls = envelope["tool_calls"]
+    if len(raw_calls) > cap:
+        logger.info(
+            "prompted-tools: model requested %d tool calls, truncating to the %d-call cap",
+            len(raw_calls),
+            cap,
+        )
     calls: list[ToolCall] = []
-    for item in envelope["tool_calls"][:cap]:
+    for item in raw_calls[:cap]:
         if not isinstance(item, dict):
+            logger.debug("prompted-tools: skipping non-object tool_calls entry: %r", item)
             continue
         name = item.get("name")
         if not isinstance(name, str) or not name:
+            logger.debug("prompted-tools: skipping tool_calls entry with invalid name: %r", name)
             continue
         args = item.get("arguments")
         if not isinstance(args, dict):
@@ -224,6 +242,7 @@ class PromptedToolsProvider:
         # contain a well-formed-looking call envelope rendered from history.
         calls = _parse_calls(completion.message.text, cap=_MAX_CALLS)
         if calls is None:
+            logger.debug("prompted-tools: no call envelope parsed, returning plain text reply")
             return completion  # unparseable (or no call requested): plain text reply
         return Completion(
             message=Message(role="assistant", text="", tool_calls=calls),

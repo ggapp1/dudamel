@@ -166,6 +166,16 @@ class Compactor:
         result = await self._compact_once(
             conversation_id, history, dropped, dropped_tainted=dropped_tainted
         )
+        # Evict any entry left over from an earlier turn on this same
+        # conversation before inserting this turn's result. A turn_key is
+        # fresh per call to `_loop` (see router.py), so without this the
+        # cache would hold one entry per turn for the process lifetime --
+        # unbounded, since a long-lived process handles arbitrarily many
+        # turns. Only one entry per conversation is ever needed: the cache
+        # exists purely to memoize repeat calls WITHIN one turn's iteration
+        # loop, never across turns.
+        for key in [k for k in self._turn_cache if k[0] == conversation_id]:
+            del self._turn_cache[key]
         self._turn_cache[cache_key] = result
         return result
 
@@ -198,6 +208,20 @@ class Compactor:
                 "conversation %s: compaction summarizer failed, proceeding uncompacted: %s",
                 conversation_id,
                 e,
+            )
+            return None
+        if not summary_text:
+            # A cleaned-to-empty summarizer output (e.g. the model replied
+            # with only a code fence, or whitespace) is a failure, not a
+            # zero-length gist: writing it as a row would mean every later
+            # turn reuses that watermark and prepends an empty framed
+            # message forever, since `_summarize`/`_write` never revisit an
+            # already-covered span. Treat it the same as a summarizer
+            # exception -- proceed uncompacted instead.
+            logger.warning(
+                "conversation %s: compaction summarizer returned empty output, "
+                "proceeding uncompacted",
+                conversation_id,
             )
             return None
         return await self._write(conversation_id, watermark, summary_text, dropped_tainted)
