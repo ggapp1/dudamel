@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
@@ -45,6 +46,7 @@ __all__ = ["TelegramInterface", "resolve_token"]
 
 _MAX_MESSAGE_LEN = 4096
 _STRANGER_COOLDOWN = timedelta(hours=1)
+_MAX_STRANGER_ENTRIES = 1000
 
 
 def resolve_token(settings: Settings) -> str | None:
@@ -70,8 +72,8 @@ def _fit_single_message(text: str, limit: int = _MAX_MESSAGE_LEN) -> str:
     split across several the way `_send_text`/`notify` can: an inline
     keyboard lives on exactly one message, and editing a message can't fan
     out into more than the one it's editing. A tool call's args summary
-    (arbitrary user/model-supplied values -- see `Router._request_
-    confirmation`) is the realistic way this gets hit."""
+    (arbitrary user/model-supplied values -- see `Router._suspend`) is the
+    realistic way this gets hit."""
     if len(text) <= limit:
         return text
     return text[: limit - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
@@ -91,7 +93,7 @@ class TelegramInterface:
             )
         self._runtime = runtime
         self._settings = settings
-        self._last_stranger_reply: dict[int, datetime] = {}
+        self._last_stranger_reply: OrderedDict[int, datetime] = OrderedDict()
         self._app: Application = ApplicationBuilder().token(token).build()
         self._app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message))
         self._app.add_handler(CallbackQueryHandler(self._on_callback))
@@ -146,7 +148,7 @@ class TelegramInterface:
             await self._app.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
         except BadRequest as e:
             # The args summary embedded in `text` is arbitrary user/model
-            # data (see `Router._request_confirmation`) and the API can
+            # data (see `Router._suspend`) and the API can
             # reject it for reasons the length check above doesn't cover --
             # degrade to a short, guaranteed-safe prompt rather than lose
             # the confirm/cancel buttons entirely.
@@ -173,13 +175,15 @@ class TelegramInterface:
         if last is not None and now - last < _STRANGER_COOLDOWN:
             return True
         self._last_stranger_reply[user_id] = now
-        # Bound the dict: prune entries older than 1 hour when size exceeds 1000.
-        if len(self._last_stranger_reply) > 1000:
-            self._last_stranger_reply = {
-                uid: ts
-                for uid, ts in self._last_stranger_reply.items()
-                if now - ts < _STRANGER_COOLDOWN
-            }
+        self._last_stranger_reply.move_to_end(user_id)
+        # Bound the dict by LRU eviction. Age-based pruning alone cannot bound
+        # it: a flood of >1000 DISTINCT strangers within the cooldown window
+        # leaves every entry fresh, so an age filter removes nothing. Evicting
+        # the oldest entries caps the size unconditionally; a stranger whose
+        # entry is evicted simply gets one more ID-reply than the ideal one
+        # per hour, which is harmless.
+        while len(self._last_stranger_reply) > _MAX_STRANGER_ENTRIES:
+            self._last_stranger_reply.popitem(last=False)
         return False
 
     # -- handlers -------------------------------------------------------------------
@@ -280,4 +284,4 @@ class TelegramInterface:
         polling internals) here instead of letting it propagate and kill the
         update-processing loop. Logged, not silently swallowed, so a handler
         bug shows up rather than just going dark."""
-        logger.error("telegram handler error: %s", context.error)
+        logger.error("telegram handler error: %s", context.error, exc_info=context.error)
