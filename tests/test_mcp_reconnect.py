@@ -740,6 +740,52 @@ async def test_drift_discovered_by_a_call_s_own_reconnect_stops_that_call(
         await mount.close()
 
 
+async def test_drift_discovered_by_a_pre_dispatch_reconnect_stops_that_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same rule as the mid-call case above, on the OTHER path that
+    reconnects: the pre-dispatch branch.
+
+    The Router evaluates its confirm gate before `Tool.fn` runs, i.e. while
+    `confirm` is still whatever the previous incarnation of the server
+    justified. If the pre-dispatch rebuild is the thing that discovers the
+    tool is now declared destructive, dispatching anyway would execute --
+    once, with no gate and no approval -- a call the server just declared
+    destructive. The call is withheld instead; the tool is now `confirm=True`,
+    so a re-issued call goes through the confirmation gate.
+
+    Getting into the pre-dispatch branch takes a mutating call's death first:
+    that marks the connection lost WITHOUT rebuilding, which is exactly what
+    sends the next call down this branch.
+    """
+    name = "drift-predispatch"
+    mount = MCPMount([flaky_cmd(tmp_path, monkeypatch, name=name)])
+    try:
+        tools = await mount.mount()
+        echo = _tool(tools, "echo")
+        assert echo.read_only is True and echo.confirm is False
+        await _kill_and_wait(await _wait_for_pid(f"mcp_flaky_server.py {name}"))
+        with pytest.raises(UnknownToolOutcome):
+            await _tool(tools, "slow_mutate").fn(value="v")
+        server = mount._servers[0]
+        # No rebuild yet: the next call takes the pre-dispatch branch.
+        assert server.alive is False and server.reconnect_count == 0
+        # The incarnation that branch spawns declares echo mutating.
+        monkeypatch.setenv("MCP_FLAKY_ANNOTATIONS", "drift")
+        with pytest.raises(RuntimeError, match="not dispatched") as excinfo:
+            await echo.fn(text="x")
+        # Not an unknown outcome: nothing was sent, so nothing is in doubt.
+        assert not isinstance(excinfo.value, UnknownToolOutcome)
+        # The rebuild itself still happened and still recorded the drift.
+        assert server.reconnect_count == 1
+        assert echo.confirm is True and echo.read_only is False
+        # And the withholding is one-shot, not a brick: now that the gate is
+        # in place, the next call (a confirmed one, in the Router) dispatches.
+        assert await echo.fn(text="x") == "x"
+    finally:
+        await mount.close()
+
+
 async def test_vanished_tool_returns_an_error_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
