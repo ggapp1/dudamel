@@ -480,6 +480,64 @@ async def test_confirm_button_roundtrip_approved_by_originating_user(
     await rt.stop()
 
 
+async def test_callback_chained_confirmation_is_surfaced(
+    tmp_path: Path, token_env: str
+) -> None:
+    """Approving one confirmation can resume a turn whose model then requests
+    ANOTHER confirm-gated tool. The callback handler must surface that
+    follow-up confirmation (its buttons + a fresh id), not drop it, or the
+    second action is unapprovable and the user is stranded."""
+    rt, interface = await build(
+        tmp_path,
+        [
+            fake_tool_call("wipe", {"reason": "first"}, id="tc1"),
+            fake_tool_call("wipe", {"reason": "second"}, id="tc2"),
+            fake_text("All done"),
+        ],
+    )
+    original_chat = make_chat(id=777)
+    msg = make_message("wipe it", chat=original_chat, from_user=make_user(id=111))
+    await interface._on_message(make_update(message=msg), None)
+    bot: FakeBot = interface._app.bot
+    first_cb = bot.sent[0]["reply_markup"].inline_keyboard[0][0].callback_data
+    first_id = first_cb.split(":")[1]
+
+    sent_message = make_message(
+        None, chat=original_chat, from_user=make_user(id=111), message_id=99
+    )
+    query = CallbackQuery(
+        id="cbq1",
+        from_user=make_user(id=111),
+        chat_instance="ci1",
+        message=sent_message,
+        data=first_cb,
+    )
+    await interface._on_callback(make_update(callback_query=query, update_id=2), None)
+
+    # A second confirmation must have been sent, with buttons and a NEW id.
+    chained = [s for s in bot.sent[1:] if isinstance(s["reply_markup"], InlineKeyboardMarkup)]
+    assert len(chained) == 1
+    assert chained[0]["chat_id"] == 777
+    second_cb = chained[0]["reply_markup"].inline_keyboard[0][0].callback_data
+    second_id = second_cb.split(":")[1]
+    assert second_id != first_id
+
+    # And the surfaced second confirmation is itself resolvable end-to-end.
+    sent_message2 = make_message(
+        None, chat=original_chat, from_user=make_user(id=111), message_id=100
+    )
+    query2 = CallbackQuery(
+        id="cbq2",
+        from_user=make_user(id=111),
+        chat_instance="ci2",
+        message=sent_message2,
+        data=second_cb,
+    )
+    await interface._on_callback(make_update(callback_query=query2, update_id=3), None)
+    assert any(e["text"] == "All done" for e in bot.edited)
+    await rt.stop()
+
+
 async def test_confirm_button_from_unauthorized_user_does_not_resolve(
     tmp_path: Path, token_env: str
 ) -> None:

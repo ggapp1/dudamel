@@ -25,7 +25,7 @@ import logging
 import os
 from datetime import UTC, datetime, timedelta
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
@@ -237,23 +237,42 @@ class TelegramInterface:
             confirmation_id, approved=(action == "yes"), user_id=str(user.id)
         )
         if message is not None:
-            edit_text = _fit_single_message(reply.text)
-            try:
-                await self._app.bot.edit_message_text(
-                    chat_id=message.chat.id,
-                    message_id=message.message_id,
-                    text=edit_text,
-                    reply_markup=None,
+            if reply.pending_confirmation_id is not None:
+                # Resolving this confirmation resumed the turn, whose model
+                # then requested ANOTHER confirm-gated call. Strip the now-stale
+                # buttons off the just-resolved prompt, then surface the
+                # follow-up as its own message with its own buttons + id --
+                # dropping it here would leave the second action unapprovable.
+                await self._edit_confirmation_result(
+                    message, "Approved." if action == "yes" else "Declined."
                 )
-            except BadRequest as e:
-                logger.warning("telegram confirmation edit rejected (%s); using plain fallback", e)
-                await self._app.bot.edit_message_text(
-                    chat_id=message.chat.id,
-                    message_id=message.message_id,
-                    text="Done (original reply could not be delivered).",
-                    reply_markup=None,
+                await self._send_confirmation(
+                    message.chat.id, reply.text, reply.pending_confirmation_id
                 )
+            else:
+                await self._edit_confirmation_result(message, reply.text)
         await self._app.bot.answer_callback_query(query.id)
+
+    async def _edit_confirmation_result(self, message: Message, text: str) -> None:
+        """Replace a confirmation prompt's text and drop its inline keyboard,
+        degrading to a short guaranteed-safe note if the API rejects the edit
+        (the resolved reply is arbitrary model/user text — see `Router._suspend`)."""
+        edit_text = _fit_single_message(text)
+        try:
+            await self._app.bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                text=edit_text,
+                reply_markup=None,
+            )
+        except BadRequest as e:
+            logger.warning("telegram confirmation edit rejected (%s); using plain fallback", e)
+            await self._app.bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                text="Done (original reply could not be delivered).",
+                reply_markup=None,
+            )
 
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Registered via `Application.add_error_handler` — PTB routes any
