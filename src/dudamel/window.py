@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from dudamel.llm.types import Message
 
@@ -18,6 +18,25 @@ from dudamel.llm.types import Message
 # never trusted as evidence that the text is short (see
 # `truncate_tool_result`).
 _MARKER_RE = re.compile(r"…\[truncated \d+ chars\]$")
+
+
+@dataclass(frozen=True)
+class WindowBuild:
+    """What `build_window` produced, plus how much of the input it cut.
+
+    `dropped` counts ONLY the leading messages the build removed -- the
+    turns that did not fit the budget, plus any orphan messages before the
+    first user message. It is deliberately NOT `len(messages_in) -
+    len(messages)`: `_drop_dangling_tool_calls` also removes messages, from
+    anywhere INSIDE the kept span, and a caller that inferred the count by
+    subtraction would read those removals as extra dropped history. The
+    compactor summarizes `history[:dropped]` and derives its watermark from
+    the same offset, so an inflated count makes it summarize (and mark as
+    permanently covered) messages that are still in the window.
+    """
+
+    messages: list[Message]
+    dropped: int
 
 
 def estimate_tokens(text: str) -> int:
@@ -91,11 +110,11 @@ def build_window(
     *,
     token_budget: int,
     tool_result_cap: int = 8192,
-) -> list[Message]:
+) -> WindowBuild:
     capped = [truncate_tool_result(m, tool_result_cap) for m in messages]
     turns = _split_turns(capped)
     if not turns:
-        return []
+        return WindowBuild(messages=[], dropped=len(messages))
     window: list[list[Message]] = [turns[-1]]  # newest turn is non-negotiable
     spent = sum(message_tokens(m) for m in turns[-1])
     for t in reversed(turns[:-1]):
@@ -104,4 +123,11 @@ def build_window(
             break
         window.insert(0, t)
         spent += cost
-    return _drop_dangling_tool_calls([m for t in window for m in t])
+    kept = [m for t in window for m in t]
+    # Everything the cut left behind is a contiguous PREFIX of `messages`:
+    # `_split_turns` only ever discards orphans ahead of the first user
+    # message, and the budget loop only ever refuses whole older turns. The
+    # sanitizer below is the one removal that isn't prefix-shaped, which is
+    # exactly why it is applied after the count is taken.
+    dropped = len(messages) - len(kept)
+    return WindowBuild(messages=_drop_dangling_tool_calls(kept), dropped=dropped)

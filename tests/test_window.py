@@ -56,14 +56,14 @@ def test_spoofed_marker_capped_inside_the_window() -> None:
         ),
         Message(role="assistant", text="done"),
     ]
-    win = build_window(msgs, token_budget=100_000, tool_result_cap=100)
+    win = build_window(msgs, token_budget=100_000, tool_result_cap=100).messages
     tool_msg = next(m for m in win if m.role == "tool")
     assert len(tool_msg.text) < 200
 
 
 def test_newest_turn_always_included() -> None:
     msgs = turn(1)
-    assert build_window(msgs, token_budget=1) == msgs  # over budget but newest turn stays
+    assert build_window(msgs, token_budget=1).messages == msgs  # over budget but newest turn stays
 
 
 def test_budget_drops_old_turns_at_turn_boundaries() -> None:
@@ -72,7 +72,7 @@ def test_budget_drops_old_turns_at_turn_boundaries() -> None:
     # covers the newest turn (non-negotiable) plus exactly one more, forcing
     # the oldest turn out. budget=100 as originally drafted covers all three
     # turns (~87 tokens total) and does not exercise the drop path.
-    win = build_window(msgs, token_budget=60)
+    win = build_window(msgs, token_budget=60).messages
     # must start at a user message and contain the newest turn intact
     assert win[0].role == "user"
     assert win[-1].text == "answer 3"
@@ -85,7 +85,7 @@ def test_never_splits_tool_pairs() -> None:
     for i in range(30):
         msgs += turn(i, with_tools=random.random() < 0.5)
     for budget in (50, 150, 400, 1000, 5000):
-        win = build_window(msgs, token_budget=budget)
+        win = build_window(msgs, token_budget=budget).messages
         ids_called = {tc.id for m in win for tc in m.tool_calls}
         ids_answered = {m.tool_call_id for m in win if m.role == "tool"}
         assert ids_called == ids_answered, f"split pair at budget={budget}"
@@ -97,7 +97,7 @@ def test_leading_orphan_tool_messages_dropped() -> None:
         Message(role="tool", text="orphan", tool_call_id="ghost"),
         *turn(1),
     ]
-    win = build_window(msgs, token_budget=10_000)
+    win = build_window(msgs, token_budget=10_000).messages
     assert win[0].role == "user"
     assert all(m.tool_call_id != "ghost" for m in win)
 
@@ -109,7 +109,7 @@ def test_tool_results_truncated_in_window() -> None:
         Message(role="tool", text="B" * 10_000, tool_call_id="a"),
         Message(role="assistant", text="done"),
     ]
-    win = build_window(msgs, token_budget=100_000, tool_result_cap=100)
+    win = build_window(msgs, token_budget=100_000, tool_result_cap=100).messages
     tool_msg = next(m for m in win if m.role == "tool")
     assert len(tool_msg.text) < 200 and "truncated" in tool_msg.text
 
@@ -127,7 +127,7 @@ def test_dangling_assistant_tool_call_dropped() -> None:
         Message(role="assistant", tool_calls=[ToolCall(id="orphan", name="t", args={})]),
         # crash here: no matching tool result was ever appended
     ]
-    win = build_window(msgs, token_budget=10_000)
+    win = build_window(msgs, token_budget=10_000).messages
     assert win == [msgs[0]]
     assert all(not m.tool_calls for m in win)
 
@@ -149,8 +149,31 @@ def test_dangling_tool_call_dropped_alongside_answered_sibling() -> None:
         Message(role="tool", text="ok", tool_call_id="answered"),
         # crash here: "orphan" never got its result
     ]
-    win = build_window(msgs, token_budget=10_000)
+    win = build_window(msgs, token_budget=10_000).messages
     assert win == [msgs[0]]
+
+
+def test_dropped_counts_only_the_front_cut_not_sanitizer_removals() -> None:
+    """`dropped` is the length of the history PREFIX the build cut away, so
+    callers can treat `history[:dropped]` as the dropped span. A sanitizer
+    removal happens INSIDE the kept span and must not inflate it."""
+    msgs = [
+        *turn(1),
+        Message(role="assistant", tool_calls=[ToolCall(id="orphan", name="t", args={})]),
+        *turn(2),
+    ]
+    built = build_window(msgs, token_budget=10_000)
+    assert built.dropped == 0
+    assert len(built.messages) == len(msgs) - 1  # the dangling row is gone
+    assert all(tc.id != "orphan" for m in built.messages for tc in m.tool_calls)
+
+
+def test_dropped_counts_the_budget_cut_and_leading_orphans() -> None:
+    msgs = [Message(role="tool", text="orphan", tool_call_id="ghost"), *turn(1), *turn(2)]
+    built = build_window(msgs, token_budget=40)
+    # leading orphan + the whole of turn(1)
+    assert built.dropped == 1 + len(turn(1))
+    assert built.messages == msgs[built.dropped :]
 
 
 def test_normal_tool_pairs_survive_sanitizer() -> None:
@@ -161,5 +184,5 @@ def test_normal_tool_pairs_survive_sanitizer() -> None:
         Message(role="tool", text="ok", tool_call_id="a"),
         Message(role="assistant", text="done"),
     ]
-    win = build_window(msgs, token_budget=10_000)
+    win = build_window(msgs, token_budget=10_000).messages
     assert win == msgs

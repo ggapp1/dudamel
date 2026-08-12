@@ -18,6 +18,7 @@ from dudamel.llm.testing import FakeProvider, fake_text, fake_tool_call
 from dudamel.llm.types import Completion, Message, ToolCall, Usage
 from dudamel.migrate import upgrade_core
 from dudamel.models_core import Activity, Summary
+from dudamel.models_core import Message as MessageRow
 from dudamel.registry import Registry
 from dudamel.router import ChatReply, Router, select_tool_subset
 from dudamel.window import message_tokens
@@ -1002,6 +1003,95 @@ async def test_compaction_recompute_gap_still_taints(tmp_path) -> None:
     # confirm-gated.
     assert reply.pending_confirmation_id is not None
     assert CALLS == []  # log_workout did not run
+    await db.dispose()
+
+
+async def test_sanitizer_removal_alone_does_not_trigger_compaction(tmp_path) -> None:
+    """A DB written before appends became atomic can hold an assistant
+    tool_calls row whose result never landed. `build_window`'s sanitizer
+    removes it from the window, but it is NOT dropped history: nothing was
+    cut for budget, so the compactor must not run or write a summary row
+    covering a message the window still shows."""
+    config = RouterConfig(window_tokens=100_000)
+    router, fp_standard, fp_compact, db, convo = make_router_with_compaction(
+        tmp_path,
+        [fake_text("final answer")],
+        [fake_text("SUMMARY: should never be produced.")],
+        config=config,
+    )
+    conv_id = await convo.get_or_create("t:1")
+    await convo.append(conv_id, Message(role="user", text="earlier question"))
+    await convo.append_many(
+        conv_id,
+        [Message(role="assistant", tool_calls=[ToolCall(id="dangler", name="t", args={})])],
+    )
+
+    reply = await router.handle(channel="t:1", text="go", user_id="u1")
+
+    assert reply.text == "final answer"
+    assert fp_compact.calls == []  # no summarizer call: nothing was dropped
+    async with db.session() as s:
+        rows = (
+            (await s.execute(select(Summary).where(Summary.conversation_id == conv_id)))
+            .scalars()
+            .all()
+        )
+    assert rows == []
+    # and the dangling row is still absent from what the model saw
+    assert all(not m.tool_calls for m in fp_standard.calls[0]["messages"])
+    await db.dispose()
+
+
+async def test_watermark_and_summarized_span_ignore_sanitizer_removals(tmp_path) -> None:
+    """A budget cut AND a sanitizer removal in the same build: the summary
+    must cover exactly the budget-cut prefix. Counting the sanitized row as
+    dropped history would push the watermark one message forward, feeding a
+    still-live message to the summarizer and permanently marking it covered
+    (the reuse check never revisits a covered span)."""
+    config = RouterConfig(window_tokens=100)
+    router, fp_standard, fp_compact, db, convo = make_router_with_compaction(
+        tmp_path,
+        [fake_text("final answer")],
+        [fake_text("SUMMARY: the old turn.")],
+        config=config,
+    )
+    conv_id = await convo.get_or_create("t:1")
+    # turn 0: too large to keep -- this, and only this, is the dropped span.
+    await convo.append(conv_id, Message(role="user", text="old " * 100))
+    await convo.append(conv_id, Message(role="assistant", text="old answer"))
+    # turn 1: kept, but carries a crash-era dangling tool_calls row the
+    # sanitizer strips out of the window.
+    await convo.append(conv_id, Message(role="user", text="keep " * 5))
+    await convo.append_many(
+        conv_id,
+        [Message(role="assistant", tool_calls=[ToolCall(id="dangler", name="t", args={})])],
+    )
+
+    reply = await router.handle(channel="t:1", text="go", user_id="u1")
+    assert reply.text == "final answer"
+
+    async with db.session() as s:
+        ids = (
+            (
+                await s.execute(
+                    select(MessageRow.id)
+                    .where(MessageRow.conversation_id == conv_id)
+                    .order_by(MessageRow.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        rows = (
+            (await s.execute(select(Summary).where(Summary.conversation_id == conv_id)))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+    assert rows[0].up_to_message_id == ids[1]  # end of turn 0, not the live turn-1 user message
+    prompt = fp_compact.calls[0]["messages"][0].text
+    assert "old answer" in prompt
+    assert "keep" not in prompt  # a message still in the window was never summarized
     await db.dispose()
 
 
