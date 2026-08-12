@@ -22,7 +22,7 @@ model = "qwen3.5:1.5b"
 # [router]
 # Customize the assistant's system-prompt identity line ("You are...").
 # Leave commented out for the default identity.
-# persona = "a terse, no-nonsense workshop assistant"
+# persona = "You are a terse, no-nonsense workshop assistant."
 
 [web]
 host = "127.0.0.1"
