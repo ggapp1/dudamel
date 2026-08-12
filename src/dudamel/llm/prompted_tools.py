@@ -81,15 +81,19 @@ def _render_tool_result(m: Message, *, nonce: str) -> Message:
     """Flatten one `role="tool"` message into fenced prompt text.
 
     Tool output is attacker-influenceable (MCP servers, web content, ...).
-    Two independent things keep it from escaping the fence and being read
-    as instructions rather than data: the whole payload is JSON-encoded
-    (so any characters that look like a fence marker are escaped inside a
-    JSON string, not live text), and the fence markers themselves carry a
-    nonce freshly drawn per request, which the attacker cannot have known
-    when the tool produced its output. Either alone would already stop a
-    naive "reproduce the closing delimiter" attempt; both together also
-    stop an attacker who has previously observed a *different* request's
-    nonce from replaying it.
+    The ONE thing that keeps it from escaping the fence is the nonce: the
+    markers carry a value freshly drawn per request, which the attacker
+    cannot have known when the tool produced its output, so a reproduced
+    closing delimiter -- including one replayed from a *different* request
+    they observed -- never matches this request's.
+
+    JSON-encoding the payload is not a second barrier and must not be
+    mistaken for one: `json.dumps` escapes quotes, backslashes, and control
+    characters, so a text containing the literal `<<<END_TOOL_RESULT:...>>>`
+    marker appears byte-for-byte in the rendered line. What the encoding
+    does contribute is keeping the payload to a single line (newlines become
+    `\\n`) and keeping structure out of it -- worth having, but the nonce is
+    what an attack has to beat.
     """
     payload = json.dumps({"tool_call_id": m.tool_call_id, "is_error": m.is_error, "text": m.text})
     text = f"{_fence_open(nonce)}\n{payload}\n{_fence_close(nonce)}"

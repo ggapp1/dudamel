@@ -34,6 +34,12 @@ def test_tool_result_reproducing_the_fence_delimiter_cannot_escape() -> None:
     body = rendered.text.split("\n", 1)[1].rsplit("\n", 1)[0]
     decoded = json.loads(body)
     assert decoded["text"] == hostile
+    # And the reason it holds is the nonce alone, not any escaping: the
+    # attacker's marker survives JSON encoding byte-for-byte (json.dumps
+    # escapes quotes, backslashes and control characters — not '<', ':', or
+    # '>'), so nothing but the freshly-drawn nonce stands between that text
+    # and a closing delimiter.
+    assert _fence_close(guessed_nonce) in rendered.text
 
 
 async def test_calls_are_parsed_only_from_the_fresh_completion() -> None:
