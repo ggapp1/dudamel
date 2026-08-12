@@ -494,11 +494,29 @@ class Router:
             "too complex; try narrowing it."
         )
 
+    def _untrusted_name(self, name: str) -> bool:
+        """Whether a call by this tool name must be treated as untrusted.
+
+        Origin comes from the LIVE registry, but the names being classified
+        come from history, which outlives it: a server dropped from the
+        config (or one that renamed its tools, changing the `{server}__{tool}`
+        prefix) leaves calls behind that no longer resolve. Unknown provenance
+        is treated as untrusted, not as trusted -- the injected text is still
+        in front of the model whether or not the tool that fetched it is still
+        mounted, and a Summary row covering that span would otherwise be
+        written clean forever.
+
+        The cost is deliberate: a name that never existed -- a hallucinated
+        tool -- is indistinguishable from a vanished one after the fact, so it
+        taints too.
+        """
+        tool = self._registry.tools.get(name)
+        return tool is None or tool.origin == "mcp"
+
     def _window_tainted(self, window: list[Message]) -> bool:
         for m in window:
             for tc in m.tool_calls:
-                tool = self._registry.tools.get(tc.name)
-                if tool is not None and tool.origin == "mcp":
+                if self._untrusted_name(tc.name):
                     return True
         return False
 
@@ -545,6 +563,11 @@ class Router:
         self, conv_id: int, calls: list[ToolCall], *, turn_tainted: bool
     ) -> _BatchOutcome:
         outcome = _BatchOutcome()
+        # Strict lookup on purpose, unlike `_untrusted_name`'s fail-closed
+        # rule for names read back out of history: a name the LIVE registry
+        # doesn't know is a model invention, and the only text it produces is
+        # the router's own "unknown tool" error. Nothing untrusted was
+        # fetched, so nothing is tainted.
         batch_has_mcp = any(
             (t := self._registry.tools.get(c.name)) is not None and t.origin == "mcp" for c in calls
         )
@@ -853,6 +876,17 @@ class Router:
             # result is produced before the assistant turn + prior results +
             # final result are appended, so no dangling tool_call persists.
             call = ToolCall(id=state["pending_call_id"], name=row.tool, args=dict(row.args))
+            # The gated call can BE the untrusted one -- an mcp tool that
+            # carries confirm=True (a destructive-hinted server tool) may be
+            # the first call of an otherwise clean turn. Approving it puts
+            # server-controlled text into history, so the resumed turn is
+            # tainted from here on, exactly as the batch path taints on every
+            # mcp outcome. Decided from the tool's ORIGIN, not its result:
+            # this covers the error path too, where the server's failure text
+            # is just as attacker-influenceable as its success text. The
+            # declined path above deliberately does not do this -- nothing ran
+            # there, and the only text appended is the router's own note.
+            initial_taint = initial_taint or self._untrusted_name(row.tool)
             result = await self._execute_confirmed(row.conversation_id, call)
             await self._convo.append_many(
                 row.conversation_id,

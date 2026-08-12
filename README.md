@@ -272,7 +272,13 @@ it (core and app schemas), not apply-only.
   further mutating tool call in that turn — native or MCP — that isn't
   marked `read_only=True` is forced through a confirm gate too, even if it
   wasn't registered with `confirm=True`. A tool with no safety annotation
-  defaults to "mutating" until proven otherwise.
+  defaults to "mutating" until proven otherwise. Approving a gated MCP call
+  taints the rest of that turn as well — its output is untrusted whether it
+  arrived through the gate or not. Where taint is re-derived from history
+  (`taint_mode = "window"`, and a summary's stored taint flag), a call whose
+  tool the registry can no longer resolve — an MCP server dropped from the
+  config, a renamed tool, or a name the model invented — counts as
+  untrusted: unknown provenance is not trusted provenance.
 - **Token budgets**: `[llm.budget] daily_tokens` in `dudamel.toml` sets a
   hard per-day ceiling per tier, enforced before each call — a runaway
   loop or a misbehaving job can't spend past it.
