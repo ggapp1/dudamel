@@ -347,9 +347,7 @@ async def test_stranger_gets_id_reply_once_then_silence_within_hour(
     await rt.stop()
 
 
-async def test_stranger_reply_dict_is_bounded_under_flood(
-    tmp_path: Path, token_env: str
-) -> None:
+async def test_stranger_reply_dict_is_bounded_under_flood(tmp_path: Path, token_env: str) -> None:
     """A flood of distinct strangers within the cooldown window must not grow
     the tracking dict without bound: age-based pruning alone can't shrink it
     (every entry is fresh), so LRU eviction has to cap it."""
@@ -495,9 +493,7 @@ async def test_confirm_button_roundtrip_approved_by_originating_user(
     await rt.stop()
 
 
-async def test_callback_chained_confirmation_is_surfaced(
-    tmp_path: Path, token_env: str
-) -> None:
+async def test_callback_chained_confirmation_is_surfaced(tmp_path: Path, token_env: str) -> None:
     """Approving one confirmation can resume a turn whose model then requests
     ANOTHER confirm-gated tool. The callback handler must surface that
     follow-up confirmation (its buttons + a fresh id), not drop it, or the
@@ -700,9 +696,7 @@ async def test_error_handler_logs_handler_exceptions(
 
     await interface._on_error(None, _StubContext())  # type: ignore[arg-type]
     matching = [
-        r
-        for r in caplog.records
-        if "telegram handler error" in r.message and "boom" in r.message
+        r for r in caplog.records if "telegram handler error" in r.message and "boom" in r.message
     ]
     assert matching
     # The traceback must be attached (exc_info), not just the str(exc) --
