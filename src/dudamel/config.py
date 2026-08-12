@@ -20,6 +20,14 @@ class TierConfig(BaseModel):
     base_url: str | None = None
     api_key_env: str | None = None
     max_tokens: int = 1024
+    # "native": send `tools` on the wire and expect the backend's own
+    # function-calling machinery (the default; every existing config keeps
+    # this and is unaffected). "prompted": the backend has no native tool
+    # calling -- Runtime wraps its Provider in PromptedToolsProvider, which
+    # flattens tool traffic into prompt text and parses calls back out of
+    # plain completions. Named `tool_calling`, not reusing `taint_mode`'s
+    # vocabulary, because the two are unrelated axes of a tier's config.
+    tool_calling: Literal["native", "prompted"] = "native"
 
 
 class BudgetConfig(BaseModel):

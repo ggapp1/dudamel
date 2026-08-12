@@ -19,6 +19,7 @@ from dudamel.exceptions import DudamelError, LLMError, RegistryError
 from dudamel.llm.anthropic import AnthropicProvider
 from dudamel.llm.client import LLMClient, Tier
 from dudamel.llm.openai_compat import OpenAICompatProvider
+from dudamel.llm.prompted_tools import PromptedToolsProvider
 from dudamel.llm.provider import Provider
 from dudamel.llm.types import Message
 from dudamel.mcp_mount import MCPMount
@@ -32,10 +33,7 @@ from dudamel.widgets import run_widget
 logger = logging.getLogger("dudamel.runtime")
 
 
-def build_provider(name: str, cfg: TierConfig) -> Provider:
-    """Construct the Provider a tier's config names -- shared by
-    Runtime._build_tiers (real runs) and `dudamel doctor --probe-tools`
-    (which needs a live Provider without standing up a whole Runtime)."""
+def _build_raw_provider(name: str, cfg: TierConfig) -> Provider:
     if cfg.provider == "openai-compatible":
         if not cfg.base_url:
             raise RegistryError(f"tier {name!r}: openai-compatible provider needs base_url")
@@ -52,6 +50,24 @@ def build_provider(name: str, cfg: TierConfig) -> Provider:
         f"tier {name!r}: provider 'fake' requires a providers= override "
         "(dudamel.llm.testing.FakeProvider)"
     )
+
+
+def build_provider(name: str, cfg: TierConfig) -> Provider:
+    """Construct the Provider a tier's config names -- shared by
+    Runtime._build_tiers (real runs) and `dudamel doctor --probe-tools`
+    (which needs a live Provider without standing up a whole Runtime).
+
+    Wraps in PromptedToolsProvider when `cfg.tool_calling == "prompted"`, so
+    the probe exercises the same object the router will actually call.
+    Probing the raw backend of a prompted tier would only ever reconfirm
+    that native tool calling is absent -- which the operator already told
+    us by setting the config -- and would say nothing about whether the
+    prompted fallback itself can round-trip a call for this model.
+    """
+    provider = _build_raw_provider(name, cfg)
+    if cfg.tool_calling == "prompted":
+        provider = PromptedToolsProvider(provider)
+    return provider
 
 
 class Runtime:
@@ -93,6 +109,15 @@ class Runtime:
         for name, cfg in self._settings.llm_tiers.items():
             if name in overrides:
                 provider: Provider = overrides[name]
+                # build_provider() already wraps for a "prompted" tier, but
+                # an override bypasses build_provider entirely (that's the
+                # whole point -- FakeProvider stands in for a real backend
+                # in tests), so the wrap has to be applied here too. This is
+                # what lets a test drive an end-to-end prompted turn: script
+                # a FakeProvider emitting the prompted JSON envelope, wrap
+                # it, and assert the router receives real ToolCalls.
+                if cfg.tool_calling == "prompted":
+                    provider = PromptedToolsProvider(provider)
             else:
                 provider = build_provider(name, cfg)
             tiers[name] = Tier(
