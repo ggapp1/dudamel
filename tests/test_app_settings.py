@@ -1,5 +1,5 @@
 import pytest
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, AliasPath, BaseModel, ConfigDict, Field
 
 from dudamel import App
 from dudamel.exceptions import AppSettingsError, RuntimeNotBoundError
@@ -89,7 +89,7 @@ def test_population_by_name_accepts_both_spellings() -> None:
 
         api_key: str = Field(alias="key")
 
-    assert App("svc", description="d", settings=Aliased).bind_settings({"key": "a"}) is None
+    App("svc", description="d", settings=Aliased).bind_settings({"key": "a"})
     app = App("svc", description="d", settings=Aliased)
     app.bind_settings({"api_key": "b"})
     assert app.settings.api_key == "b"
@@ -114,3 +114,37 @@ def test_alias_choices_each_accepted() -> None:
         assert app.settings.api_key == "abc"
     with pytest.raises(AppSettingsError, match="api_key"):
         App("svc", description="d", settings=Choosy).bind_settings({"api_key": "abc"})
+
+
+def test_path_alias_accepts_its_top_level_key_and_not_the_field_name() -> None:
+    """A path alias is looked up under its first element. The field name is not
+    accepted, so the framework must not advertise it as a fallback."""
+
+    class Pathed(BaseModel):
+        api_key: str = Field(validation_alias=AliasPath("creds", 0))
+
+    app = App("svc", description="d", settings=Pathed)
+    app.bind_settings({"creds": ["abc"]})
+    assert app.settings.api_key == "abc"
+
+    with pytest.raises(AppSettingsError) as excinfo:
+        App("svc", description="d", settings=Pathed).bind_settings({"api_key": "abc"})
+    message = str(excinfo.value)
+    assert "unknown setting(s) api_key" in message
+    assert "known: creds" in message
+
+
+def test_alias_choices_mixing_a_path_accepts_both_forms() -> None:
+    class Mixed(BaseModel):
+        api_key: str = Field(validation_alias=AliasChoices("key", AliasPath("creds", 0)))
+
+    plain = App("svc", description="d", settings=Mixed)
+    plain.bind_settings({"key": "abc"})
+    assert plain.settings.api_key == "abc"
+
+    pathed = App("svc", description="d", settings=Mixed)
+    pathed.bind_settings({"creds": ["xyz"]})
+    assert pathed.settings.api_key == "xyz"
+
+    with pytest.raises(AppSettingsError, match="unknown setting\\(s\\) api_key"):
+        App("svc", description="d", settings=Mixed).bind_settings({"api_key": "abc"})
