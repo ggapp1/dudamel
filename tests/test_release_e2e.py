@@ -24,7 +24,7 @@ import dudamel
 from dudamel import cli
 from dudamel.config import Settings
 from dudamel.llm.testing import FakeProvider
-from dudamel.serve import serve
+from dudamel.serve import _InstanceLock, serve
 
 REPO_ROOT = Path(__file__).parent.parent
 
@@ -138,7 +138,14 @@ async def test_new_user_path_scaffold_migrate_serve_health_and_widgets(
         with contextlib.suppress(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=5.0)
 
-    assert not (target / ".dudamel.lock").exists()
+    # The lockfile persists across a clean shutdown (flock on a persistent
+    # file is the single-instance guarantee); the flock is released, so a
+    # fresh acquire against it succeeds.
+    lockfile = target / ".dudamel.lock"
+    assert lockfile.exists()
+    reacquire = _InstanceLock(lockfile)
+    reacquire.acquire()
+    reacquire.release()
 
 
 @pytest.mark.slow
