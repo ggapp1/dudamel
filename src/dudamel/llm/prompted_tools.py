@@ -284,7 +284,7 @@ class PromptedToolsProvider:
             # answer, so it is replaced rather than forwarded -- the reason
             # was already logged at WARNING inside `_parse_calls`. Usage is
             # carried through unchanged: the tokens were really spent, and
-            # the budget ledger must not lose them just because the reply
+            # budget accounting must not lose them just because the reply
             # was unusable.
             return Completion(
                 message=Message(role="assistant", text=_DEGRADED_TEXT),
