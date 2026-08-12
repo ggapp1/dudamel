@@ -109,12 +109,17 @@ class McpConfig(BaseModel):
     reconnect_cooldown_seconds: float = RECONNECT_COOLDOWN_SECONDS
 
     @model_validator(mode="after")
-    def reject_non_positive_reconnect_settings(self) -> McpConfig:
+    def reject_non_positive_settings(self) -> McpConfig:
         # Zero is not a smaller budget, it is a silent disabling of reconnect
         # entirely, and a negative backoff/cooldown is not a duration at all --
         # both are config bugs worth failing at load rather than at the first
-        # dead server.
+        # dead server. The two timeouts are the same kind of bug with the same
+        # remedy: a non-positive call_timeout makes every tool call fail on the
+        # transport-native timeout, and a non-positive mount_timeout makes every
+        # mount attempt fail instantly with an opaque TimeoutError.
         for field, value in (
+            ("call_timeout", self.call_timeout),
+            ("mount_timeout", self.mount_timeout),
             ("reconnect_attempts", self.reconnect_attempts),
             ("reconnect_backoff_seconds", self.reconnect_backoff_seconds),
             ("reconnect_cooldown_seconds", self.reconnect_cooldown_seconds),
@@ -166,6 +171,4 @@ class Settings(BaseSettings):
             data["llm_tiers"] = llm["tiers"]
         if "budget" in llm:
             data["llm_budget"] = llm["budget"]
-        if "router" in data:
-            data["router"] = data.pop("router")
         return cls(_env_file=project_dir / ".env", **data)

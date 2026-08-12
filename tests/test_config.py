@@ -53,6 +53,31 @@ def test_mcp_reconnect_settings_reject_non_positive_values(field: str, value: fl
         McpConfig(**{field: value})
 
 
+@pytest.mark.parametrize("field", ["call_timeout", "mount_timeout"])
+@pytest.mark.parametrize("value", [0, -1])
+def test_mcp_timeouts_reject_non_positive_values(field: str, value: float) -> None:
+    """Same rationale as the reconnect budget beside them, and the same
+    section: a non-positive timeout is a config bug, not a tighter budget.
+    call_timeout = 0 makes every tool call fail on the transport-native
+    timeout (and leaves Tool.timeout as the router margin alone); a
+    non-positive mount_timeout makes every mount fail instantly with an
+    opaque TimeoutError. Both are far cheaper to hit at load."""
+    with pytest.raises(ValueError, match="must be positive"):
+        McpConfig(**{field: value})
+
+
+def test_router_section_maps_straight_through(tmp_path: Path) -> None:
+    """[router] is a plain field name -- unlike [llm], whose `tiers`/`budget`
+    keys are remapped in Settings.load. Pins that a [router] table still lands
+    on Settings.router as-is now that load() no longer round-trips the key."""
+    (tmp_path / "dudamel.toml").write_text(
+        "[router]\niteration_cap = 4\n\n[llm.tiers.standard]\nprovider = 'fake'\nmodel = 'f'\n"
+    )
+    s = Settings.load(tmp_path)
+    assert s.router.iteration_cap == 4
+    assert set(s.llm_tiers) == {"standard"}
+
+
 def test_toml_overrides_defaults(tmp_path: Path) -> None:
     (tmp_path / "dudamel.toml").write_text('database_url = "sqlite+aiosqlite:///custom.db"\n')
     s = Settings.load(tmp_path)

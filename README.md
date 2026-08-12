@@ -414,7 +414,8 @@ the model is free to call the tool again on its own.
 Two `[mcp]` settings in `dudamel.toml` control how long this is allowed to
 take: `call_timeout` (default 30 seconds) bounds a single tool call, and
 `mount_timeout` (default 15 seconds) bounds connecting to and listing
-tools from a server at startup and on each reconnect.
+tools from a server at startup and on each reconnect. Both must be
+positive; anything else is rejected at startup.
 
 Three more size the reconnect burst itself: `reconnect_attempts` (default
 3) is how many connection attempts one burst may spend,
