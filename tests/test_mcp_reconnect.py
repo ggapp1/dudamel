@@ -476,6 +476,78 @@ async def test_reconnect_is_bounded_at_three_attempts(
         await mount.close()
 
 
+async def test_configured_reconnect_attempts_bounds_the_burst(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mount configured with a smaller budget than the module default spends
+    exactly that budget: one attempt per burst, not three."""
+    name = "one-attempt"
+    script = tmp_path / "flaky_copy.py"
+    script.write_text(FIXTURE.read_text())
+    mount = MCPMount(
+        [flaky_cmd(tmp_path, monkeypatch, name=name, script=script)], reconnect_attempts=1
+    )
+    try:
+        tools = await mount.mount()
+        echo = _tool(tools, "echo")
+        assert await echo.fn(text="up") == "up"
+        script.write_text("import sys\n\nsys.exit(1)\n")
+        await _kill_and_wait(await _wait_for_pid(f"flaky_copy.py {name}"))
+        with pytest.raises(RuntimeError):
+            await echo.fn(text="down")
+        server = mount._servers[0]
+        assert server.reconnect_attempts == 1
+        assert server.reconnect_count == 1
+        assert server.alive is False
+    finally:
+        await mount.close()
+
+
+async def test_configured_backoff_and_cooldown_replace_the_module_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other two configured values, measured against a stubbed bring-up so
+    the assertions are about the budget arithmetic alone. A configured value
+    wins over the module constant; what is NOT configured still falls back to
+    it (the autouse fixture's zeroed backoff is what the second burst below
+    would otherwise pay)."""
+    delays: list[float] = []
+
+    async def fake_sleep(seconds: float, *args: Any, **kwargs: Any) -> Any:
+        delays.append(seconds)
+        return await asyncio.sleep(0, *args, **kwargs)
+
+    class _AsyncioProxy:
+        sleep = staticmethod(fake_sleep)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(asyncio, name)
+
+    async def always_fails(op: str) -> BaseException | None:
+        return RuntimeError("nope")
+
+    server = _MountedServer(
+        MCPServerConfig(command="unused"),
+        reconnect_attempts=2,
+        reconnect_backoff_seconds=0.25,
+        reconnect_cooldown_seconds=30.0,
+    )
+    server._mounted = True
+    server.alive = False
+    monkeypatch.setattr(mcp_mount, "asyncio", _AsyncioProxy())
+    monkeypatch.setattr(server, "_submit", always_fails)
+
+    assert await server.reconnect(server.generation) is False
+    # Two attempts, one gap between them, at the configured base delay.
+    assert server.reconnect_attempts == 2
+    assert delays == [0.25]
+    # And the burst that just failed starts the configured cooldown, so the
+    # next caller fails fast without spending a single further attempt.
+    assert await server.reconnect(server.generation) is False
+    assert server.reconnect_attempts == 2
+    assert server._cooldown_until - asyncio.get_running_loop().time() > 25.0
+
+
 async def test_backoff_grows_between_attempts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

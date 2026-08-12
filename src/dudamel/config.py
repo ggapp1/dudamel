@@ -11,7 +11,13 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
-from dudamel.mcp_mount import CALL_TIMEOUT, MOUNT_TIMEOUT
+from dudamel.mcp_mount import (
+    CALL_TIMEOUT,
+    MAX_RECONNECT_ATTEMPTS,
+    MOUNT_TIMEOUT,
+    RECONNECT_BACKOFF_SECONDS,
+    RECONNECT_COOLDOWN_SECONDS,
+)
 
 
 class TierConfig(BaseModel):
@@ -94,6 +100,31 @@ class McpConfig(BaseModel):
     # -- see `MCPMount.__init__` for how each is actually enforced.
     call_timeout: float = CALL_TIMEOUT
     mount_timeout: float = MOUNT_TIMEOUT
+    # The reconnect budget, defaulted from the same module constants for the
+    # same reason: how many connection attempts one burst may spend, the base
+    # delay between them (it doubles each attempt), and how long a server whose
+    # burst failed outright fails fast before the next call gets a fresh burst.
+    reconnect_attempts: int = MAX_RECONNECT_ATTEMPTS
+    reconnect_backoff_seconds: float = RECONNECT_BACKOFF_SECONDS
+    reconnect_cooldown_seconds: float = RECONNECT_COOLDOWN_SECONDS
+
+    @model_validator(mode="after")
+    def reject_non_positive_reconnect_settings(self) -> McpConfig:
+        # Zero is not a smaller budget, it is a silent disabling of reconnect
+        # entirely, and a negative backoff/cooldown is not a duration at all --
+        # both are config bugs worth failing at load rather than at the first
+        # dead server.
+        for field, value in (
+            ("reconnect_attempts", self.reconnect_attempts),
+            ("reconnect_backoff_seconds", self.reconnect_backoff_seconds),
+            ("reconnect_cooldown_seconds", self.reconnect_cooldown_seconds),
+        ):
+            if value <= 0:
+                raise ValueError(
+                    f"[mcp] {field} must be positive (got {value}); "
+                    "remove the setting to use the default"
+                )
+        return self
 
 
 class Settings(BaseSettings):
