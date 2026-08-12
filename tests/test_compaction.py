@@ -1,20 +1,23 @@
 from pathlib import Path
 
+import pytest
 from sqlalchemy import select
 
 from dudamel.compaction import _KEEP_PER_CONVERSATION, Compactor
 from dudamel.config import BudgetConfig
 from dudamel.db import Database
-from dudamel.exceptions import LLMError
+from dudamel.exceptions import BudgetExceededError, LLMError
 from dudamel.llm.client import LLMClient, Tier
 from dudamel.llm.testing import FakeProvider, fake_text
 from dudamel.llm.types import Message
 from dudamel.migrate import upgrade_core
-from dudamel.models_core import Conversation, Summary
+from dudamel.models_core import Conversation, LlmCall, Summary
 from dudamel.models_core import Message as MessageRow
 
 
-async def _make(tmp_path: Path, script, *, max_tokens: int = 111):
+async def _make(
+    tmp_path: Path, script, *, max_tokens: int = 111, budget: BudgetConfig | None = None
+):
     url = f"sqlite+aiosqlite:///{tmp_path}/c.db"
     upgrade_core(url)
     db = Database(url)
@@ -22,7 +25,7 @@ async def _make(tmp_path: Path, script, *, max_tokens: int = 111):
     llm = LLMClient(
         tiers={"compact": Tier(name="compact", provider=fp, model="m", max_tokens=max_tokens)},
         db=db,
-        budget=BudgetConfig(),
+        budget=budget if budget is not None else BudgetConfig(),
     )
     compactor = Compactor(llm=llm, db=db, tier="compact")
     async with db.session() as s:
@@ -182,6 +185,57 @@ async def test_failed_summarization_proceeds_uncompacted(tmp_path: Path) -> None
     )
     assert record is None
     assert await _summary_rows(db, conv_id) == []
+    await db.dispose()
+
+
+async def test_exhausted_budget_fails_open_and_leaves_the_watermark_where_it_was(
+    tmp_path: Path,
+) -> None:
+    """An exhausted daily token budget is the one summarizer failure a long
+    conversation will actually hit, and it is raised by the client before
+    the provider is ever reached -- not by the model call itself. It must
+    still fail open exactly like any other summarizer failure: nothing
+    raised out of `maybe_compact`, nothing to prepend (so the caller
+    proceeds with the plain, uncompacted window), and no row written -- so
+    the covered-span watermark stays where it was and a later turn, once
+    budget is available again, still summarizes that same span rather than
+    treating it as already covered.
+    """
+    budget = BudgetConfig(daily_tokens=100)
+    compactor, fp, db, conv_id = await _make(tmp_path, [fake_text("the gist")], budget=budget)
+    history = await _seed_messages(db, conv_id, 5)
+    # Spend the whole day's budget on an unrelated earlier call.
+    async with db.session() as s:
+        s.add(LlmCall(tier="standard", provider="fake", model="m", tokens_in=90, tokens_out=10))
+
+    # Pin what the summarizer tier now raises: a `BudgetExceededError` --
+    # a `DudamelError` subclass, which is what the fail-open path below is
+    # relying on to catch it.
+    exhausted = LLMClient(
+        tiers={"compact": Tier(name="compact", provider=fp, model="m", max_tokens=111)},
+        db=db,
+        budget=budget,
+    )
+    with pytest.raises(BudgetExceededError):
+        await exhausted.complete([Message(role="user", text="x")], tier="compact")
+
+    record = await compactor.maybe_compact(
+        conv_id, history, dropped=3, turn_key="t1", dropped_tainted=False
+    )
+    assert record is None  # nothing to prepend: the window falls back uncompacted
+    assert fp.calls == []  # the budget guard tripped before any model call
+    assert await _summary_rows(db, conv_id) == []
+    assert await compactor.newest(conv_id) is None  # watermark not advanced
+
+    # Budget available again on a later turn: the span the failed attempt
+    # would have covered is still uncovered, so it gets summarized now.
+    budget.daily_tokens = None
+    record = await compactor.maybe_compact(
+        conv_id, history, dropped=3, turn_key="t2", dropped_tainted=False
+    )
+    assert record is not None
+    assert record.text == "the gist"
+    assert record.up_to_message_id == (await _message_ids(db, conv_id))[2]
     await db.dispose()
 
 
