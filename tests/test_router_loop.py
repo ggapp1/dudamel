@@ -73,7 +73,9 @@ def make_app() -> App:
     return app
 
 
-def make_router(tmp_path, script, config: RouterConfig | None = None):
+def make_router(
+    tmp_path, script, config: RouterConfig | None = None, budget: BudgetConfig | None = None
+):
     url = f"sqlite+aiosqlite:///{tmp_path}/r.db"
     upgrade_core(url)
     db = Database(url)
@@ -81,7 +83,7 @@ def make_router(tmp_path, script, config: RouterConfig | None = None):
     llm = LLMClient(
         tiers={"standard": Tier(name="standard", provider=fp, model="f", max_tokens=64)},
         db=db,
-        budget=BudgetConfig(),
+        budget=budget or BudgetConfig(),
     )
     registry = Registry([make_app()])
     router = Router(
@@ -1021,4 +1023,28 @@ async def test_activity_log_failure_after_a_successful_tool_does_not_kill_the_tu
     tool_msgs = [m for m in fp.calls[1]["messages"] if m.role == "tool"]
     assert tool_msgs and "logged bench x5" in tool_msgs[0].text and not tool_msgs[0].is_error
     assert any("activity" in r.message.lower() for r in caplog.records)
+    await db.dispose()
+
+
+async def test_budget_exhausted_mid_turn_discloses_the_action_already_ran(tmp_path) -> None:
+    """The budget check is PRE-call: iteration 0's mutation lands, its usage
+    row pushes spend over the cap, and iteration 1 trips the check. Reporting
+    only "budget exhausted" invites the user to re-issue the request tomorrow
+    and run the mutation twice, so the reply must disclose what already ran —
+    the same honesty the LLMError path has always had."""
+    script = [fake_tool_call("log_workout", {"exercise": "bench", "reps": 5}), fake_text("Done!")]
+    router, fp, db = make_router(tmp_path, script, budget=BudgetConfig(daily_tokens=10))
+    reply = await router.handle(channel="t:1", text="log it", user_id="u1")
+    assert CALLS == ["log:bench:5"]  # the mutation really happened
+    assert len(fp.calls) == 1  # iteration 1 never reached the provider
+    assert "completed the action" in reply.text
+    assert "budget" in reply.text  # and still says why it stopped
+    await db.dispose()
+
+
+async def test_budget_exhausted_before_any_action_reports_only_the_budget(tmp_path) -> None:
+    """The mirror case: nothing ran, so no completion may be claimed."""
+    router, fp, db = make_router(tmp_path, [fake_text("hi")], budget=BudgetConfig(daily_tokens=0))
+    reply = await router.handle(channel="t:1", text="hi", user_id="u1")
+    assert "budget" in reply.text and "completed the action" not in reply.text
     await db.dispose()
