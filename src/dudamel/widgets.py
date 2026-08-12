@@ -50,8 +50,18 @@ async def run_widget(widget: Widget) -> dict[str, Any]:
     caller can still tell WHICH widget failed.
     """
     try:
-        raw = await asyncio.wait_for(widget.fn(), timeout=widget.timeout)
-    except TimeoutError:
+        # `asyncio.timeout` lets us tell OUR deadline apart from a TimeoutError
+        # the widget raised itself (an OS connect timeout IS TimeoutError since
+        # Python 3.10). `cm.expired()` is true only when the context manager's
+        # own deadline fired -- a widget-raised TimeoutError falls through to
+        # the generic handler below and reports its real message, not a
+        # fabricated "widget timed out after Ns".
+        async with asyncio.timeout(widget.timeout) as cm:
+            raw = await widget.fn()
+    except TimeoutError as e:
+        if not cm.expired():
+            logger.warning("widget %s (app %s) failed: %s", widget.id, widget.app_name, e)
+            return _error_card(widget, str(e))
         message = f"widget timed out after {widget.timeout}s"
         logger.warning("widget %s (app %s) %s", widget.id, widget.app_name, message)
         return _error_card(widget, message)

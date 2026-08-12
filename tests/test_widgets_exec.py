@@ -80,6 +80,21 @@ async def test_run_widget_timeout_yields_error_shape() -> None:
     assert "data" not in out
 
 
+async def test_run_widget_that_raises_its_own_timeouterror_reports_the_real_message() -> None:
+    """A widget whose fn() raises TimeoutError itself (e.g. an OS-level connect
+    timeout, which IS TimeoutError since Python 3.10) well within its own
+    budget must yield an error card with the RAISED message -- not the
+    fabricated scheduler-imposed "widget timed out after Ns" it never hit."""
+
+    async def fn() -> dict:
+        raise TimeoutError("connection to api.example.com timed out")
+
+    out = await run_widget(make_widget(fn, timeout=30))
+    assert out["error"] == "connection to api.example.com timed out"
+    assert "timed out after 30" not in out["error"]  # never the scheduler's message
+    assert "data" not in out
+
+
 async def test_run_widget_timeout_preserves_identity() -> None:
     """Same identity-survives-error guarantee as a raising widget (above),
     for the timeout path specifically."""
