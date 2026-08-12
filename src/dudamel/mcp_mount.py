@@ -668,6 +668,7 @@ def _make_call_fn(
             # so rebuilding and calling once cannot double anything up. This
             # is the only case where a MUTATING tool is (re)dispatched by
             # this code at all.
+            #
             # Snapshotted BEFORE the rebuild, because the rebuild is what
             # re-reads the server's annotations: only the difference isolates
             # drift this reconnect just discovered from drift recorded
