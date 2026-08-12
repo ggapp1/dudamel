@@ -132,13 +132,29 @@ def suite_version_table(app_name: str) -> str:
     return f"alembic_version_app_{app_name}"
 
 
-def _suite_lane_config(db_url: str, app_name: str, versions_dir: Path) -> Config:
+def _lane_script_config(versions_dir: Path) -> Config:
+    """The half of a lane's config that locates its revisions -- shared by the
+    read path (`_lane_heads`) and the write path (`_suite_lane_config`) so the
+    two can never drift. A drift on the read path alone is the dangerous one:
+    it reports a behind lane as up to date.
+
+    `path_separator = "newline"` matters. A lane's `version_locations` is
+    always exactly one path, and Alembic otherwise splits it: the legacy
+    default on spaces and commas, "os" on `os.pathsep` (`:` on POSIX). Every
+    one of those is a legal directory-name character, and a split path
+    silently resolves to no revisions rather than raising -- so the lane would
+    report as up to date and apply nothing. "newline" cannot occur in a path
+    component in practice, and it raises no deprecation warning.
+    """
     cfg = Config()
     cfg.set_main_option("script_location", str(files("dudamel") / "migrations_suite_lane"))
-    # Without this, Alembic splits version_locations on spaces and commas, so a
-    # project path containing either would silently resolve to no revisions.
-    cfg.set_main_option("path_separator", "os")
+    cfg.set_main_option("path_separator", "newline")
     cfg.set_main_option("version_locations", str(versions_dir))
+    return cfg
+
+
+def _suite_lane_config(db_url: str, app_name: str, versions_dir: Path) -> Config:
+    cfg = _lane_script_config(versions_dir)
     cfg.set_main_option("version_table", suite_version_table(app_name))
     cfg.set_main_option("sqlalchemy.url", sync_url(db_url))
     return cfg
@@ -147,11 +163,7 @@ def _suite_lane_config(db_url: str, app_name: str, versions_dir: Path) -> Config
 def _lane_heads(versions_dir: Path) -> set[str]:
     """Heads of one lane's revisions. They live in `version_locations`, not in
     the shared script directory, so `script_heads` cannot read them."""
-    cfg = Config()
-    cfg.set_main_option("script_location", str(files("dudamel") / "migrations_suite_lane"))
-    cfg.set_main_option("path_separator", "os")
-    cfg.set_main_option("version_locations", str(versions_dir))
-    return set(ScriptDirectory.from_config(cfg).get_heads())
+    return set(ScriptDirectory.from_config(_lane_script_config(versions_dir)).get_heads())
 
 
 def upgrade_suite_app(db_url: str, app_name: str, versions_dir: Path) -> None:
@@ -166,6 +178,12 @@ def upgrade_all(db_url: str, project_dir: Path, suite_lanes: Sequence[tuple[str,
     Sequential, not atomic. A lane that fails leaves earlier lanes applied and
     stops the rest from running; the raised error names the lane, and re-running
     after the fix is safe because a lane already at head is a no-op.
+
+    Not atomic *within* a lane either, on SQLite: alembic's SQLite dialect sets
+    transactional_ddl=False, so a lane whose second revision fails keeps the
+    first one applied and recorded. That is why a rerun must resume rather than
+    restart -- it picks up from the recorded revision, and the single backup
+    taken above is the real undo.
     """
     _backup_sqlite(db_url)
     for app_name, versions_dir in sorted(suite_lanes):
