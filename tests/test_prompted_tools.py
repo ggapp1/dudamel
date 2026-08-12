@@ -12,7 +12,7 @@ from dudamel.llm.prompted_tools import (
 )
 from dudamel.llm.provider import ToolSpec
 from dudamel.llm.testing import FakeProvider, fake_text
-from dudamel.llm.types import Message, ToolCall
+from dudamel.llm.types import Completion, Message, ToolCall, Usage
 
 
 def test_tool_result_reproducing_the_fence_delimiter_cannot_escape() -> None:
@@ -245,3 +245,70 @@ async def test_envelope_with_no_runnable_calls_never_shows_the_user_raw_json(
     assert completion.message.text.strip()  # a real sentence, not an empty reply
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1 and "tool" in warnings[0].getMessage()
+
+
+def _truncated(text: str) -> Completion:
+    """A completion the tier's max_tokens cut off mid-emission."""
+    return Completion(
+        message=Message(role="assistant", text=text),
+        usage=Usage(tokens_in=10, tokens_out=64),
+        stop_reason="max_tokens",
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"tool_calls": [{"name": "search", "argu',
+        '```json\n{"tool_calls": [{"name": "search", "arguments": {"q": "ca',
+        '<think>picking a tool</think>\n{"tool_calls": [{"name": "sea',
+    ],
+    ids=["bare", "fenced", "after-think"],
+)
+async def test_truncated_call_envelope_never_reaches_the_user_as_raw_json(
+    text: str, caplog
+) -> None:
+    """A call envelope the tier's max_tokens cut in half is unparseable, so
+    it used to be classified as "the model's actual answer" and forwarded --
+    half a JSON object in the user's chat. The truncation signal is in hand
+    (`stop_reason`), so it degrades to the same neutral reply an empty
+    envelope gets, and the fragment goes to the log instead."""
+    inner = FakeProvider([_truncated(text)])
+    wrapped = PromptedToolsProvider(inner)
+    tools = [ToolSpec(name="search", description="search stuff", json_schema={"type": "object"})]
+    with caplog.at_level(logging.WARNING, logger="dudamel.llm.prompted_tools"):
+        completion = await wrapped.complete(
+            model="m", messages=[Message(role="user", text="find cats")], tools=tools
+        )
+    assert "tool_calls" not in completion.message.text
+    assert completion.message.text.strip()
+    assert completion.message.tool_calls == []
+    assert completion.usage.tokens_out == 64  # spent tokens still accounted for
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "truncat" in warnings[0].getMessage().lower()
+
+
+async def test_truncated_prose_answer_still_reaches_the_user(caplog) -> None:
+    """Only a truncated ENVELOPE is machinery. A long prose answer the tier
+    cut short is still the model's answer, and a partial answer beats an
+    apology that throws it away."""
+    inner = FakeProvider([_truncated("Here are the cats I found: tabby, calico, si")])
+    wrapped = PromptedToolsProvider(inner)
+    tools = [ToolSpec(name="search", description="search stuff", json_schema={"type": "object"})]
+    completion = await wrapped.complete(
+        model="m", messages=[Message(role="user", text="find cats")], tools=tools
+    )
+    assert completion.message.text.startswith("Here are the cats")
+
+
+async def test_degradation_keys_on_the_truncation_signal_not_on_json_shape() -> None:
+    """A complete reply that merely opens with `{` -- a model answering a
+    question ABOUT JSON, say -- is not an aborted envelope, and nothing here
+    may withhold it: only `stop_reason` says the emission was cut off."""
+    inner = FakeProvider([fake_text('{"example": "this is what a payload looks like"')])
+    wrapped = PromptedToolsProvider(inner)
+    tools = [ToolSpec(name="search", description="search stuff", json_schema={"type": "object"})]
+    completion = await wrapped.complete(
+        model="m", messages=[Message(role="user", text="show me json")], tools=tools
+    )
+    assert completion.message.text.startswith('{"example"')
