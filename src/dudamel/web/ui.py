@@ -111,7 +111,10 @@ def add_ui(app: FastAPI, runtime: Runtime, settings: Settings) -> None:
         if csrf_token is None:
             return RedirectResponse("/login", status_code=303)
         messages = await runtime.recent_messages(_CHAT_CHANNEL)
-        pending = await runtime.list_pending_confirmations(_CHAT_CHANNEL)
+        # Exclude lazily-expired confirmations: the chat page renders an
+        # approve/deny button for every entry, and an expired one only ever
+        # yields "that confirmation expired; nothing was done" on click.
+        pending = await runtime.list_pending_confirmations(_CHAT_CHANNEL, include_expired=False)
         return _TEMPLATES.TemplateResponse(
             request,
             "chat.html",

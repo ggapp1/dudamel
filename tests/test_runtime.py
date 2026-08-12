@@ -32,6 +32,10 @@ def make_settings(tmp_path: Path, **tiers: TierConfig) -> Settings:
     return Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/rt.db",
         data_dir=tmp_path,
+        # These tests place their migrations/ under tmp_path, so that is the
+        # project directory app migrations resolve from (Settings.load sets
+        # this to the CWD for a real CLI invocation).
+        project_dir=tmp_path,
         llm_tiers=tiers or {"standard": TierConfig(provider="fake", model="f")},
     )
 
@@ -371,6 +375,45 @@ async def test_list_pending_confirmations(tmp_path) -> None:
 
     await rt.resolve_confirmation(reply.pending_confirmation_id, approved=False, user_id="u1")
     assert await rt.list_pending_confirmations() == []  # resolved, no longer pending
+    await rt.stop()
+
+
+async def test_list_pending_confirmations_can_exclude_expired(tmp_path) -> None:
+    """A confirmation past its TTL keeps status="pending" until the router
+    lazily expires it. include_expired=True (the default, used by /api/pending)
+    still lists it; include_expired=False (used by the dashboard chat page)
+    filters it out so no dead approve/deny button is shown."""
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import select
+
+    from dudamel.models_core import PendingConfirmation
+
+    app = App("gym", description="d")
+
+    @app.tool(confirm=True)
+    async def wipe(reason: str) -> str:
+        """Delete stuff."""
+        return "wiped"
+
+    orc = Orchestrator(apps=[app])
+    rt = Runtime(
+        orc,
+        make_settings(tmp_path),
+        providers={"standard": FakeProvider([fake_tool_call("wipe", {"reason": "x"})])},
+    )
+    await rt.start()
+    reply = await rt.chat("web:default", "wipe it", user_id="web")
+    assert reply.pending_confirmation_id
+
+    # Age the row past its TTL without touching the conversation (so the router
+    # never gets a chance to flip status to "expired").
+    async with rt._db.session() as s:
+        row = (await s.execute(select(PendingConfirmation))).scalars().one()
+        row.expires_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=1)
+
+    assert len(await rt.list_pending_confirmations()) == 1  # default keeps it
+    assert await rt.list_pending_confirmations(include_expired=False) == []  # filtered
     await rt.stop()
 
 
