@@ -185,6 +185,21 @@ async def test_failed_summarization_proceeds_uncompacted(tmp_path: Path) -> None
     await db.dispose()
 
 
+async def test_empty_cleaned_summary_is_treated_as_failure(tmp_path: Path) -> None:
+    """An output that cleans down to nothing (e.g. an empty code fence, or
+    pure whitespace) must be treated the same as a summarizer failure: no
+    row written, so a later turn tries again instead of reusing an empty
+    summary forever."""
+    compactor, fp, db, conv_id = await _make(tmp_path, [fake_text("```text\n\n```")])
+    history = await _seed_messages(db, conv_id, 5)
+    record = await compactor.maybe_compact(
+        conv_id, history, dropped=3, turn_key="t", dropped_tainted=False
+    )
+    assert record is None
+    assert await _summary_rows(db, conv_id) == []
+    await db.dispose()
+
+
 async def test_no_dropped_span_returns_none_without_calling_the_model(tmp_path: Path) -> None:
     compactor, fp, db, conv_id = await _make(tmp_path, [])
     history = await _seed_messages(db, conv_id, 5)
@@ -230,6 +245,21 @@ async def test_newest_n_pruning_keeps_only_the_latest_rows(tmp_path: Path) -> No
 async def test_newest_returns_none_when_no_summary_exists(tmp_path: Path) -> None:
     compactor, fp, db, conv_id = await _make(tmp_path, [])
     assert await compactor.newest(conv_id) is None
+    await db.dispose()
+
+
+async def test_turn_cache_does_not_accumulate_across_turns(tmp_path: Path) -> None:
+    """`_turn_cache` exists only to memoize repeat calls WITHIN one turn's
+    iteration loop (a fresh turn_key each turn) -- across many turns on the
+    same conversation it must stay at one entry, not grow without bound for
+    the life of the process."""
+    compactor, fp, db, conv_id = await _make(tmp_path, [fake_text(f"gist-{i}") for i in range(50)])
+    history = await _seed_messages(db, conv_id, 5)
+    for i in range(50):
+        await compactor.maybe_compact(
+            conv_id, history, dropped=3, turn_key=f"turn-{i}", dropped_tainted=False
+        )
+        assert len(compactor._turn_cache) == 1
     await db.dispose()
 
 

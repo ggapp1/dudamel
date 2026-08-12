@@ -717,3 +717,75 @@ async def test_oversized_newest_turn_still_sent_despite_compaction_accounting(tm
         )
     assert len(rows) == 1  # accounting still wrote exactly one summary row, no crash
     await db.dispose()
+
+
+async def test_compaction_recompute_gap_still_taints(tmp_path) -> None:
+    """When the summary-cost subtraction forces the second `build_window`
+    call to drop MORE than the span the summary itself covers, the extra
+    ("gap") turns are neither in the rebuilt window nor covered by the
+    summary's own taint flag -- the summary was computed against the
+    ORIGINAL, smaller dropped count. If an mcp-origin call sits in that
+    gap, a native mutation later in the same turn must still be
+    confirm-gated."""
+    url = f"sqlite+aiosqlite:///{tmp_path}/gap.db"
+    upgrade_core(url)
+    db = Database(url)
+    fp_standard = FakeProvider([fake_tool_call("log_workout", {"exercise": "bench", "reps": 5})])
+    fp_compact = FakeProvider([fake_text("s")])
+    llm = LLMClient(
+        tiers={
+            "standard": Tier(name="standard", provider=fp_standard, model="f", max_tokens=64),
+            "compact": Tier(name="compact", provider=fp_compact, model="f", max_tokens=64),
+        },
+        db=db,
+        budget=BudgetConfig(),
+    )
+    registry = Registry([make_app()])
+    registry.tools["web__fetch"] = _mcp_tool("web__fetch", "Fetch a page.")
+    convo = ConversationStore(db)
+    compactor = Compactor(llm=llm, db=db, tier="compact")
+    config = RouterConfig(window_tokens=50, taint_mode="window")
+    router = Router(
+        llm=llm, registry=registry, convo=convo, db=db, config=config, compactor=compactor
+    )
+    conv_id = await convo.get_or_create("t:1")
+
+    # turn 0 (oldest): large plain filler -- the only thing a FULL-budget
+    # build_window drops, so the summary's span (and its untainted flag)
+    # covers only this turn.
+    await convo.append(conv_id, Message(role="user", text="x" * 200))
+    # turn 1 (the gap): an mcp-origin call. Fits under the full budget
+    # (so it survives into the first, untainted-summary build) but not
+    # under the smaller budget left after the summary's own cost is
+    # subtracted.
+    await convo.append(conv_id, Message(role="user", text="y" * 40))
+    await convo.append_many(
+        conv_id,
+        [
+            Message(role="assistant", tool_calls=[ToolCall(id="g1", name="web__fetch", args={})]),
+            Message(role="tool", text="z" * 40, tool_call_id="g1"),
+        ],
+    )
+    # turn 2: small filler that keeps the newest turn company under the
+    # reduced, post-summary budget.
+    await convo.append(conv_id, Message(role="user", text="w" * 40))
+    await convo.append(conv_id, Message(role="assistant", text="ok"))
+
+    reply = await router.handle(channel="t:1", text="log it", user_id="u1")
+
+    assert len(fp_compact.calls) == 1  # exactly one summarizer call
+    async with db.session() as s:
+        rows = (
+            (await s.execute(select(Summary).where(Summary.conversation_id == conv_id)))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+    assert rows[0].tainted is False  # the summary's own span (turn 0) has no mcp call
+
+    # The gap (turn 1's mcp call) is invisible in the rebuilt window and
+    # uncovered by the summary's taint flag -- the mutation must still be
+    # confirm-gated.
+    assert reply.pending_confirmation_id is not None
+    assert CALLS == []  # log_workout did not run
+    await db.dispose()

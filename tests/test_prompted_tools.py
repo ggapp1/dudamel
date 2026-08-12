@@ -1,4 +1,5 @@
 import json
+import logging
 
 from dudamel.llm.prompted_tools import (
     PromptedToolsProvider,
@@ -88,6 +89,24 @@ def test_unparseable_output_degrades_to_plain_text() -> None:
     assert _parse_calls("just a normal reply, no json here", cap=8) is None
     assert _parse_calls("{not even valid json", cap=8) is None
     assert _parse_calls('{"tool_calls": "not a list"}', cap=8) is None
+
+
+def test_call_count_cap_truncation_is_logged(caplog) -> None:
+    envelope = json.dumps({"tool_calls": [{"name": f"t{i}", "arguments": {}} for i in range(20)]})
+    with caplog.at_level(logging.INFO, logger="dudamel.llm.prompted_tools"):
+        calls = _parse_calls(envelope, cap=3)
+    assert calls is not None and len(calls) == 3
+    assert any("truncating" in r.message for r in caplog.records)
+
+
+def test_invalid_entries_are_skipped_and_logged(caplog) -> None:
+    envelope = json.dumps(
+        {"tool_calls": [{"name": "ok", "arguments": {}}, "not-a-dict", {"arguments": {}}]}
+    )
+    with caplog.at_level(logging.DEBUG, logger="dudamel.llm.prompted_tools"):
+        calls = _parse_calls(envelope, cap=8)
+    assert calls is not None and len(calls) == 1
+    assert any("skipping" in r.message for r in caplog.records)
 
 
 async def test_history_with_native_tool_messages_is_flattened_to_text() -> None:
