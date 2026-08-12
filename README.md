@@ -300,7 +300,11 @@ into the single top-level `system` request parameter, alongside the
 operator's own instructions, and a summary of the conversation's own
 history (which can include text an MCP tool put into it) does not belong
 there. Its token cost is subtracted from the budget handed to the window
-builder, so the model call still stays within `window_tokens` overall.
+builder, so compaction never adds headroom pressure beyond an uncompacted
+turn — it does not guarantee the model call stays within `window_tokens`
+overall: the window builder always includes the newest turn even when
+that turn alone exceeds whatever budget it's given, with or without a
+summary competing for the same budget.
 Summarization runs at most once per turn — not once per loop iteration —
 and reuses the newest summary already covering the dropped span instead of
 calling the model again. A summarization failure (including a budget

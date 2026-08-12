@@ -676,4 +676,44 @@ async def test_initial_taint_seeded_from_newest_summary_in_default_turn_mode(tmp
     assert "Confirm: run log_workout" in reply.text
     assert fp_compact.calls == []  # nothing dropped this turn -- no summarizer call
     await db.dispose()
+
+
+async def test_oversized_newest_turn_still_sent_despite_compaction_accounting(tmp_path) -> None:
+    """build_window's newest-turn-is-non-negotiable rule (window.py) means a
+    single turn larger than the whole budget is still sent whole, with or
+    without compaction competing for the same budget. This is the boundary
+    the summary-cost subtraction does NOT smooth over: it only keeps
+    compaction from adding pressure beyond an uncompacted turn, and must not
+    crash or mis-drop when the remaining budget can't hold the oversized
+    turn either."""
+    config = RouterConfig(window_tokens=10)
+    huge_text = "gigantic user turn " * 200  # unmistakably larger than window_tokens alone
+    router, fp_standard, fp_compact, db, convo = make_router_with_compaction(
+        tmp_path,
+        [fake_text("final answer")],
+        [fake_text("SUMMARY: recap.")],
+        config=config,
+    )
+    conv_id = await convo.get_or_create("t:1")
+    filler = "filler " * 20
+    for i in range(3):
+        await convo.append(conv_id, Message(role="user", text=f"prior user {i} {filler}"))
+        await convo.append(conv_id, Message(role="assistant", text=f"prior assistant {i} {filler}"))
+
+    reply = await router.handle(channel="t:1", text=huge_text, user_id="u1")
+    assert reply.text == "final answer"
+
+    messages = fp_standard.calls[0]["messages"]
+    assert messages[0].role == "system"
+    assert messages[1].role == "user" and "SUMMARY: recap." in messages[1].text
+    # the oversized newest turn is still sent whole, not truncated or dropped
+    assert messages[-1].role == "user" and messages[-1].text == huge_text
+
+    async with db.session() as s:
+        rows = (
+            (await s.execute(select(Summary).where(Summary.conversation_id == conv_id)))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1  # accounting still wrote exactly one summary row, no crash
     await db.dispose()
