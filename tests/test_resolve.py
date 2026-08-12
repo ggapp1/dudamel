@@ -1,3 +1,4 @@
+import importlib
 import itertools
 import sys
 import textwrap
@@ -35,6 +36,11 @@ def write_suite_app(tmp_path: Path, monkeypatch, name: str, body: str) -> SuiteA
     (pkg / f"{name}.py").write_text(textwrap.dedent(body))
     if str(tmp_path) not in sys.path:
         monkeypatch.syspath_prepend(str(tmp_path))
+    # Unconditionally, not just on the first call: the import system caches a
+    # directory listing per sys.path entry, so a package written into a
+    # directory that is ALREADY on the path is invisible without this.
+    # `syspath_prepend` does it for us on the first call and not after.
+    importlib.invalidate_caches()
     versions = tmp_path / f"{name}_versions"
     versions.mkdir(exist_ok=True)
     return SuiteApp(
@@ -49,7 +55,7 @@ def register(monkeypatch, *entries: SuiteApp) -> None:
     monkeypatch.setattr("dudamel.apps.SUITE_APPS", {e.name: e for e in entries}, raising=True)
 
 
-DEMO = '''
+DEMO_TEMPLATE = '''
 from pydantic import BaseModel
 from dudamel import App
 
@@ -58,7 +64,7 @@ class DemoSettings(BaseModel):
     city: str = "here"
 
 
-app = App("demo", description="demo summary", settings=DemoSettings)
+app = App("{name}", description="{name} summary", settings=DemoSettings)
 
 
 @app.tool
@@ -66,6 +72,8 @@ async def ping() -> str:
     """Ping."""
     return "pong"
 '''
+
+DEMO = DEMO_TEMPLATE.format(name="demo")
 
 
 def settings_for(tmp_path: Path, toml: str) -> Settings:
@@ -157,6 +165,29 @@ def test_undeclared_import_error_keeps_its_own_message(tmp_path, monkeypatch) ->
     assert "pip install" not in resolution.errors[0].message
 
 
+def test_import_failure_strict_raises(tmp_path, monkeypatch) -> None:
+    register(
+        monkeypatch,
+        write_suite_app(tmp_path, monkeypatch, "demo", "import dudamel_typo_module"),
+    )
+    settings = settings_for(tmp_path, "[apps.demo]\nenabled = true\n")
+    with pytest.raises(AppResolutionError, match="dudamel_typo_module"):
+        resolve_apps(Orchestrator(), settings, strict=True)
+
+
+def test_import_calling_sys_exit_is_still_collected(tmp_path, monkeypatch) -> None:
+    """A module that kills the interpreter at import must not take `doctor`
+    with it: diagnostic mode never raises."""
+    register(
+        monkeypatch,
+        write_suite_app(tmp_path, monkeypatch, "demo", "import sys\nsys.exit(3)\n"),
+    )
+    settings = settings_for(tmp_path, "[apps.demo]\nenabled = true\n")
+    resolution = resolve_apps(Orchestrator(), settings, strict=False)
+    assert [(e.app, e.stage) for e in resolution.errors] == [("demo", 2)]
+    assert resolution.apps == []
+
+
 def test_suite_module_without_an_app_object_is_stage_two(tmp_path, monkeypatch) -> None:
     register(monkeypatch, write_suite_app(tmp_path, monkeypatch, "demo", "app = 'not an App'"))
     settings = settings_for(tmp_path, "[apps.demo]\nenabled = true\n")
@@ -172,6 +203,13 @@ def test_settings_failure_is_stage_three(tmp_path, monkeypatch) -> None:
     resolution = resolve_apps(Orchestrator(), settings, strict=False)
     assert resolution.errors[0].stage == 3
     assert resolution.apps == []
+
+
+def test_settings_failure_strict_raises(tmp_path, monkeypatch) -> None:
+    register(monkeypatch, write_suite_app(tmp_path, monkeypatch, "demo", DEMO))
+    settings = settings_for(tmp_path, "[apps.demo]\nenabled = true\nnope = 1\n")
+    with pytest.raises(AppResolutionError, match="nope"):
+        resolve_apps(Orchestrator(), settings, strict=True)
 
 
 def test_local_app_runs_without_a_config_block(tmp_path, monkeypatch) -> None:
@@ -204,8 +242,8 @@ def test_local_app_may_not_take_a_reserved_name(tmp_path, monkeypatch, block) ->
 
 
 def test_second_resolution_does_not_mutate_the_first(tmp_path, monkeypatch) -> None:
-    """Spec 3.1: module-global App objects must not leak settings across
-    resolutions."""
+    """A suite module's `app` is a module global, so two resolutions in one
+    process must not end up sharing (and reconfiguring) the same object."""
     register(monkeypatch, write_suite_app(tmp_path, monkeypatch, "demo", DEMO))
     first = resolve_apps(
         Orchestrator(), settings_for(tmp_path, "[apps.demo]\ncity = 'lisbon'\n"), strict=True
@@ -252,3 +290,28 @@ def test_diagnostic_mode_collects_several_failures(tmp_path, monkeypatch) -> Non
     settings = settings_for(tmp_path, "[apps.demo]\nnope = 1\n\n[apps.ghost]\nenabled = true\n")
     resolution = resolve_apps(Orchestrator(), settings, strict=False)
     assert {e.app for e in resolution.errors} == {"demo", "ghost"}
+
+
+def test_a_healthy_app_survives_its_broken_neighbours(tmp_path, monkeypatch) -> None:
+    """The point of diagnostic mode: one failure per app, and the apps that are
+    fine still resolve completely."""
+    good = write_suite_app(tmp_path, monkeypatch, "good", DEMO_TEMPLATE.format(name="good"))
+    broken = write_suite_app(tmp_path, monkeypatch, "broken", "import dudamel_typo_module")
+    misconfigured = write_suite_app(
+        tmp_path, monkeypatch, "badcfg", DEMO_TEMPLATE.format(name="badcfg")
+    )
+    register(monkeypatch, good, broken, misconfigured)
+    settings = settings_for(
+        tmp_path,
+        "[apps.good]\ncity = 'lisbon'\n\n[apps.broken]\n\n[apps.badcfg]\nnope = 1\n"
+        "\n[apps.ghost]\n",
+    )
+    resolution = resolve_apps(Orchestrator(), settings, strict=False)
+    assert [a.name for a in resolution.apps] == ["good"]
+    assert resolution.apps[0].settings.city == "lisbon"
+    assert resolution.suite_lanes == [("good", good.versions_dir)]
+    assert {(e.app, e.stage) for e in resolution.errors} == {
+        ("broken", 2),
+        ("badcfg", 3),
+        ("ghost", 1),
+    }

@@ -135,7 +135,14 @@ def resolve_apps(orchestrator: Orchestrator, settings: Settings, *, strict: bool
     for entry in enabled_suite:
         try:
             module = _import_fresh(entry)
-        except Exception as e:  # the app's own import problem, reported as-is
+        # The app's own import problem, reported as-is. `SystemExit` is named
+        # alongside `Exception` because it is not one: a module that calls
+        # `sys.exit()` at import would otherwise unwind straight through
+        # diagnostic mode and take `doctor` down with it, which is the one
+        # thing diagnostic mode promises not to do. `KeyboardInterrupt` is
+        # deliberately still allowed through -- that one is the operator
+        # talking, not the app.
+        except (Exception, SystemExit) as e:
             fail(entry.name, 2, f"app {entry.name!r} failed to import: {e!r}")
             continue
         app = getattr(module, "app", None)
