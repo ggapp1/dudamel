@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 import pytest
@@ -293,6 +294,41 @@ async def test_newest_n_pruning_keeps_only_the_latest_rows(tmp_path: Path) -> No
     assert len(remaining) == _KEEP_PER_CONVERSATION
     expected = [f"gist-{i}" for i in range(2, _KEEP_PER_CONVERSATION + 2)]
     assert [r.text for r in remaining] == expected
+    await db.dispose()
+
+
+async def test_a_row_landing_between_the_two_reads_proceeds_uncompacted(
+    tmp_path: Path, caplog
+) -> None:
+    """`_watermark_id` lines its ids up positionally with the caller's
+    history, which only holds while nothing writes between the two reads --
+    the router's per-conversation lock, which `Compactor` neither receives
+    nor checks. Simulate the write landing anyway: the ids shift, position
+    `dropped - 1` now names a NEWER message, and marking that covered would
+    lose it forever. Compaction is best-effort, so the turn proceeds
+    uncompacted instead."""
+    compactor, fp, db, conv_id = await _make(tmp_path, [fake_text("the gist")])
+    history = await _seed_messages(db, conv_id, 5)
+    # A second writer (another process, a scheduler job) appends after the
+    # caller's `recent()` read produced `history`.
+    async with db.session() as s:
+        s.add(
+            MessageRow(
+                conversation_id=conv_id,
+                role="user",
+                content={"role": "user", "text": "landed late"},
+            )
+        )
+
+    with caplog.at_level(logging.WARNING, logger="dudamel.compaction"):
+        record = await compactor.maybe_compact(
+            conv_id, history, dropped=3, turn_key="turn-1", dropped_tainted=False
+        )
+
+    assert record is None
+    assert fp.calls == []  # no summarizer call against a span we can't locate
+    assert await _summary_rows(db, conv_id) == []  # and no wrong watermark written
+    assert "shifted under compaction" in caplog.text
     await db.dispose()
 
 

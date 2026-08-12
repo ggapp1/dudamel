@@ -187,7 +187,7 @@ class Compactor:
         *,
         dropped_tainted: bool,
     ) -> SummaryRecord | None:
-        watermark = await self._watermark_id(conversation_id, len(history), dropped)
+        watermark = await self._watermark_id(conversation_id, history, dropped)
         if watermark is None:
             return None
         newest = await self.newest(conversation_id)
@@ -227,33 +227,54 @@ class Compactor:
         return await self._write(conversation_id, watermark, summary_text, dropped_tainted)
 
     async def _watermark_id(
-        self, conversation_id: int, history_len: int, dropped: int
+        self, conversation_id: int, history: list[Message], dropped: int
     ) -> int | None:
         """The id of the newest Message row the dropped span ends at.
 
         Mirrors `ConversationStore.recent()`'s own query (same conversation,
         same order, same limit) so the ids returned line up positionally
         with the `history` list the caller already built from that same
-        method -- the router holds the per-conversation lock for the whole
-        turn, so no write can land between the two reads.
+        method. The router holds the per-conversation lock for the whole
+        turn, so in-process no write can land between the two reads -- but
+        that is the CALLER's discipline, and `maybe_compact` is public. A
+        write slipping in (a second process on the same DB, a scheduler job
+        appending a proactive message) shifts the newest-N window, and
+        `ids[dropped - 1]` would then name a message NEWER than the span
+        really ends at -- permanently marked covered by a summary that never
+        saw it, since the reuse check never revisits a covered span.
+
+        So the alignment is verified rather than assumed: the rows are read
+        with their content and checked against the same positions in
+        `history`. A mismatch means the assumption broke; compaction is
+        best-effort, so this turn proceeds uncompacted rather than writing a
+        wrong watermark.
         """
         async with self._db.session() as s:
             rows = (
-                (
-                    await s.execute(
-                        select(MessageRow.id)
-                        .where(MessageRow.conversation_id == conversation_id)
-                        .order_by(MessageRow.id.desc())
-                        .limit(history_len)
-                    )
+                await s.execute(
+                    select(MessageRow.id, MessageRow.content)
+                    .where(MessageRow.conversation_id == conversation_id)
+                    .order_by(MessageRow.id.desc())
+                    .limit(len(history))
                 )
-                .scalars()
-                .all()
-            )
-        ids = list(reversed(rows))
-        if dropped > len(ids):
+            ).all()
+        aligned = list(reversed(rows))
+        if dropped > len(aligned):
             return None
-        return ids[dropped - 1]
+        # Checking the two ends is enough to catch a shifted window: any
+        # insert or delete between the reads moves the newest row, and any
+        # shift big enough to matter moves the boundary row too.
+        for index in (len(aligned) - 1, dropped - 1):
+            if Message.from_dict(aligned[index][1]) != history[index]:
+                logger.warning(
+                    "conversation %s: message rows shifted under compaction "
+                    "(position %d no longer matches the history read); "
+                    "proceeding uncompacted",
+                    conversation_id,
+                    index,
+                )
+                return None
+        return aligned[dropped - 1][0]
 
     async def _summarize(self, dropped_messages: list[Message]) -> str:
         prompt = (
