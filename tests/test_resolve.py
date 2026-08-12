@@ -218,6 +218,16 @@ def test_second_resolution_does_not_mutate_the_first(tmp_path, monkeypatch) -> N
     assert first.apps[0] is not second.apps[0]
 
 
+def test_local_app_settings_failure_is_stage_three(tmp_path, monkeypatch) -> None:
+    register(monkeypatch)
+    local = App("mine", description="d")
+    settings = settings_for(tmp_path, "[apps.mine]\nnope = 1\n")
+    resolution = resolve_apps(Orchestrator(apps=[local]), settings, strict=False)
+    assert [(e.app, e.stage) for e in resolution.errors] == [("mine", 3)]
+    assert resolution.apps == []
+    assert resolution.local_apps == []
+
+
 def test_local_app_settings_are_rebound_on_a_second_resolution(tmp_path, monkeypatch) -> None:
     """A local app object is owned by the caller's Orchestrator and outlives a
     resolution, so re-resolving it must re-bind rather than refuse."""

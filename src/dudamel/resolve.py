@@ -58,6 +58,13 @@ def _is_enabled(blocks: dict[str, dict[str, Any]], name: str) -> bool:
     return bool(blocks[name].get("enabled", True))
 
 
+def _settings_values(block: dict[str, Any]) -> dict[str, Any]:
+    """The block minus `enabled`, which is the resolver's switch and not one of
+    the app's own settings. `bind_settings` rejects unknown keys, so leaving it
+    in would make every configured app fail validation."""
+    return {k: v for k, v in block.items() if k != "enabled"}
+
+
 def _import_fresh(entry: SuiteApp) -> ModuleType:
     """Import a suite module, discarding any previously imported copy.
 
@@ -143,9 +150,8 @@ def resolve_apps(orchestrator: Orchestrator, settings: Settings, *, strict: bool
 
     # --- stage 3: settings --------------------------------------------------
     for entry, app in imported:
-        block = {k: v for k, v in blocks.get(entry.name, {}).items() if k != "enabled"}
         try:
-            app.bind_settings(block)
+            app.bind_settings(_settings_values(blocks.get(entry.name, {})))
         except AppSettingsError as e:
             fail(entry.name, 3, str(e))
             continue
@@ -162,7 +168,7 @@ def resolve_apps(orchestrator: Orchestrator, settings: Settings, *, strict: bool
             continue
         app = local_by_name[name]
         try:
-            app.bind_settings({k: v for k, v in block.items() if k != "enabled"})
+            app.bind_settings(_settings_values(block))
         except AppSettingsError as e:
             fail(name, 3, str(e))
             continue
