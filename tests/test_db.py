@@ -33,6 +33,27 @@ async def test_rollback_on_exception(db: Database):
     assert count == 0
 
 
+async def test_foreign_keys_enforced(tmp_path):
+    """SQLite enforces foreign keys per connection and defaults to off, so
+    without the pragma every ForeignKey in models_core.py is decorative on
+    the default backend -- and an FK mistake that raises on Postgres passes
+    silently in a SQLite-only test run."""
+    from sqlalchemy.exc import IntegrityError
+
+    from dudamel.migrate import upgrade_core
+    from dudamel.models_core import Message as MessageRow
+
+    url = f"sqlite+aiosqlite:///{tmp_path}/fk.db"
+    upgrade_core(url)
+    d = Database(url)
+    try:
+        with pytest.raises(IntegrityError):
+            async with d.session() as s:
+                s.add(MessageRow(conversation_id=999_999, role="user", content={"role": "user"}))
+    finally:
+        await d.dispose()
+
+
 async def test_wal_mode_enabled(db: Database):
     async with db.session() as s:
         mode = (await s.execute(text("PRAGMA journal_mode"))).scalar()

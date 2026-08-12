@@ -22,6 +22,15 @@ class Database:
                 cursor = dbapi_conn.cursor()
                 cursor.execute("PRAGMA journal_mode=WAL")
                 cursor.execute("PRAGMA busy_timeout=5000")
+                # SQLite enforces foreign keys per CONNECTION and defaults to
+                # off, so without this every ForeignKey in models_core.py is
+                # decorative on the default backend while the same insert
+                # raises on Postgres -- a divergence that also hides FK
+                # mistakes from a SQLite-only test run. Enforcement applies
+                # to writes from here on; rows an older install already wrote
+                # are never re-validated, so enabling it cannot fail an
+                # existing database on open.
+                cursor.execute("PRAGMA foreign_keys=ON")
                 cursor.close()
 
         self._factory = async_sessionmaker(self.engine, expire_on_commit=False)
