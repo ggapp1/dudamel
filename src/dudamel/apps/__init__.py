@@ -47,7 +47,23 @@ def suite_versions_dir(entry: SuiteApp) -> Path:
     return Path(str(files("dudamel.apps"))) / entry.name / "migrations" / "versions"
 
 
+def _is_importable(module: str) -> bool:
+    """Whether `module` could be imported, without importing it.
+
+    `find_spec` returns None for an absent top-level module, but *raises* for a
+    dotted name whose parent package is absent, and for a name already in
+    `sys.modules` whose `__spec__` is None. Every such failure means the same
+    thing here -- the requirement is not usable -- so report it instead of
+    propagating: this function exists to turn a missing dependency into a
+    friendly "install the extra" message, not into a traceback.
+    """
+    try:
+        return importlib.util.find_spec(module) is not None
+    except (ImportError, AttributeError, ValueError):
+        return False
+
+
 def missing_requirements(entry: SuiteApp) -> tuple[str, ...]:
     """Declared requirements that are not importable. Uses find_spec so a
     missing dependency is detected without executing any app code."""
-    return tuple(m for m in entry.requires if importlib.util.find_spec(m) is None)
+    return tuple(m for m in entry.requires if not _is_importable(m))
