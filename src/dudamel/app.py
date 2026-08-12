@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager
 from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, ValidationError
+from pydantic import AliasChoices, BaseModel, ValidationError
 
 from dudamel.contract.renderers import RENDERERS
 from dudamel.contract.schema import ToolSchema
@@ -28,6 +28,39 @@ class _EmptySettings(BaseModel):
 
 
 _EMPTY_SETTINGS = _EmptySettings()
+
+
+def _accepted_keys(model: type[BaseModel]) -> set[str]:
+    """The key spellings `model.model_validate` will actually accept.
+
+    An alias replaces the field name rather than adding to it: with a plain
+    `Field(alias="key")` pydantic accepts `key` and rejects `api_key`, unless
+    the model opts into population by name. Listing both would advertise a
+    spelling that validation then rejects, so the two sets are kept in step.
+    """
+    config = model.model_config
+    by_name = bool(config.get("validate_by_name") or config.get("populate_by_name"))
+    keys: set[str] = set()
+    for field_name, field in model.model_fields.items():
+        aliases: list[str] = []
+        # pydantic mirrors a plain `alias=` into `validation_alias`, so this
+        # branch covers both spellings; `alias` remains the fallback for any
+        # field that only carries the serialization-side name.
+        if isinstance(field.validation_alias, AliasChoices):
+            aliases = [
+                choice for choice in field.validation_alias.choices if isinstance(choice, str)
+            ]
+        elif isinstance(field.validation_alias, str):
+            aliases = [field.validation_alias]
+        elif field.alias is not None:
+            aliases = [field.alias]
+        if not aliases:
+            keys.add(field_name)
+            continue
+        keys.update(aliases)
+        if by_name:
+            keys.add(field_name)
+    return keys
 
 
 class App:
@@ -209,11 +242,7 @@ class App:
                 )
             self._settings = _EMPTY_SETTINGS
             return
-        known: set[str] = set()
-        for field_name, field in self.settings_model.model_fields.items():
-            known.add(field_name)
-            if field.alias is not None:
-                known.add(field.alias)
+        known = _accepted_keys(self.settings_model)
         unknown = sorted(set(values) - known)
         if unknown:
             raise AppSettingsError(

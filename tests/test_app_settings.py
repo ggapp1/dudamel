@@ -1,5 +1,5 @@
 import pytest
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from dudamel import App
 from dudamel.exceptions import AppSettingsError, RuntimeNotBoundError
@@ -27,8 +27,12 @@ def test_unknown_key_rejected_even_without_extra_forbid() -> None:
     """Weather does NOT set model_config extra='forbid'. The framework, not the
     app author, is what makes a typo an error instead of a silent no-op."""
     app = App("weather", description="d", settings=Weather)
-    with pytest.raises(AppSettingsError, match="latitide"):
+    with pytest.raises(AppSettingsError) as excinfo:
         app.bind_settings({"latitude": 1.0, "latitide": 2.0})
+    message = str(excinfo.value)
+    assert "latitide" in message
+    # the hint half of the message is what lets an operator fix the typo
+    assert "known: latitude, units" in message
 
 
 def test_validation_failure_names_app_and_field() -> None:
@@ -60,3 +64,53 @@ def test_alias_accepted_and_unknown_key_still_rejected() -> None:
     assert app.settings.api_key == "abc"
     with pytest.raises(AppSettingsError, match="nope"):
         App("svc", description="d", settings=Aliased).bind_settings({"key": "a", "nope": 1})
+
+
+def test_plain_alias_replaces_the_field_name() -> None:
+    """With `alias=` and no population by name, pydantic accepts only the alias.
+    The framework must reject the field name here rather than advertise it and
+    then let model_validate fail on a key the user never wrote."""
+
+    class Aliased(BaseModel):
+        api_key: str = Field(alias="key")
+
+    app = App("svc", description="d", settings=Aliased)
+    with pytest.raises(AppSettingsError) as excinfo:
+        app.bind_settings({"api_key": "abc"})
+    message = str(excinfo.value)
+    assert "unknown setting(s) api_key" in message
+    assert "known: key" in message
+    assert "api_key" not in message.split("known:")[1]
+
+
+def test_population_by_name_accepts_both_spellings() -> None:
+    class Aliased(BaseModel):
+        model_config = ConfigDict(populate_by_name=True)
+
+        api_key: str = Field(alias="key")
+
+    assert App("svc", description="d", settings=Aliased).bind_settings({"key": "a"}) is None
+    app = App("svc", description="d", settings=Aliased)
+    app.bind_settings({"api_key": "b"})
+    assert app.settings.api_key == "b"
+
+
+def test_validation_alias_accepted() -> None:
+    class Aliased(BaseModel):
+        api_key: str = Field(validation_alias="key")
+
+    app = App("svc", description="d", settings=Aliased)
+    app.bind_settings({"key": "abc"})
+    assert app.settings.api_key == "abc"
+
+
+def test_alias_choices_each_accepted() -> None:
+    class Choosy(BaseModel):
+        api_key: str = Field(validation_alias=AliasChoices("key", "token"))
+
+    for spelling in ("key", "token"):
+        app = App("svc", description="d", settings=Choosy)
+        app.bind_settings({spelling: "abc"})
+        assert app.settings.api_key == "abc"
+    with pytest.raises(AppSettingsError, match="api_key"):
+        App("svc", description="d", settings=Choosy).bind_settings({"api_key": "abc"})
