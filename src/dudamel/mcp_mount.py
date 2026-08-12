@@ -853,6 +853,14 @@ class _MountedServer:
         # Diagnostics, and what the tests assert coalescing against:
         # `reconnect_count` counts rebuild *cycles* (one per burst of failing
         # calls), `reconnect_attempts` counts individual connection attempts.
+        # "Attempt" means a connection this server actually tried to build:
+        # a caller whose failure was coalesced onto somebody else's burst adds
+        # nothing, and `_submit`'s resubmit of a request the supervisor lost
+        # *without running it* is still one attempt, not two. Measured against
+        # both -- a five-call burst that coalesces to one rebuild, and an
+        # exhausted burst -- the counter equals the number of `_connect` calls
+        # actually made; `test_reconnect_attempts_counts_real_connection_
+        # attempts` keeps it that way.
         self.reconnect_count = 0
         self.reconnect_attempts = 0
         self._stack: AsyncExitStack | None = None
