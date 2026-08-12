@@ -9,6 +9,12 @@ from dudamel import App, Orchestrator, Runtime
 from dudamel.config import Settings, TierConfig
 from dudamel.exceptions import DudamelError, LLMError, RegistryError
 from dudamel.llm.testing import FakeProvider, fake_text, fake_tool_call
+from dudamel.migrate import (
+    ensure_app_migrations,
+    generate_app_migration,
+    pending_migrations,
+    upgrade_core,
+)
 
 
 def make_orc() -> Orchestrator:
@@ -253,6 +259,81 @@ async def test_prompted_tier_wraps_a_providers_override_end_to_end(tmp_path) -> 
 
 
 # --- Runtime extensions: pending confirmations, notify fallback, widgets ----
+
+
+def _blog_orc() -> Orchestrator:
+    app = App("blog", description="d")
+
+    class Post(app.Model):
+        title: str
+
+    return Orchestrator(apps=[app])
+
+
+async def test_runtime_gate_binds_on_app_migrations_in_project_dir_not_data_dir(
+    tmp_path: Path,
+) -> None:
+    """CONFIRMED finding: with auto_migrate off, Runtime.start() must refuse to
+    start against an app schema that is behind head. It has to resolve app
+    migrations from the PROJECT directory (where `dudamel db migrate` writes
+    them) -- resolving from `settings.data_dir` when that differs from the
+    project root finds no migrations/, silently hollowing the gate."""
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    data_dir = tmp_path / "state"
+    data_dir.mkdir()
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'app.db'}"
+
+    # Core at head; an app migration exists in the PROJECT dir but is unapplied.
+    upgrade_core(db_url)
+    ensure_app_migrations(project_dir)
+    orc = _blog_orc()
+    generate_app_migration(orc, db_url, "add posts", project_dir)
+
+    settings = Settings(
+        database_url=db_url,
+        data_dir=data_dir,
+        project_dir=project_dir,
+        auto_migrate=False,
+        llm_tiers={"standard": TierConfig(provider="fake", model="f")},
+    )
+    rt = Runtime(orc, settings, providers={"standard": FakeProvider([])})
+    with pytest.raises(DudamelError, match="app schema is behind head"):
+        await rt.start()
+    await rt.stop()
+
+
+async def test_runtime_auto_migrate_applies_project_dir_migrations(tmp_path: Path) -> None:
+    """The other entry point: with auto_migrate on and data_dir != project_dir,
+    Runtime.start() applies the app migrations found in the project directory
+    (the same place the CLI reads), and never touches data_dir as a migrations
+    root -- so both paths agree on where migrations live."""
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    data_dir = tmp_path / "state"
+    data_dir.mkdir()
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'app.db'}"
+
+    upgrade_core(db_url)
+    ensure_app_migrations(project_dir)
+    orc = _blog_orc()
+    generate_app_migration(orc, db_url, "add posts", project_dir)
+
+    settings = Settings(
+        database_url=db_url,
+        data_dir=data_dir,
+        project_dir=project_dir,
+        auto_migrate=True,
+        llm_tiers={"standard": TierConfig(provider="fake", model="f")},
+    )
+    rt = Runtime(orc, settings, providers={"standard": FakeProvider([])})
+    await rt.start()
+    await rt.stop()
+
+    # Applied from the project dir -> nothing pending there; data_dir never
+    # became a migrations root.
+    assert pending_migrations(db_url, project_dir) == []
+    assert not (data_dir / "migrations").exists()
 
 
 async def test_list_pending_confirmations(tmp_path) -> None:

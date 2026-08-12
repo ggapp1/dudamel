@@ -179,13 +179,19 @@ class Runtime:
 
     async def start(self) -> None:
         url = self._settings.database_url
+        # App migrations live in the PROJECT directory (where `dudamel new`/
+        # `dudamel db migrate` create and read them), NOT data_dir. Resolving
+        # from project_dir keeps this in lockstep with the CLI so the
+        # auto_migrate gate below cannot be hollowed out by a data_dir that
+        # differs from the project root.
+        project_dir = self._settings.project_dir
         if self._settings.auto_migrate:
             await asyncio.to_thread(upgrade_core, url)
-            migrations_dir = self._settings.data_dir / "migrations"
+            migrations_dir = project_dir / "migrations"
             if migrations_dir.exists():
-                await asyncio.to_thread(upgrade_apps, url, self._settings.data_dir)
+                await asyncio.to_thread(upgrade_apps, url, project_dir)
         else:
-            pending = await asyncio.to_thread(pending_migrations, url, self._settings.data_dir)
+            pending = await asyncio.to_thread(pending_migrations, url, project_dir)
             if pending:
                 raise DudamelError(
                     "refusing to start: "
