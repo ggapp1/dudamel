@@ -26,6 +26,7 @@ from dudamel.db import Database
 from dudamel.exceptions import (
     BudgetExceededError,
     LLMError,
+    ProviderRequestError,
     RegistryError,
     ToolValidationError,
     UnknownToolOutcome,
@@ -549,6 +550,13 @@ class Router:
                         text=f"I completed the action(s), but couldn't produce a "
                         f"summary — the model failed afterwards ({e})."
                     )
+                if isinstance(e, ProviderRequestError):
+                    # Not an outage: the provider refused this request and
+                    # will refuse it identically next time (an empty message,
+                    # an unusable tool schema, a bad key). Saying "the model
+                    # is unavailable" would send the user off to wait for a
+                    # recovery that never comes.
+                    return ChatReply(text=f"The model provider rejected the request: {e}")
                 return ChatReply(text=f"The model is unavailable: {e}")
             msg = completion.message
             if not msg.tool_calls:

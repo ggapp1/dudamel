@@ -3,7 +3,7 @@ import json
 import httpx
 import pytest
 
-from dudamel.exceptions import LLMError
+from dudamel.exceptions import LLMError, ProviderRequestError
 from dudamel.llm.openai_compat import OpenAICompatProvider
 from dudamel.llm.provider import ToolSpec
 from dudamel.llm.types import Message, ToolCall
@@ -197,3 +197,15 @@ async def test_api_key_redacted_in_errors() -> None:
         await provider.complete(model="m", messages=[])
     assert "sk-secret123" not in str(exc.value)
     assert "***" in str(exc.value)
+
+
+async def test_client_errors_classify_as_rejected_requests() -> None:
+    """Symmetric with the anthropic provider: a 4xx the endpoint will keep
+    rejecting is a request error, not an outage."""
+
+    def handler(_r: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": {"message": "bad request"}})
+
+    with pytest.raises(ProviderRequestError) as exc:
+        await make_provider(handler).complete(model="m", messages=[])
+    assert exc.value.retryable is False
