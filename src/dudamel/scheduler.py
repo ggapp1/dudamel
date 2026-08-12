@@ -26,7 +26,7 @@ from apscheduler.job import Job as APSJob
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import SQLAlchemyError
 
 from dudamel.contract.types import Job
 from dudamel.db import Database
@@ -98,11 +98,25 @@ class JobScheduler:
             task.add_done_callback(self._inflight.discard)
         started = _utcnow()
         try:
-            await asyncio.wait_for(job.fn(), timeout=job.timeout)
-        except TimeoutError:
-            detail = f"job {job.id} timed out after {job.timeout}s"
-            logger.warning(detail)
-            await self._record(job.id, "timeout", started, detail)
+            # `asyncio.timeout` lets us tell OUR deadline apart from a
+            # TimeoutError the job raised itself. Since Python 3.11
+            # asyncio.TimeoutError IS the builtin TimeoutError (and OSError
+            # ETIMEDOUT/socket.timeout are too), so a job whose own network
+            # call times out raises TimeoutError from job.fn() -- catching that
+            # as a scheduler timeout would record a fabricated "timed out after
+            # {job.timeout}s" and drop the real traceback. `cm.expired()` is
+            # true only when the context manager's own deadline fired.
+            async with asyncio.timeout(job.timeout) as cm:
+                await job.fn()
+        except TimeoutError as e:
+            if cm.expired():
+                detail = f"job {job.id} timed out after {job.timeout}s"
+                logger.warning(detail)
+                await self._record(job.id, "timeout", started, detail)
+            else:
+                # The job raised its own TimeoutError -- a job error, recorded
+                # with the traceback like any other raised exception.
+                await self._record_error(job.id, started, e)
         except asyncio.CancelledError:
             # The executor cancels in-flight jobs at shutdown. Record the
             # outcome, then let the cancellation continue -- a run that was
@@ -118,11 +132,17 @@ class JobScheduler:
                 logger.warning("failed to record cancelled run for job %s: %s", job.id, e)
             raise
         except Exception as e:  # job bugs must not kill the scheduler
-            detail = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"[:_DETAIL_CAP]
-            logger.warning("job %s raised: %s", job.id, e)
-            await self._record(job.id, "error", started, detail)
+            await self._record_error(job.id, started, e)
         else:
             await self._record(job.id, "ok", started, None)
+
+    async def _record_error(self, job_id: str, started: datetime, e: BaseException) -> None:
+        """Record a job that raised as an "error" row, capturing the active
+        traceback. Must be called from inside the handling `except` block so
+        `traceback.format_exc()` refers to `e`."""
+        detail = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"[:_DETAIL_CAP]
+        logger.warning("job %s raised: %s", job_id, e)
+        await self._record(job_id, "error", started, detail)
 
     def _on_missed(self, event: JobExecutionEvent) -> None:
         """APScheduler listener (sync callback, invoked from the running
@@ -161,10 +181,15 @@ class JobScheduler:
                         detail=detail,
                     )
                 )
-        except OperationalError as e:
+        except SQLAlchemyError as e:
             # The job itself already ran to whatever conclusion it reached; a
-            # DB hiccup recording that outcome must not raise into the
-            # scheduler's executor (mirrors the llm_calls usage-insert rider).
+            # DB failure recording that outcome must not raise into the
+            # scheduler's executor. Broad by design (any SQLAlchemy error, not
+            # just OperationalError): the ok/error/timeout paths call _record
+            # directly, and an InterfaceError from a straggler task writing
+            # after the engine is disposed at shutdown, or an IntegrityError,
+            # would otherwise surface as a spurious executor failure -- the
+            # same reason the cancelled path already catches broadly.
             logger.warning("failed to record job_runs row for job %s: %s", job_id, e)
 
     def list_jobs(self) -> list[dict[str, Any]]:

@@ -116,6 +116,62 @@ async def test_slow_job_times_out(tmp_path) -> None:
     assert "0.05" in row.detail
 
 
+async def test_job_that_raises_its_own_timeouterror_is_an_error_not_a_timeout(
+    tmp_path,
+) -> None:
+    """A job that raises TimeoutError itself (e.g. an OS-level connect timeout,
+    which since Python 3.10 IS TimeoutError) well within its own budget must
+    be recorded as an "error" WITH the traceback -- not misreported as a
+    scheduler "timeout after {job.timeout}s" the job never actually hit."""
+    app = App("stats", description="d")
+
+    @app.job(interval_seconds=0, timeout=30)
+    async def flaky() -> None:
+        raise TimeoutError("connection to api.example.com timed out")
+
+    orc = Orchestrator(apps=[app])
+    db = await make_db(tmp_path)
+    sched = JobScheduler(orc.registry, db)
+    await sched.start()
+    try:
+        rows = await poll_job_runs(db, "stats.flaky")
+    finally:
+        await sched.shutdown()
+        await db.dispose()
+
+    row = rows[0]
+    assert row.status == "error"  # NOT "timeout"
+    assert row.detail is not None
+    assert "TimeoutError" in row.detail
+    assert "api.example.com" in row.detail
+    assert "Traceback" in row.detail  # the real traceback, not a fabricated line
+    assert "timed out after 30" not in row.detail  # never the scheduler's message
+
+
+async def test_record_swallows_any_db_error_not_just_operationalerror(tmp_path) -> None:
+    """`_record` is best-effort: a DB failure while writing the job_runs row
+    must never propagate into APScheduler's executor. The guard covers every
+    SQLAlchemyError (e.g. InterfaceError from a straggler writing after the
+    engine is disposed at shutdown), not only OperationalError."""
+    from sqlalchemy.exc import SQLAlchemyError
+
+    app = App("stats", description="d")
+    orc = Orchestrator(apps=[app])
+    db = await make_db(tmp_path)
+    sched = JobScheduler(orc.registry, db)
+
+    class _BrokenDB:
+        def session(self):
+            raise SQLAlchemyError("engine already disposed")
+
+    sched._db = _BrokenDB()
+    try:
+        # Must return normally, not raise.
+        await sched._record("stats.x", "ok", datetime.now(UTC).replace(tzinfo=None), None)
+    finally:
+        await db.dispose()
+
+
 async def test_cron_job_registers_with_correct_next_fire(tmp_path) -> None:
     app = App("stats", description="d")
 
