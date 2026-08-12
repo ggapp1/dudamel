@@ -9,6 +9,8 @@ import json
 import logging
 import re
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -142,6 +144,15 @@ def _confirmed_error_text(name: str, e: Exception) -> str:
 
 
 @dataclass
+class _LockEntry:
+    """A conversation's serialization lock plus the number of turns holding
+    or waiting for it -- the refcount is what makes eviction safe."""
+
+    lock: asyncio.Lock
+    users: int = 0
+
+
+@dataclass
 class ChatReply:
     text: str
     pending_confirmation_id: str | None = None
@@ -179,7 +190,7 @@ class Router:
         self._config = config
         self._compactor = compactor
         self._specs = [ToolSpec.from_tool(t) for t in registry.tools.values()]
-        self._locks: dict[int, asyncio.Lock] = {}
+        self._locks: dict[int, _LockEntry] = {}
         self._locks_guard = asyncio.Lock()
 
     def refresh_tool_specs(self) -> None:
@@ -230,7 +241,7 @@ class Router:
         tier: str = "standard",
     ) -> ChatReply:
         conv_id = await self._convo.get_or_create(channel)
-        async with await self._lock_for(conv_id):
+        async with self._conversation_lock(conv_id):
             if client_msg_id is not None:
                 # Read-only duplicate check BEFORE auto-decline: an interface
                 # retry of the very message that created a pending confirmation
@@ -299,11 +310,36 @@ class Router:
         except Exception as e:  # noqa: BLE001 — bookkeeping must never kill a turn
             logger.warning("failed to record activity row for tool %s: %s", tool, e)
 
-    async def _lock_for(self, conv_id: int) -> asyncio.Lock:
+    @asynccontextmanager
+    async def _conversation_lock(self, conv_id: int) -> AsyncIterator[None]:
+        """Serialize turns on one conversation, and keep no lock for a
+        conversation with no turn in flight.
+
+        Every Telegram chat and every web session id is its own conversation,
+        so a map that only ever grows is a leak for the process lifetime (the
+        compactor's per-conversation turn cache was bounded for the same
+        reason). The entry is reference-counted rather than dropped on
+        release: a waiter registers its interest BEFORE acquiring, so the
+        last holder can never evict a lock someone is still queued on and
+        hand a second caller a fresh, uncontended one.
+        """
         async with self._locks_guard:
-            if conv_id not in self._locks:
-                self._locks[conv_id] = asyncio.Lock()
-            return self._locks[conv_id]
+            entry = self._locks.get(conv_id)
+            if entry is None:
+                entry = _LockEntry(asyncio.Lock())
+                self._locks[conv_id] = entry
+            entry.users += 1
+        try:
+            async with entry.lock:
+                yield
+        finally:
+            # Deliberately NOT under `_locks_guard`: this runs on the
+            # cancellation unwind too, where awaiting anything is a risk, and
+            # it needs none -- there is no await between the read and the
+            # mutation, so no other task can observe a half-updated map.
+            entry.users -= 1
+            if entry.users == 0 and self._locks.get(conv_id) is entry:
+                del self._locks[conv_id]
 
     def _system_message(self) -> Message:
         apps = "\n".join(f"- {a.name}: {a.description}" for a in self._registry.apps.values())
@@ -861,7 +897,7 @@ class Router:
             ).scalar_one_or_none()
         if row is None:
             return ChatReply(text="Unknown confirmation — it may already be resolved.")
-        async with await self._lock_for(row.conversation_id):
+        async with self._conversation_lock(row.conversation_id):
             async with self._db.session() as s:
                 row = (
                     await s.execute(

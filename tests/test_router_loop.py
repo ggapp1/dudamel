@@ -1097,3 +1097,35 @@ async def test_resume_at_the_final_iteration_reports_the_approved_tool_ran(tmp_p
     assert len(fp.calls) == 1  # and the resume made no model call at all
     assert "completed the action" in r2.text
     await db.dispose()
+
+
+async def test_conversation_locks_do_not_accumulate_per_conversation(tmp_path) -> None:
+    """Every Telegram chat and web session is its own conversation, so a
+    per-conversation lock that is never released from the map is a slow leak
+    for the process lifetime. Measured, not asserted in prose: after N
+    conversations have each finished a turn, nothing is left behind."""
+    script = [fake_text(f"reply {n}") for n in range(6)]
+    router, fp, db = make_router(tmp_path, script)
+    for n in range(6):
+        await router.handle(channel=f"t:{n}", text="hi", user_id="u1")
+    assert router._locks == {}
+    await db.dispose()
+
+
+async def test_concurrent_turns_on_one_conversation_share_a_lock(tmp_path) -> None:
+    """Eviction must not hand two in-flight turns on the SAME conversation
+    two different locks: the serialization guarantee outranks the cleanup."""
+    script = [
+        fake_tool_call("serialized_probe", {}),
+        fake_text("one"),
+        fake_tool_call("serialized_probe", {}),
+        fake_text("two"),
+    ]
+    router, fp, db = make_router(tmp_path, script)
+    await asyncio.gather(
+        router.handle(channel="t:1", text="a", user_id="u1"),
+        router.handle(channel="t:1", text="b", user_id="u1"),
+    )
+    assert CALLS == ["probe:start", "probe:end", "probe:start", "probe:end"]
+    assert router._locks == {}  # and both turns released the shared entry
+    await db.dispose()
