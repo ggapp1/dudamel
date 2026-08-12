@@ -476,6 +476,49 @@ async def test_reconnect_is_bounded_at_three_attempts(
         await mount.close()
 
 
+async def test_reconnect_attempts_counts_real_connection_attempts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`reconnect_attempts` claims to count individual connection attempts, so
+    it is pinned against the connections actually built: `_connect` is what
+    performs one, and the counter must agree with how many times it ran.
+
+    Both directions matter. Counting a coalesced caller that did no work would
+    over-report; missing an attempt made through `_submit`'s resubmit (which
+    re-issues a request the supervisor lost *without* running it, so it is one
+    attempt and not two) would under-report.
+    """
+    name = "counts-real"
+    script = tmp_path / "flaky_copy.py"
+    script.write_text(FIXTURE.read_text())
+    mount = MCPMount([flaky_cmd(tmp_path, monkeypatch, name=name, script=script)])
+    connects = 0
+    try:
+        tools = await mount.mount()
+        echo = _tool(tools, "echo")
+        server = mount._servers[0]
+        assert await echo.fn(text="up") == "up"
+        real_connect = server._connect
+
+        async def counting_connect(stack: Any) -> None:
+            nonlocal connects
+            connects += 1
+            await real_connect(stack)
+
+        monkeypatch.setattr(server, "_connect", counting_connect)
+
+        # A burst that fails outright: every attempt is spent and counted.
+        script.write_text("import sys\n\nsys.exit(1)\n")
+        await _kill_and_wait(await _wait_for_pid(f"flaky_copy.py {name}"))
+        with pytest.raises(RuntimeError):
+            await echo.fn(text="down")
+        spent = server.reconnect_attempts
+        assert spent == server.max_reconnect_attempts
+        assert connects == spent
+    finally:
+        await mount.close()
+
+
 async def test_configured_reconnect_attempts_bounds_the_burst(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
