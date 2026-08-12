@@ -66,10 +66,12 @@ def add_ui(app: FastAPI, runtime: Runtime, settings: Settings) -> None:
     assets (vendored htmx). Raises RuntimeError if `app` wasn't built by
     `create_api()` first — see the module docstring for why.
 
-    `settings` isn't read yet (no [web] dashboard knob exists) but is kept
-    in the signature for symmetry with `create_api(runtime, settings)` and
-    because the single-process assembly (dudamel.serve.serve) will need to
-    pass it either way."""
+    `settings` is read to resolve the session cookie's name — the pages here
+    must read back whichever cookie `create_api()`/`POST /login` issued, and
+    that name derives from `resolve_cookie_secure(settings)` (see the
+    `cookie_name` line below). There is no [web] dashboard knob of its own
+    yet; the signature also stays symmetric with `create_api(runtime,
+    settings)` for the single-process assembly (dudamel.serve.serve)."""
     sessions: SessionStore | None = getattr(app.state, "sessions", None)
     if sessions is None:
         raise RuntimeError(
