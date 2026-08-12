@@ -143,12 +143,14 @@ def test_failing_lane_stops_later_lanes_and_reruns_cleanly(tmp_path) -> None:
     assert {"aaa_t", "bbb_t", "zzz_t"} <= names
 
 
-def test_lane_versions_dir_may_contain_spaces_and_commas(tmp_path) -> None:
-    """Alembic's legacy version_locations splitting would silently find no
-    revisions under a path containing a space or a comma."""
+def test_lane_versions_dir_may_contain_path_separator_characters(tmp_path) -> None:
+    """Every candidate version_locations separator -- space, comma, and the
+    POSIX os.pathsep ':' -- is a legal directory-name character, and a split
+    path silently resolves to no revisions instead of raising, so the lane
+    would report up to date and apply nothing."""
     url = db_url_for(tmp_path)
     upgrade_core(url)
-    awkward = tmp_path / "My Apps, v2"
+    awkward = tmp_path / "My Apps, v2:x"
     awkward.mkdir()
     notes = make_lane(awkward, "notes", body=CREATE_NOTES, rev="n1")
     assert pending_migrations(url, tmp_path, [("notes", notes)]) == [
@@ -156,6 +158,41 @@ def test_lane_versions_dir_may_contain_spaces_and_commas(tmp_path) -> None:
     ]
     upgrade_all(url, tmp_path, [("notes", notes)])
     assert "notes_note" in table_names(url)
+
+
+def test_second_revision_applies_to_a_lane_already_at_the_first(tmp_path) -> None:
+    """The ordinary way a shipped app evolves: revision 2 lands against a
+    database already at revision 1, and only revision 2 runs."""
+    url = db_url_for(tmp_path)
+    upgrade_core(url)
+    notes = make_lane(tmp_path, "notes", body=CREATE_NOTES, rev="n1")
+    upgrade_all(url, tmp_path, [("notes", notes)])
+
+    make_lane(
+        tmp_path,
+        "notes",
+        body="op.add_column('notes_note', sa.Column('title', sa.String()))",
+        rev="n2",
+        down="n1",
+    )
+    assert pending_migrations(url, tmp_path, [("notes", notes)]) == [
+        "app 'notes' schema is behind head"
+    ]
+    upgrade_all(url, tmp_path, [("notes", notes)])
+
+    engine = create_engine(url.replace("+aiosqlite", ""))
+    try:
+        assert "title" in {c["name"] for c in inspect(engine).get_columns("notes_note")}
+        with engine.connect() as conn:
+            assert (
+                conn.execute(
+                    text(f"select version_num from {suite_version_table('notes')}")
+                ).scalar()
+                == "n2"
+            )
+    finally:
+        engine.dispose()
+    assert pending_migrations(url, tmp_path, [("notes", notes)]) == []
 
 
 def test_upgrade_all_without_a_project_lane(tmp_path) -> None:
