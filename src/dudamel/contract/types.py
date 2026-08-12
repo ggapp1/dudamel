@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from dudamel.contract.schema import ToolSchema
@@ -41,4 +41,3 @@ class Job:
     cron: str | None = None
     interval_seconds: int | None = None
     timeout: float = 300.0
-    extra: dict[str, Any] = field(default_factory=dict)
