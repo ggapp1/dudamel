@@ -405,6 +405,14 @@ take: `call_timeout` (default 30 seconds) bounds a single tool call, and
 `mount_timeout` (default 15 seconds) bounds connecting to and listing
 tools from a server at startup and on each reconnect.
 
+Three more size the reconnect burst itself: `reconnect_attempts` (default
+3) is how many connection attempts one burst may spend,
+`reconnect_backoff_seconds` (default 0.5) is the delay before the second
+attempt and doubles for each one after it, and
+`reconnect_cooldown_seconds` (default 60) is how long that server's tools
+fail fast after a burst is exhausted, before the next call earns a fresh
+burst. All three must be positive; anything else is rejected at startup.
+
 ## Breaking changes for next release
 
 - `[llm.budget] daily_usd` has been removed and is no longer accepted.

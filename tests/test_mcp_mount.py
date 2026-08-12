@@ -159,6 +159,35 @@ async def test_configured_mount_timeout_bounds_a_hanging_server() -> None:
     assert elapsed < 5.0
 
 
+async def test_configured_reconnect_budget_reaches_the_mounted_server(tmp_path: Path) -> None:
+    """`[mcp]` reconnect settings are plumbed the same way as the two timeouts:
+    Settings -> Runtime -> MCPMount -> each mounted server."""
+    orc = Orchestrator(apps=[], mcp=[FIXTURE_CMD])
+    rt = Runtime(
+        orc,
+        make_settings(
+            tmp_path,
+            mcp=McpConfig(
+                reconnect_attempts=1,
+                reconnect_backoff_seconds=0.25,
+                reconnect_cooldown_seconds=7.0,
+            ),
+        ),
+        providers={"standard": FakeProvider([fake_text("hi")])},
+    )
+    await rt.start()
+    try:
+        assert rt._mcp_mount is not None
+        server = rt._mcp_mount._servers[0]
+        assert server.max_reconnect_attempts == 1
+        assert server.reconnect_backoff_seconds == 0.25
+        assert server.reconnect_cooldown_seconds == 7.0
+        # Derived, never configured separately.
+        assert server.max_scope_recoveries == 2
+    finally:
+        await rt.stop()
+
+
 # -- e2e chat via FakeProvider through the mounted tool ------------------------
 
 

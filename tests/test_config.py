@@ -1,7 +1,15 @@
 from pathlib import Path
 
+import pytest
+
 from dudamel.config import McpConfig, Settings
-from dudamel.mcp_mount import CALL_TIMEOUT, MOUNT_TIMEOUT
+from dudamel.mcp_mount import (
+    CALL_TIMEOUT,
+    MAX_RECONNECT_ATTEMPTS,
+    MOUNT_TIMEOUT,
+    RECONNECT_BACKOFF_SECONDS,
+    RECONNECT_COOLDOWN_SECONDS,
+)
 
 
 def test_defaults(tmp_path: Path) -> None:
@@ -15,6 +23,34 @@ def test_mcp_timeouts_are_configurable_and_default_to_the_module_constants() -> 
     assert McpConfig().mount_timeout == MOUNT_TIMEOUT
     assert McpConfig(call_timeout=2.5, mount_timeout=5.0).call_timeout == 2.5
     assert McpConfig(call_timeout=2.5, mount_timeout=5.0).mount_timeout == 5.0
+
+
+def test_mcp_reconnect_settings_default_to_the_module_constants() -> None:
+    """Same rule as the two timeouts above: the module constants stay the one
+    source of each default, so a default-constructed McpConfig cannot drift
+    away from the behavior mcp_mount ships with."""
+    assert McpConfig().reconnect_attempts == MAX_RECONNECT_ATTEMPTS
+    assert McpConfig().reconnect_backoff_seconds == RECONNECT_BACKOFF_SECONDS
+    assert McpConfig().reconnect_cooldown_seconds == RECONNECT_COOLDOWN_SECONDS
+    tuned = McpConfig(
+        reconnect_attempts=1, reconnect_backoff_seconds=0.25, reconnect_cooldown_seconds=5.0
+    )
+    assert tuned.reconnect_attempts == 1
+    assert tuned.reconnect_backoff_seconds == 0.25
+    assert tuned.reconnect_cooldown_seconds == 5.0
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["reconnect_attempts", "reconnect_backoff_seconds", "reconnect_cooldown_seconds"],
+)
+@pytest.mark.parametrize("value", [0, -1])
+def test_mcp_reconnect_settings_reject_non_positive_values(field: str, value: float) -> None:
+    """Zero or negative is never a coherent setting here -- zero attempts
+    disables reconnecting silently, and a negative cooldown/backoff is not a
+    duration -- so it is rejected at config load rather than acted on."""
+    with pytest.raises(ValueError, match="must be positive"):
+        McpConfig(**{field: value})
 
 
 def test_toml_overrides_defaults(tmp_path: Path) -> None:

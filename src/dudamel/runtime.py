@@ -205,6 +205,9 @@ class Runtime:
                 env_passthrough=self._settings.mcp.env_passthrough,
                 call_timeout=self._settings.mcp.call_timeout,
                 mount_timeout=self._settings.mcp.mount_timeout,
+                reconnect_attempts=self._settings.mcp.reconnect_attempts,
+                reconnect_backoff_seconds=self._settings.mcp.reconnect_backoff_seconds,
+                reconnect_cooldown_seconds=self._settings.mcp.reconnect_cooldown_seconds,
             )
             tools = await self._mcp_mount.mount()
             if tools:

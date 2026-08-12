@@ -190,6 +190,14 @@ ROUTER_TIMEOUT_MARGIN_SECONDS = 5.0
 # fresh burst: an HTTP server being restarted or rolled is routinely gone
 # for much longer than one burst spans, so the budget bounds a burst rather
 # than the process lifetime.
+#
+# All three are DEFAULTS, not fixed policy: `[mcp] reconnect_attempts`,
+# `reconnect_backoff_seconds` and `reconnect_cooldown_seconds` in
+# `dudamel.toml` override them per mount (see `McpConfig`). They stay the
+# single source of each default, and an unconfigured mount reads them at the
+# moment it needs them rather than binding them at import time -- see
+# `_MountedServer.__init__`, which is the deliberate opposite of the
+# call_timeout/mount_timeout trap documented above.
 MAX_RECONNECT_ATTEMPTS = 3
 RECONNECT_BACKOFF_SECONDS = 0.5
 RECONNECT_COOLDOWN_SECONDS = 60.0
@@ -202,7 +210,10 @@ RECONNECT_COOLDOWN_SECONDS = 60.0
 # MAX_RECONNECT_ATTEMPTS because, measured, every attempt in a burst against
 # a fully-down HTTP server ends in a cancellation from the connection it was
 # building; a budget at one burst's worth would retire a server for a single
-# failed burst.
+# failed burst. Derived, never configured on its own: a mount with a
+# different attempt budget gets `2 * attempts` (see
+# `_MountedServer.max_scope_recoveries`), so the "above one burst's worth"
+# property holds however the burst was sized.
 MAX_SCOPE_RECOVERIES = 2 * MAX_RECONNECT_ATTEMPTS
 
 # Sizing note: a full burst against a server that accepts connections but
@@ -808,9 +819,27 @@ class _MountedServer:
     supervisor's ownership is negotiable.
     """
 
-    def __init__(self, config: MCPServerConfig, *, mount_timeout: float = MOUNT_TIMEOUT) -> None:
+    def __init__(
+        self,
+        config: MCPServerConfig,
+        *,
+        mount_timeout: float = MOUNT_TIMEOUT,
+        reconnect_attempts: int | None = None,
+        reconnect_backoff_seconds: float | None = None,
+        reconnect_cooldown_seconds: float | None = None,
+    ) -> None:
         self.config = config
         self.mount_timeout = mount_timeout
+        # `None` means "whatever the module constant says at the moment the
+        # value is USED" -- deliberately NOT the bound-at-import default that
+        # `mount_timeout` above uses (the trap documented near the top of this
+        # module). The reconnect budget is read inside `reconnect()`, so a
+        # test that monkeypatches `RECONNECT_BACKOFF_SECONDS` and constructs a
+        # mount without configuring one still sees the patched value, while an
+        # explicitly configured value always wins over the constant.
+        self._reconnect_attempts = reconnect_attempts
+        self._reconnect_backoff_seconds = reconnect_backoff_seconds
+        self._reconnect_cooldown_seconds = reconnect_cooldown_seconds
         self.session: ClientSession | None = None
         self.server_name: str = ""
         # The self-reported name the tools were registered under, kept apart
@@ -852,6 +881,41 @@ class _MountedServer:
         # Set when those stand-downs are exhausted: the supervisor is not
         # respawned again, because something is cancelling it in a loop.
         self._supervisor_failed = False
+
+    # -- the reconnect budget, resolved at use time ---------------------------
+
+    @property
+    def max_reconnect_attempts(self) -> int:
+        """How many connection attempts one burst may spend."""
+        if self._reconnect_attempts is None:
+            return MAX_RECONNECT_ATTEMPTS
+        return self._reconnect_attempts
+
+    @property
+    def reconnect_backoff_seconds(self) -> float:
+        """Base delay between attempts in a burst; it doubles each time."""
+        if self._reconnect_backoff_seconds is None:
+            return RECONNECT_BACKOFF_SECONDS
+        return self._reconnect_backoff_seconds
+
+    @property
+    def reconnect_cooldown_seconds(self) -> float:
+        """How long this server's tools fail fast after a burst fails."""
+        if self._reconnect_cooldown_seconds is None:
+            return RECONNECT_COOLDOWN_SECONDS
+        return self._reconnect_cooldown_seconds
+
+    @property
+    def max_scope_recoveries(self) -> int:
+        """Stand-down budget, derived from the attempt budget for the reason
+        `MAX_SCOPE_RECOVERIES` documents: every attempt in a burst against a
+        fully-down server can cost a stand-down, so this has to stay above one
+        burst's worth however the burst was sized. Left as the module constant
+        verbatim when the budget is not configured, so it stays derived from
+        the same constant it always was."""
+        if self._reconnect_attempts is None:
+            return MAX_SCOPE_RECOVERIES
+        return 2 * self._reconnect_attempts
 
     # -- what callers read ----------------------------------------------------
 
@@ -1034,7 +1098,7 @@ class _MountedServer:
                         self._resolve(pending, e)
                         pending = None
                     self._standdowns += 1
-                    exhausted = self._standdowns > MAX_SCOPE_RECOVERIES
+                    exhausted = self._standdowns > self.max_scope_recoveries
                     # Release the stack either way -- that is the whole point
                     # of catching this -- and only then decide whether this
                     # server is worth serving again.
@@ -1256,8 +1320,9 @@ class _MountedServer:
         makes a batch of simultaneously-failing calls produce exactly one
         reconnect instead of one per call.
 
-        `MAX_RECONNECT_ATTEMPTS` bounds one *burst*, not the process. A burst
-        that fails outright starts a `RECONNECT_COOLDOWN_SECONDS` cooldown
+        The attempt budget (`max_reconnect_attempts`, defaulting to
+        `MAX_RECONNECT_ATTEMPTS`) bounds one *burst*, not the process. A burst
+        that fails outright starts a `reconnect_cooldown_seconds` cooldown
         during which calls fail fast; after it, the next call is allowed a
         fresh burst. The bound has to work this way because the thing being
         waited for is usually somebody else's deployment: an HTTP server
@@ -1299,7 +1364,8 @@ class _MountedServer:
             # caps a permanently dead server at one burst per minute forever.
             self._standdowns = 0
             delay = 0.0
-            for attempt in range(MAX_RECONNECT_ATTEMPTS):
+            budget = self.max_reconnect_attempts
+            for attempt in range(budget):
                 if delay:
                     await asyncio.sleep(delay)
                 if self._closed:  # close() landed while we were backing off
@@ -1318,19 +1384,20 @@ class _MountedServer:
                 logger.warning(
                     "mcp: reconnect attempt %d/%d for server %r failed (%s: %s)",
                     attempt + 1,
-                    MAX_RECONNECT_ATTEMPTS,
+                    budget,
                     self.config.label,
                     type(error).__name__,
                     error,
                 )
-                delay = RECONNECT_BACKOFF_SECONDS * (2**attempt)
-            self._cooldown_until = asyncio.get_running_loop().time() + RECONNECT_COOLDOWN_SECONDS
+                delay = self.reconnect_backoff_seconds * (2**attempt)
+            cooldown = self.reconnect_cooldown_seconds
+            self._cooldown_until = asyncio.get_running_loop().time() + cooldown
             logger.warning(
                 "mcp: server %r could not be reconnected in %d attempts -- its tools fail "
                 "fast for the next %.0fs, then one more burst will be tried; core unaffected",
                 self.config.label,
-                MAX_RECONNECT_ATTEMPTS,
-                RECONNECT_COOLDOWN_SECONDS,
+                budget,
+                cooldown,
             )
             return False
 
@@ -1580,6 +1647,9 @@ class MCPMount:
         env_passthrough: Sequence[str] = (),
         call_timeout: float = CALL_TIMEOUT,
         mount_timeout: float = MOUNT_TIMEOUT,
+        reconnect_attempts: int | None = None,
+        reconnect_backoff_seconds: float | None = None,
+        reconnect_cooldown_seconds: float | None = None,
     ) -> None:
         # Normalization (string -> MCPServerConfig) is deliberately NOT done
         # here: MCPServerConfig("") -- e.g. from os.environ.get("VAR", "")
@@ -1592,6 +1662,11 @@ class MCPMount:
         self._env_passthrough = tuple(env_passthrough)
         self._call_timeout = call_timeout
         self._mount_timeout = mount_timeout
+        # Each `None` defers to the module constant at use time -- see
+        # `_MountedServer.__init__`, which is where they land.
+        self._reconnect_attempts = reconnect_attempts
+        self._reconnect_backoff_seconds = reconnect_backoff_seconds
+        self._reconnect_cooldown_seconds = reconnect_cooldown_seconds
         self._servers: list[_MountedServer] = []
 
     async def mount(self) -> list[Tool]:
@@ -1614,7 +1689,13 @@ class MCPMount:
                     if isinstance(entry, str)
                     else entry
                 )
-                server = _MountedServer(config, mount_timeout=self._mount_timeout)
+                server = _MountedServer(
+                    config,
+                    mount_timeout=self._mount_timeout,
+                    reconnect_attempts=self._reconnect_attempts,
+                    reconnect_backoff_seconds=self._reconnect_backoff_seconds,
+                    reconnect_cooldown_seconds=self._reconnect_cooldown_seconds,
+                )
                 # Connect + discovery happen inside the server's supervisor
                 # task, under this mount's configured mount_timeout;
                 # `start()` re-raises whatever went wrong for the handler
