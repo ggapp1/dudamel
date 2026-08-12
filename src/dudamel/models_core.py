@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -51,10 +51,9 @@ class Activity(CoreBase):
     args: Mapped[dict] = mapped_column(JSON)
     status: Mapped[str] = mapped_column(String(32))  # ok|error|declined|confirmed
     result_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # reserved; never populated
-    tokens_in: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    tokens_out: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Token/cost accounting lives in llm_calls (per call, with a
+    # conversation_id), never here -- 0001's reserved tokens_in/tokens_out/
+    # cost_usd columns were dropped in migration 0005.
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
@@ -100,7 +99,9 @@ class Summary(CoreBase):
     __table_args__ = (
         # Lets a query scan a conversation's summaries newest-first without a
         # separate sort step -- `newest()` and the pruning-on-write query both
-        # do exactly that.
+        # do exactly that. Its leading column also serves every plain
+        # conversation_id lookup, which is why the column carries no index of
+        # its own (0004's was dropped in 0005).
         Index("ix_summaries_conversation_id_id", "conversation_id", "id"),
         # One summary per watermark per conversation: the reuse check in
         # compaction.py relies on there being no more than one row for a
@@ -108,7 +109,7 @@ class Summary(CoreBase):
         Index("uq_summaries_conv_upto", "conversation_id", "up_to_message_id", unique=True),
     )
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    conversation_id: Mapped[int] = mapped_column(ForeignKey("conversations.id"), index=True)
+    conversation_id: Mapped[int] = mapped_column(ForeignKey("conversations.id"))
     # Watermark: the id of the newest Message row this summary covers. A
     # window whose dropped span ends at or before this id can reuse the
     # summary instead of calling the model again.
