@@ -173,6 +173,24 @@ async def test_append_concurrent_race_backstopped(store: ConversationStore) -> N
     assert len(rows) == 1
 
 
+async def test_append_reraises_a_non_dedupe_integrity_error(store: ConversationStore) -> None:
+    """`return False` is append()'s DEDUPE signal and callers ignore it, so
+    translating every IntegrityError into it drops a message in silence. A
+    foreign-key violation (no such conversation) is not a duplicate and must
+    propagate -- as it already does from append_many."""
+    with pytest.raises(IntegrityError):
+        await store.append(999_999, Message(role="user", text="orphan"))
+
+
+async def test_append_reraises_a_non_dedupe_integrity_error_with_a_client_msg_id(
+    store: ConversationStore,
+) -> None:
+    """Carrying a client_msg_id does not make an unrelated integrity failure
+    a duplicate: the duplicate has to actually be there."""
+    with pytest.raises(IntegrityError):
+        await store.append(999_999, Message(role="user", text="orphan"), client_msg_id="m1")
+
+
 async def test_dedupe_is_per_conversation(store: ConversationStore) -> None:
     c1 = await store.get_or_create("t:1")
     c2 = await store.get_or_create("t:2")
