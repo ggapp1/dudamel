@@ -13,6 +13,8 @@ CORE_TABLES = {
     "activity",
     "job_runs",
     "pending_confirmations",
+    "llm_calls",
+    "summaries",
 }
 
 

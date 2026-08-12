@@ -12,6 +12,7 @@ from typing import Any
 
 from sqlalchemy import select
 
+from dudamel.compaction import Compactor
 from dudamel.config import Settings, TierConfig
 from dudamel.convo import ConversationStore
 from dudamel.db import Database
@@ -86,12 +87,14 @@ class Runtime:
         tiers = self._build_tiers(providers or {})
         self._llm = LLMClient(tiers=tiers, db=self._db, budget=settings.llm_budget)
         self._convo = ConversationStore(self._db)
+        self._compactor = self._build_compactor(settings, tiers)
         self._router = Router(
             llm=self._llm,
             registry=self._registry,
             convo=self._convo,
             db=self._db,
             config=settings.router,
+            compactor=self._compactor,
         )
         # Created here so Runtime construction (safe to do in tests / at
         # import-adjacent time) fully wires the process, but NOT started:
@@ -131,6 +134,24 @@ class Runtime:
                     name=name, provider=overrides[name], model=model, max_tokens=1024
                 )
         return tiers
+
+    def _build_compactor(self, settings: Settings, tiers: dict[str, Tier]) -> Compactor | None:
+        """`[router] compact_dropped_turns` is opt-in and off by default, so
+        this is where its config is validated -- `tiers` (which tier names
+        are actually configured) is only known here, at Runtime construction,
+        never at Settings/RouterConfig parse time."""
+        if not settings.router.compact_dropped_turns:
+            return None
+        tier_name = settings.router.compaction_tier
+        if not tier_name:
+            raise RegistryError(
+                "[router] compact_dropped_turns is true but compaction_tier is not set"
+            )
+        if tier_name not in tiers:
+            raise RegistryError(
+                f"unknown tier {tier_name!r}; configured tiers: {sorted(tiers) or 'none'}"
+            )
+        return Compactor(llm=self._llm, db=self._db, tier=tier_name)
 
     def _make_app_llm(self) -> Callable[..., Awaitable[str | dict[str, Any]]]:
         async def app_llm(

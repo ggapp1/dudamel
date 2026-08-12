@@ -280,6 +280,44 @@ it (core and app schemas), not apply-only.
   token is configured, so it can't end up unauthenticated on your network
   by accident.
 
+## Conversation compaction (opt-in)
+
+Every turn assembles a context window from the conversation's history under
+a token budget (`[router] window_tokens`); once a long-running conversation
+doesn't fit, the oldest turns are cut, always at turn boundaries, and the
+model simply never sees them. `[router] compact_dropped_turns` (default
+`false`) turns on a summarizer that condenses the turns a window build is
+about to drop into one row in the `summaries` table, so the assistant keeps
+"the gist" of a long conversation instead of silently forgetting it.
+Turning it on requires `[router] compaction_tier`, naming one of
+`[llm.tiers]` — dudamel refuses to start if it's missing or names a tier
+that isn't configured.
+
+The summary is prepended to the window as a `role="user"` message, worded
+as background context rather than as an instruction — never as
+`role="system"`, because the anthropic provider folds every system message
+into the single top-level `system` request parameter, alongside the
+operator's own instructions, and a summary of the conversation's own
+history (which can include text an MCP tool put into it) does not belong
+there. Its token cost is subtracted from the budget handed to the window
+builder, so the model call still stays within `window_tokens` overall.
+Summarization runs at most once per turn — not once per loop iteration —
+and reuses the newest summary already covering the dropped span instead of
+calling the model again. A summarization failure (including a budget
+error) is logged and the turn proceeds with the uncompacted window; it
+never fails the turn.
+
+A summarized turn's taint (whether it saw output from a less-trusted MCP
+tool) is computed from the summarized rows' own provenance, never from the
+summarizer's output, and is carried forward: a new turn seeds its taint
+state from the newest summary's flag, under every `taint_mode` except
+`"off"`, including the default `"turn"` mode.
+
+**Scope**: `ConversationStore.recent()` reads at most the newest 200
+messages in a conversation. Compaction only ever sees, and only ever
+covers, that same window — anything older than the 200-message horizon is
+gone regardless of whether compaction is enabled.
+
 ## MCP (experimental)
 
 dudamel can mount external [MCP](https://modelcontextprotocol.io) servers

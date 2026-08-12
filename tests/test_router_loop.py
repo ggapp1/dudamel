@@ -5,6 +5,7 @@ import pytest
 from sqlalchemy import select
 
 from dudamel import App
+from dudamel.compaction import Compactor
 from dudamel.config import BudgetConfig, RouterConfig
 from dudamel.contract.schema import ToolSchema
 from dudamel.contract.types import Tool
@@ -15,9 +16,10 @@ from dudamel.llm.client import LLMClient, Tier
 from dudamel.llm.testing import FakeProvider, fake_text, fake_tool_call
 from dudamel.llm.types import Completion, Message, ToolCall, Usage
 from dudamel.migrate import upgrade_core
-from dudamel.models_core import Activity
+from dudamel.models_core import Activity, Summary
 from dudamel.registry import Registry
 from dudamel.router import ChatReply, Router, select_tool_subset
+from dudamel.window import message_tokens
 
 CALLS: list[str] = []
 
@@ -565,4 +567,113 @@ async def test_vanished_tool_in_persisted_subset_is_skipped_not_fatal(tmp_path) 
     assert r2.text == "resumed done"
     offered_iter1 = {s.name for s in fp.calls[1]["tools"]}
     assert offered_iter1 == {"wipe_log"}
+
+
+# -- compaction -----------------------------------------------------------
+
+
+def make_router_with_compaction(tmp_path, standard_script, compact_script, config=None):
+    url = f"sqlite+aiosqlite:///{tmp_path}/rc.db"
+    upgrade_core(url)
+    db = Database(url)
+    fp_standard = FakeProvider(standard_script)
+    fp_compact = FakeProvider(compact_script)
+    llm = LLMClient(
+        tiers={
+            "standard": Tier(name="standard", provider=fp_standard, model="f", max_tokens=64),
+            "compact": Tier(name="compact", provider=fp_compact, model="f", max_tokens=64),
+        },
+        db=db,
+        budget=BudgetConfig(),
+    )
+    registry = Registry([make_app()])
+    convo = ConversationStore(db)
+    compactor = Compactor(llm=llm, db=db, tier="compact")
+    router = Router(
+        llm=llm,
+        registry=registry,
+        convo=convo,
+        db=db,
+        config=config or RouterConfig(window_tokens=10),
+        compactor=compactor,
+    )
+    return router, fp_standard, fp_compact, db, convo
+
+
+async def test_compaction_prepends_summary_once_per_turn_within_budget(tmp_path) -> None:
+    """A long conversation that overflows window_tokens: the model's window
+    starts with the system message then the summary as a user message, the
+    summarizer runs exactly once even across two _loop iterations (a tool
+    call followed by the final reply), and the window handed to the model
+    stays within window_tokens including the summary's own cost."""
+    config = RouterConfig(window_tokens=60)
+    router, fp_standard, fp_compact, db, convo = make_router_with_compaction(
+        tmp_path,
+        [
+            fake_tool_call("log_workout", {"exercise": "bench", "reps": 5}),
+            fake_text("final answer"),
+        ],
+        [fake_text("SUMMARY: recap of the earlier discussion.")],
+        config=config,
+    )
+    conv_id = await convo.get_or_create("t:1")
+    filler = "filler " * 20
+    for i in range(5):
+        await convo.append(conv_id, Message(role="user", text=f"prior user {i} {filler}"))
+        await convo.append(conv_id, Message(role="assistant", text=f"prior assistant {i} {filler}"))
+
+    reply = await router.handle(channel="t:1", text="hi", user_id="u1")
+    assert reply.text == "final answer"
+
+    # exactly one summarizer call across both _loop iterations
+    assert len(fp_compact.calls) == 1
+    assert fp_compact.calls[0]["tools"] is None
+
+    first_call_messages = fp_standard.calls[0]["messages"]
+    assert first_call_messages[0].role == "system"
+    assert first_call_messages[1].role == "user"
+    assert "SUMMARY: recap of the earlier discussion." in first_call_messages[1].text
+    assert "background context" in first_call_messages[1].text  # data framing, not an instruction
+
+    total = sum(message_tokens(m) for m in first_call_messages if m.role != "system")
+    assert total <= config.window_tokens
+
+    async with db.session() as s:
+        rows = (
+            (await s.execute(select(Summary).where(Summary.conversation_id == conv_id)))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1  # exactly one row written for the whole turn
+    await db.dispose()
+
+
+async def test_initial_taint_seeded_from_newest_summary_in_default_turn_mode(tmp_path) -> None:
+    """`_loop` seeds turn_tainted from the newest summary's flag under the
+    default taint_mode="turn" -- not just "window" -- even when nothing
+    dropped or summarized this turn."""
+    config = RouterConfig(window_tokens=10, taint_mode="turn")
+    router, fp_standard, fp_compact, db, convo = make_router_with_compaction(
+        tmp_path,
+        [fake_tool_call("log_workout", {"exercise": "bench", "reps": 5})],
+        [],
+        config=config,
+    )
+    conv_id = await convo.get_or_create("t:1")
+    async with db.session() as s:
+        s.add(
+            Summary(
+                conversation_id=conv_id,
+                up_to_message_id=0,
+                text="earlier mcp-origin output summarized here",
+                tainted=True,
+            )
+        )
+
+    reply = await router.handle(channel="t:1", text="log it", user_id="u1")
+
+    assert reply.pending_confirmation_id is not None
+    assert "Confirm: run log_workout" in reply.text
+    assert fp_compact.calls == []  # nothing dropped this turn -- no summarizer call
+    await db.dispose()
     await db.dispose()

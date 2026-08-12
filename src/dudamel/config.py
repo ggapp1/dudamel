@@ -49,6 +49,13 @@ class RouterConfig(BaseModel):
     confirm_ttl_seconds: int = 900
     taint_mode: Literal["turn", "window", "off"] = "turn"
     persona: str | None = None
+    # Opt-in: summarize turns a window build drops so a long conversation
+    # degrades to "the gist" instead of silently forgetting them (see
+    # compaction.py). `compaction_tier` names one of `[llm.tiers]` and is
+    # required (and validated against those tiers at startup, in
+    # Runtime.__init__) only when this is true.
+    compact_dropped_turns: bool = False
+    compaction_tier: str | None = None
 
 
 class WebConfig(BaseModel):

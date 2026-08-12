@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -93,3 +93,29 @@ class LlmCall(CoreBase):
         ForeignKey("conversations.id"), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+
+
+class Summary(CoreBase):
+    __tablename__ = "summaries"
+    __table_args__ = (
+        # Lets a query scan a conversation's summaries newest-first without a
+        # separate sort step -- `newest()` and the pruning-on-write query both
+        # do exactly that.
+        Index("ix_summaries_conversation_id_id", "conversation_id", "id"),
+        # One summary per watermark per conversation: the reuse check in
+        # compaction.py relies on there being no more than one row for a
+        # given (conversation_id, up_to_message_id) pair.
+        Index("uq_summaries_conv_upto", "conversation_id", "up_to_message_id", unique=True),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    conversation_id: Mapped[int] = mapped_column(ForeignKey("conversations.id"), index=True)
+    # Watermark: the id of the newest Message row this summary covers. A
+    # window whose dropped span ends at or before this id can reuse the
+    # summary instead of calling the model again.
+    up_to_message_id: Mapped[int] = mapped_column(Integer)
+    text: Mapped[str] = mapped_column(Text)
+    # Computed from the provenance of the summarized rows (any MCP-origin
+    # tool call in the dropped span), never from the summarizer's own
+    # output -- see compaction.py.
+    tainted: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
