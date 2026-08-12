@@ -52,6 +52,7 @@ from dudamel.migrate import (
 from dudamel.orchestrator import Orchestrator
 from dudamel.runtime import build_provider
 from dudamel.serve import serve
+from dudamel.web.api import resolve_cookie_secure
 from dudamel.web.auth import resolve_token as resolve_web_token
 
 __all__ = ["main"]
@@ -370,6 +371,42 @@ def _check_web_token(settings: Settings) -> tuple[bool, str]:
     return True, f"{settings.web.token_env} is set"
 
 
+def _check_cookie_secure(settings: Settings) -> tuple[bool, str]:
+    """Report the RESOLVED session-cookie `Secure` posture against the scheme
+    doctor actually prints (always `http://` — see `_check_tailscale`).
+
+    `[web] cookie_secure` describes the transport the browser sees, but its
+    auto-derivation can only read the bind host, so the derived value is wrong
+    in either direction depending on the topology: a non-loopback bind reached
+    over plain HTTP (the tailnet case) derives `Secure` and the browser then
+    refuses to store the cookie, while a TLS-terminating proxy in front of a
+    loopback bind derives plain and drops `Secure` on a genuinely HTTPS
+    deployment. So a derived value gets the matching remedy; an explicit value
+    is the operator's own statement about the transport and is only reported.
+    """
+    secure = resolve_cookie_secure(settings)
+    value = str(secure).lower()
+    if settings.web.cookie_secure is not None:
+        flags = (
+            "session cookie marked Secure, named __Host-dudamel_session"
+            if secure
+            else "session cookie not marked Secure"
+        )
+        return True, f"{value} (explicit) — {flags}"
+    if secure:
+        return False, (
+            f"true (derived from non-loopback bind host {settings.web.host!r}) — "
+            "dashboard URLs above are http://, and a browser will not store a Secure "
+            "cookie on a plain-HTTP origin (the login page just loops); for plain-HTTP "
+            "tailnet access set `cookie_secure = false` under [web] in dudamel.toml"
+        )
+    return True, (
+        f"false (derived from loopback bind host {settings.web.host!r}) — correct for the "
+        "http:// dashboard URLs above; if a TLS-terminating proxy fronts this bind, set "
+        "`cookie_secure = true` under [web] in dudamel.toml"
+    )
+
+
 def _check_tailscale(settings: Settings) -> str:
     dashboard = f"http://{settings.web.host}:{settings.web.port}"
     try:
@@ -439,6 +476,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     lines.append(_line(ok, "web token", detail))
 
     lines.append(_check_tailscale(settings))
+
+    # Last, so it reads against the dashboard URL the tailscale line just
+    # printed -- that URL's scheme is what the cookie posture is judged by.
+    ok, detail = _check_cookie_secure(settings)
+    lines.append(_line(ok, "cookie_secure", detail))
 
     print("\n".join(lines))
     print()

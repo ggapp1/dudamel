@@ -30,7 +30,7 @@ from dudamel.web.throttle import FailedAuthThrottle
 
 logger = logging.getLogger("dudamel.web.api")
 
-__all__ = ["create_api", "is_loopback_host"]
+__all__ = ["create_api", "is_loopback_host", "resolve_cookie_secure"]
 
 # Every channel this surface may write to. The channel selects the
 # conversation a message joins, and handling a message auto-declines that
@@ -72,6 +72,22 @@ def is_loopback_host(host: str) -> bool:
         # so treat it as exposed. Refusing to start without a token is the
         # safe direction to be wrong in.
         return False
+
+
+def resolve_cookie_secure(settings: Settings) -> bool:
+    """Whether the session cookie is issued with the `Secure` flag (and the
+    `__Host-` name that goes with it).
+
+    An explicit `[web] cookie_secure` always wins; `None` derives it from the
+    bind host, since a loopback bind is a secure context to a browser even
+    over plain HTTP. The single definition every caller shares: the flag both
+    names the cookie and gates it, so /login, the dashboard's read side and
+    `dudamel doctor` disagreeing about it would mean a session cookie nobody
+    can read back.
+    """
+    if settings.web.cookie_secure is not None:
+        return settings.web.cookie_secure
+    return not is_loopback_host(settings.web.host)
 
 
 def _utcnow() -> datetime:
@@ -119,11 +135,7 @@ def create_api(runtime: Runtime, settings: Settings) -> FastAPI:
     # Resolved once, and shared by /login's cookie name/flags and the
     # Authenticator's read side, so they can never disagree about which
     # cookie name is in play.
-    cookie_secure = (
-        settings.web.cookie_secure
-        if settings.web.cookie_secure is not None
-        else not is_loopback_host(settings.web.host)
-    )
+    cookie_secure = resolve_cookie_secure(settings)
 
     sessions = SessionStore()
     throttle = FailedAuthThrottle()

@@ -447,6 +447,99 @@ def test_doctor_probe_tools_runs_probe_per_tier_and_reports_the_remedy(
     assert f"llm tier 'fast' tool calling: {remedy}" in out
 
 
+def _set_web_config(project_dir: Path, *, host: str, cookie_secure: bool | None = None) -> None:
+    """Rewrite the scaffold's `[web]` block with an explicit host and (when
+    given) an explicit `cookie_secure`."""
+    toml_path = project_dir / "dudamel.toml"
+    text = toml_path.read_text()
+    head, _, _ = text.partition("[web]")
+    block = f'[web]\nhost = "{host}"\nport = 8787\n'
+    if cookie_secure is not None:
+        block += f"cookie_secure = {str(cookie_secure).lower()}\n"
+    toml_path.write_text(head + block)
+
+
+def test_doctor_reports_derived_cookie_secure_with_a_remedy_for_a_non_loopback_bind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A non-loopback bind derives `Secure`, but doctor prints the dashboard
+    URL as `http://` — a browser will not store a Secure cookie there, so the
+    line must say the value was derived and name the remedy."""
+    target = scaffold(tmp_path)
+    _set_web_config(target, host="0.0.0.0")
+    monkeypatch.chdir(target)
+    capsys.readouterr()  # drain `new`'s output
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if "cookie_secure:" in ln)
+    assert "true" in line
+    assert "derived" in line
+    assert "http://" in line
+    assert "cookie_secure = false" in line
+
+
+def test_doctor_reports_derived_cookie_secure_for_a_loopback_bind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The scaffold's loopback bind derives `false`, which is right for plain
+    http:// on this machine but wrong behind a TLS-terminating proxy — the
+    line reports the derived value and names that case."""
+    target = scaffold(tmp_path)
+    monkeypatch.chdir(target)
+    capsys.readouterr()  # drain `new`'s output
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if "cookie_secure:" in ln)
+    assert "false" in line
+    assert "derived" in line
+    assert "http://" in line
+    assert "cookie_secure = true" in line
+
+
+@pytest.mark.parametrize("explicit", [True, False])
+def test_doctor_reports_an_explicit_cookie_secure_without_second_guessing_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    explicit: bool,
+) -> None:
+    """An explicit setting is the operator's statement about the transport,
+    which doctor reports and never argues with — no remedy either way."""
+    target = scaffold(tmp_path)
+    _set_web_config(target, host="0.0.0.0", cookie_secure=explicit)
+    monkeypatch.chdir(target)
+    capsys.readouterr()  # drain `new`'s output
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if "cookie_secure:" in ln)
+    assert str(explicit).lower() in line
+    assert "explicit" in line
+    assert "derived" not in line
+    # never second-guessed: no "set cookie_secure = ..." remedy on this line
+    assert "cookie_secure = " not in line
+
+
+def test_doctor_cookie_secure_line_neither_starts_the_orchestrator_nor_creates_a_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The posture line is pure config reporting: it must not build the web
+    app, start the orchestrator, or touch the database."""
+    target = scaffold(tmp_path)
+    _set_web_config(target, host="0.0.0.0")
+    monkeypatch.chdir(target)
+    capsys.readouterr()  # drain `new`'s output
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "cookie_secure:" in out
+    assert not list(target.glob("*.db"))
+    # the orchestrator was imported for the tool table but never started
+    assert "not created yet" in out
+
+
 # --- token rotate --------------------------------------------------------
 
 
