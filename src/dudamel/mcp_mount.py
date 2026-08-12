@@ -636,6 +636,17 @@ def _make_call_fn(
             f"server's state first."
         )
 
+    def newly_gated() -> RuntimeError:
+        """Nothing was dispatched, so this is an ordinary error, NOT an
+        unknown outcome: there is no side effect in doubt, only a call that
+        was withheld."""
+        return RuntimeError(
+            f"mcp tool {local_name}: the server came back from a reconnect declaring "
+            f"different safety annotations, so this call was not dispatched -- nothing "
+            f"was sent to the server. The tool now requires confirmation; request it "
+            f"again to go through that gate."
+        )
+
     def demote(e: BaseException) -> RuntimeError:
         """Turn a `BaseException` into an ordinary error for the Router.
 
@@ -657,9 +668,28 @@ def _make_call_fn(
             # so rebuilding and calling once cannot double anything up. This
             # is the only case where a MUTATING tool is (re)dispatched by
             # this code at all.
+            # Snapshotted BEFORE the rebuild, because the rebuild is what
+            # re-reads the server's annotations: only the difference isolates
+            # drift this reconnect just discovered from drift recorded
+            # earlier. A blanket `is_retry_safe` check here would be wrong --
+            # an already-drifted tool is `confirm=True`, so the Router has
+            # already gated it and a call arriving here has been approved;
+            # refusing it would brick the tool permanently.
+            was_retry_safe = server.is_retry_safe(remote_name)
             await server.reconnect(generation)
             if server.is_vanished(remote_name):
                 raise vanished()
+            if was_retry_safe and not server.is_retry_safe(remote_name):
+                # This call cleared the Router's confirm gate while the tool
+                # was still classified harmless, and the rebuild it just paid
+                # for is what revealed that the server now declares it
+                # otherwise. Dispatching would execute, with no confirm gate
+                # and no approval, a call the server has just declared
+                # destructive -- the same refusal the mid-call path makes
+                # below, on the other path that can discover drift.
+                # `_apply_reconnect_drift` has already set `confirm=True`, so
+                # a re-issued call is gated rather than blocked.
+                raise newly_gated()
             generation = server.generation
             session = server.session
             if session is None:
@@ -716,11 +746,14 @@ def _make_call_fn(
             # request reached the server before the connection dropped.
             await server.reconnect(generation)
             if not server.is_retry_safe(remote_name):
-                # Re-checked AFTER the reconnect, and this is the only place
-                # it can be checked: the reconnect is what re-reads the
-                # server's annotations, so a tool that comes back declared
-                # MUTATING is first knowable here -- and it is precisely the
-                # tool this call is about to re-invoke. Retrying it would
+                # Re-checked AFTER the reconnect, as on the pre-dispatch
+                # branch above and for the same reason: the reconnect is what
+                # re-reads the server's annotations, so a tool that comes
+                # back declared MUTATING is first knowable here -- and it is
+                # precisely the tool this call is about to re-invoke. Unlike
+                # up there, a bare `is_retry_safe` is right here: this call
+                # WAS dispatched, so an already-drifted tool's outcome is
+                # indeterminate regardless of who approved it. Retrying would
                 # execute, with no confirm gate and no approval, a call the
                 # server has just declared destructive. The justification
                 # for the transparent retry is gone, so the outcome is
