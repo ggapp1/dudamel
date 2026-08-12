@@ -133,7 +133,15 @@ class McpConfig(BaseModel):
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="DUDAMEL_", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="DUDAMEL_",
+        extra="ignore",
+        # Lets a single per-app setting be overridden from the environment
+        # (DUDAMEL_APPS__WEATHER__LATITUDE) so secrets never have to live in
+        # dudamel.toml. Applies to every nested section, hence the regression
+        # test covering [web] and [llm.budget].
+        env_nested_delimiter="__",
+    )
 
     database_url: str = "sqlite+aiosqlite:///dudamel.db"
     # Where dudamel keeps runtime state (currently just the single-instance
@@ -157,6 +165,11 @@ class Settings(BaseSettings):
     web: WebConfig = WebConfig()
     telegram: TelegramConfig = TelegramConfig()
     mcp: McpConfig = McpConfig()
+    # Raw per-app config blocks straight from [apps.*]. Values stay untyped
+    # here: an app's settings model lives inside that app's module, which is
+    # imported only when the app is enabled, so validation happens later
+    # during resolution.
+    apps: dict[str, dict[str, Any]] = {}
 
     @classmethod
     def settings_customise_sources(

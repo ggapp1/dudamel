@@ -115,3 +115,44 @@ def test_dotenv_beats_toml_and_real_env_beats_dotenv(tmp_path: Path, monkeypatch
     monkeypatch.setenv("DUDAMEL_DATABASE_URL", "sqlite+aiosqlite:///env.db")
     s = Settings.load(tmp_path)
     assert s.database_url == "sqlite+aiosqlite:///env.db"
+
+
+def test_apps_section_loads_from_toml(tmp_path: Path) -> None:
+    (tmp_path / "dudamel.toml").write_text(
+        "[apps.weather]\nenabled = true\nlatitude = 52.52\n"
+        "\n[apps.papers]\nenabled = false\ncategories = ['cs.AI']\n"
+    )
+    settings = Settings.load(tmp_path)
+    assert settings.apps == {
+        "weather": {"enabled": True, "latitude": 52.52},
+        "papers": {"enabled": False, "categories": ["cs.AI"]},
+    }
+
+
+def test_apps_absent_gives_empty_mapping(tmp_path: Path) -> None:
+    (tmp_path / "dudamel.toml").write_text("[web]\nport = 9999\n")
+    assert Settings.load(tmp_path).apps == {}
+
+
+def test_app_setting_overridable_from_env(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "dudamel.toml").write_text("[apps.weather]\nenabled = true\nlatitude = 1.0\n")
+    monkeypatch.setenv("DUDAMEL_APPS__WEATHER__LATITUDE", "52.52")
+    settings = Settings.load(tmp_path)
+    assert settings.apps["weather"]["latitude"] == 52.52
+    # the sibling TOML key survives the env override of its neighbour
+    assert settings.apps["weather"]["enabled"] is True
+
+
+def test_nested_env_delimiter_does_not_break_existing_sections(tmp_path: Path, monkeypatch) -> None:
+    """Regression for adding env_nested_delimiter to a shared Settings.
+
+    `llm_budget` is the hard case: the TOML section is [llm.budget] but the
+    FIELD is llm_budget, so the env path follows the field and the field's own
+    name contains a single underscore next to the double-underscore delimiter.
+    """
+    (tmp_path / "dudamel.toml").write_text("[web]\nport = 8787\n\n[llm.budget]\ndaily_tokens = 5\n")
+    monkeypatch.setenv("DUDAMEL_WEB__PORT", "9999")
+    monkeypatch.setenv("DUDAMEL_LLM_BUDGET__DAILY_TOKENS", "12")
+    settings = Settings.load(tmp_path)
+    assert settings.web.port == 9999
+    assert settings.llm_budget.daily_tokens == 12
