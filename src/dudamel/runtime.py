@@ -16,6 +16,7 @@ from sqlalchemy import select
 
 from dudamel.compaction import Compactor
 from dudamel.config import Settings, TierConfig
+from dudamel.contract.types import Tool
 from dudamel.convo import ConversationStore
 from dudamel.db import Database
 from dudamel.exceptions import DudamelError, LLMError, RegistryError
@@ -327,10 +328,29 @@ class Runtime:
         async with self._db.session() as s:
             await s.execute(select(1))
 
+    def _app_actions(self, app_name: str) -> dict[str, Tool]:
+        """The action-labelled tools of one app, for widget rendering.
+
+        Scoped to a single app deliberately: this is what makes a per-item
+        action naming another app's tool impossible rather than merely
+        forbidden.
+        """
+        app = self._registry.apps.get(app_name)
+        if app is None:
+            return {}
+        return {name: tool for name, tool in app.tools.items() if tool.action is not None}
+
     async def render_widgets(self) -> list[dict[str, Any]]:
         """Run every registered widget concurrently. Data-plane guarantee: no
         model is ever invoked here (widgets.run_widget calls only widget.fn())."""
-        return list(await asyncio.gather(*(run_widget(w) for w in self._registry.widgets)))
+        return list(
+            await asyncio.gather(
+                *(
+                    run_widget(widget, self._app_actions(widget.app_name))
+                    for widget in self._registry.widgets
+                )
+            )
+        )
 
     async def recent_messages(self, channel: str, limit: int = 200) -> list[dict[str, Any]]:
         """Chat history for `channel` — used by the dashboard's /chat page.
