@@ -51,13 +51,12 @@ ACTION_LABEL_MAX = 32
 # U+202A-U+202E / U+2066-U+2069 -- the same class a plain-text surface already
 # strips, held here instead so every surface inherits it. Jinja's autoescape
 # stops a label breaking OUT of its attribute and does nothing about the
-# direction the remaining characters are drawn in: a label spelled
-# `"Nuke"` + U+202E + `" evihcrA"` renders in a browser as "Nuke Archive",
-# and the same string reaches
-# `data-label`, which feeds both the confirm dialog and the aria-live
-# announcement -- so the one mis-tap protection a `confirm=True` action has on
-# the web would carry the spoofed reading too. Same reasoning that put the url
-# allowlist here: a per-surface fix is one surface's fix.
+# direction the remaining characters are drawn in: a label spelled `"Nuke"` +
+# U+202E + `" evihcrA"` renders in a browser as "Nuke Archive", and that same
+# string reaches `data-label`, which feeds both the confirm dialog and the
+# aria-live announcement -- so the one mis-tap protection a `confirm=True`
+# action has on the web would carry the spoofed reading too. Same reasoning
+# that put the url allowlist here: a per-surface fix is one surface's fix.
 #
 # Stripped, not rejected, unlike `url` above. That rule rejects because it
 # cannot clean without approving one string and storing another; this one
@@ -69,6 +68,17 @@ ACTION_LABEL_MAX = 32
 # Sanitizing happens BEFORE the non-empty and length checks, so a label cannot
 # pass the cap and then shrink, and one spelled entirely out of overrides is
 # reported as empty rather than stored as "".
+#
+# What this class IS: parity with the digest surface, exactly. It is not a
+# comprehensive invisible-character filter, and should not be read as one.
+# U+200F RLM, U+061C ALM, U+200B ZWSP, U+FEFF, U+00AD and U+3164 all pass, and
+# the first two are implicit bidi controls that still reorder neutral runs --
+# digits, punctuation, spaces -- so "Delete 3-1" can be made to draw as
+# "Delete 1-3". They pass identically on BOTH surfaces, which is the property
+# being held here; widening the class is a change to make on both at once, in
+# one commit, or the disagreement this exists to remove comes straight back.
+# Confusables (Cyrillic "А" in "Аrchive") are out of reach of any blacklist,
+# the same unwinnable-list note the digest carries about bracket lookalikes.
 _UNSAFE_LABEL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
 
 
