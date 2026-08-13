@@ -117,7 +117,10 @@
   // another is in flight on the same element is queued and replayed after the
   // swap, and the replay is dropped without a throw if the element it captured
   // was detached by the outerHTML swap. The grid's own poll clears the flag
-  // too -- its swap delivers the same fresh data an action was waiting for.
+  // too, and that is not always the same data the action was waiting for: a
+  // poll already in flight when the button was clicked can land afterwards
+  // carrying pre-mutation HTML. So the guarantee is a bound, not freshness --
+  // a committed mutation shows up within one poll interval at worst.
   document.body.addEventListener('htmx:afterSwap', function (event) {
     if (isGrid(event.detail.elt) || isGrid(event.target)) {
       refreshPending = false;
@@ -145,10 +148,15 @@
     if (button.dataset.confirm && !window.confirm('Run "' + label + '"?')) return;
     button.disabled = true;
     button.setAttribute('aria-busy', 'true');
-    inFlight += 1;
-    announce(label + ': running');
     let succeeded = false;
+    // The increment is the LAST statement before `try`, and everything that
+    // can throw — `announce` included, since it dereferences an element it
+    // does not own — is inside it. A throw between the two would leak a
+    // permanently elevated inFlight past the `finally` that exists to rule
+    // exactly that out.
+    inFlight += 1;
     try {
+      announce(label + ': running');
       const response = await fetch('/api/action/' + encodeURIComponent(button.dataset.tool), {
         method: 'POST',
         headers: {'Content-Type': 'application/json', 'x-csrf-token': csrfToken()},
