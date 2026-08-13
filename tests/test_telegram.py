@@ -24,6 +24,7 @@ from dudamel.interfaces.telegram import (
     _MAX_MESSAGE_LEN,
     TelegramInterface,
     _ActionTokens,
+    _button_label,
     _card_lines,
     _pack,
     resolve_token,
@@ -191,11 +192,23 @@ def make_orc() -> Orchestrator:
     @app.tool(action="Break")
     async def explode() -> str:
         """Fail on purpose."""
-        raise RuntimeError("kaboom")
+        # Long on purpose: a real failure message (a database integrity error,
+        # say) routinely runs to hundreds of characters, and a callback answer
+        # is capped at 200.
+        raise RuntimeError("kaboom " + "E" * 500)
 
-    @app.widget(title="Tasks", renderer="list", actions=["explode"])
+    @app.tool(action="Nuke", confirm=True)
+    async def nuke() -> str:
+        """Destroy everything."""
+        return "nuked"
+
+    @app.widget(title="Tasks", renderer="list", actions=["explode", "nuke"])
     async def today() -> list[dict[str, object]]:
-        return [{"title": "Buy milk", "action": {"tool": "complete", "args": {"id": 4}}}]
+        return [
+            {"title": "Buy milk", "action": {"tool": "complete", "args": {"id": 4}}},
+            {"title": "Call mum"},
+            {"title": "Walk dog", "action": {"tool": "complete", "args": {"id": 9}}},
+        ]
 
     return Orchestrator(apps=[app])
 
@@ -857,9 +870,19 @@ def _button_data(bot: FakeBot, label: str) -> str:
             continue
         for row in keyboard.inline_keyboard:
             for button in row:
-                if button.text == label:
+                if label in button.text:  # button labels are numbered
                     return button.callback_data
     raise AssertionError(f"no button labelled {label!r} was sent")
+
+
+def _keyboard_messages(bot: FakeBot) -> list[tuple[str, list[Any]]]:
+    """Every sent message that carries a keyboard, as (text, buttons)."""
+    out = []
+    for sent in bot.sent:
+        keyboard = sent["reply_markup"]
+        if keyboard is not None:
+            out.append((sent["text"], [b for row in keyboard.inline_keyboard for b in row]))
+    return out
 
 
 def _first_button_data(bot: FakeBot) -> str:
@@ -954,7 +977,9 @@ async def test_another_users_tap_neither_runs_nor_disarms(tmp_path: Path, token_
 
 async def test_a_failing_action_is_reported_on_the_callback(tmp_path: Path, token_env: str) -> None:
     """A tool that raises must surface as an answered callback, not as an
-    exception escaping the handler."""
+    exception escaping the handler -- and the answer must be short enough for
+    Telegram to accept, or the operator is told nothing about a tool that has
+    already run."""
     rt, interface = await build(tmp_path, [], telegram=TelegramConfig(allowed_user_ids=[111]))
     await _home(interface)
     bot: FakeBot = interface._app.bot
@@ -964,4 +989,141 @@ async def test_a_failing_action_is_reported_on_the_callback(tmp_path: Path, toke
 
     assert bot.answered[-1]["id"] == "cbq9"
     assert "kaboom" in bot.answered[-1]["text"]
+    assert len(bot.answered[-1]["text"]) <= CallbackQuery.MAX_ANSWER_TEXT_LENGTH
     await rt.stop()
+
+
+async def test_a_vanished_action_is_not_reported_as_a_failure(
+    tmp_path: Path, token_env: str
+) -> None:
+    """A digest can outlive the app that owned its buttons. Tapping one then
+    reaches no tool at all, which is a different thing from a tool that ran
+    and broke."""
+    rt, interface = await build(tmp_path, [], telegram=TelegramConfig(allowed_user_ids=[111]))
+    token = interface._action_tokens.issue("ghost", {}, 111)
+
+    await interface._on_callback(_tap(f"act:{token}", query_id="cbq8"), None)
+
+    assert "no longer available" in interface._app.bot.answered[-1]["text"]
+    await rt.stop()
+
+
+async def test_every_button_is_named_on_the_line_it_acts_on(tmp_path: Path, token_env: str) -> None:
+    """The guarantee: in each message, every button's label appears verbatim
+    in the text, exactly once, appended to the line that button acts on. Two
+    items offering the same action would otherwise render two identical
+    buttons distinguishable only by keyboard order -- and one tap is consent,
+    so reading that order wrong completes the wrong item.
+    """
+    rt, interface = await build(tmp_path, [], telegram=TelegramConfig(allowed_user_ids=[111]))
+    await _home(interface)
+    messages = _keyboard_messages(interface._app.bot)
+    assert messages
+    for text, buttons in messages:
+        labels = [button.text for button in buttons]
+        assert len(set(labels)) == len(labels)  # unique within the message
+        for label in labels:
+            assert text.count(f"[{label}]") == 1
+    # and the two same-named item actions are anchored to different lines
+    text, _ = messages[0]
+    milk = next(line for line in text.splitlines() if "Buy milk" in line)
+    dog = next(line for line in text.splitlines() if "Walk dog" in line)
+    assert "Done]" in milk and "Done]" in dog and milk != dog
+    assert all("Done]" not in line for line in text.splitlines() if "Call mum" in line)
+    await rt.stop()
+
+
+async def test_a_confirm_action_is_marked_before_it_is_tapped(
+    tmp_path: Path, token_env: str
+) -> None:
+    """One tap is consent on Telegram, as on the web -- but the browser's
+    dialog also guards against a mis-tap, and a phone screen needs that more.
+    The marker is what replaces it."""
+    rt, interface = await build(tmp_path, [], telegram=TelegramConfig(allowed_user_ids=[111]))
+    await _home(interface)
+    text, buttons = _keyboard_messages(interface._app.bot)[0]
+    marked = [button.text for button in buttons if "Nuke" in button.text]
+    assert marked and all(button.startswith(("⚠️", "1", "2", "3", "4", "5")) for button in marked)
+    assert all("⚠️" in button for button in marked)
+    assert all("⚠️" not in button.text for button in buttons if "Nuke" not in button.text)
+    assert f"[{marked[0]}]" in text  # the marker shows in the text too
+    await rt.stop()
+
+
+async def test_the_digest_is_sent_plain_never_markdown(tmp_path: Path, token_env: str) -> None:
+    """One parser for the whole digest. Bolding card titles would leave
+    app-authored item text Markdown-interpreted in the button-less messages
+    and literal in the keyboard-bearing ones."""
+    rt, interface = await build(tmp_path, [], telegram=TelegramConfig(allowed_user_ids=[111]))
+    await _home(interface)
+    bot: FakeBot = interface._app.bot
+    assert bot.sent
+    assert all(sent["parse_mode"] is None for sent in bot.sent)
+    assert all("*Tasks*" not in sent["text"] for sent in bot.sent)
+    assert any("Tasks" in sent["text"] for sent in bot.sent)
+    await rt.stop()
+
+
+async def test_a_rejected_digest_degrades_without_its_buttons(
+    tmp_path: Path, token_env: str
+) -> None:
+    """A rejected send must not abort /home and lose every later section. The
+    fallback drops the keyboard: buttons whose lines were never delivered are
+    exactly the referent-less buttons packing exists to prevent."""
+    rt, interface = await build(
+        tmp_path,
+        [],
+        telegram=TelegramConfig(allowed_user_ids=[111]),
+        bot=ConfirmationRejectingBot(),
+    )
+    await _home(interface)
+    bot: ConfirmationRejectingBot = interface._app.bot
+    assert len(bot.sent) == 1
+    assert "could not be delivered" in bot.sent[0]["text"]
+    assert bot.sent[0]["reply_markup"] is None
+    await rt.stop()
+
+
+async def test_a_button_less_digest_message_is_still_plain(tmp_path: Path, token_env: str) -> None:
+    rt, interface = await build(tmp_path, [], telegram=TelegramConfig(allowed_user_ids=[111]))
+    await interface._send_digest(555, 111, "Home\nnothing to do", [])
+    assert interface._app.bot.sent == [
+        {"chat_id": 555, "text": "Home\nnothing to do", "parse_mode": None, "reply_markup": None}
+    ]
+    await rt.stop()
+
+
+def test_packing_splits_on_length_with_buttons_attached() -> None:
+    """The length-driven split, with action-bearing and plain lines
+    interleaved: the message limit has to be enforced while a keyboard is
+    being carried, and every button must still name a line of its own message.
+    """
+    entries: list[tuple[str, dict[str, Any] | None]] = []
+    for n in range(40):
+        label = f"{n} · Go"
+        entries.append((f"note {n} " + "x" * 240, None))
+        entries.append(
+            (f"• item {n} [{label}] " + "y" * 200, {"tool": "t", "args": {}, "label": label})
+        )
+    messages = _pack(entries, "Today")
+    assert len(messages) > 1
+    assert any(len(actions) < _MAX_ACTION_BUTTONS for _, actions in messages)  # split on length
+    for text, actions in messages:
+        assert len(text) <= _MAX_MESSAGE_LEN
+        for action in actions:
+            assert text.count(f"[{action['label']}]") == 1
+
+
+def test_the_section_header_is_capped_like_any_other_line() -> None:
+    """`HomeSection.title` is operator-supplied and unconstrained, and the
+    header repeats on every message of the section, so an uncapped one puts
+    every message of that section over the limit at once."""
+    entries: list[tuple[str, dict[str, Any] | None]] = [(f"• item {n}", None) for n in range(5)]
+    messages = _pack(entries, "T" * 5000)
+    assert messages
+    assert all(len(text) <= _MAX_MESSAGE_LEN for text, _ in messages)
+
+
+def test_a_confirm_action_button_label_is_marked() -> None:
+    assert _button_label({"label": "Nuke", "confirm": True}, 2) == "2 · ⚠️ Nuke"
+    assert _button_label({"label": "Done", "confirm": False}, 1) == "1 · Done"
