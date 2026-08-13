@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import AliasChoices, AliasPath, BaseModel, ValidationError
 
-from dudamel.contract.renderers import ACTION_LABEL_MAX, RENDERERS
+from dudamel.contract.renderers import ACTION_LABEL_MAX, RENDERERS, clean_action_label
 from dudamel.contract.schema import ToolSchema
 from dudamel.contract.types import TOOL_NAME_RE, Job, Tool, Widget
 from dudamel.exceptions import AppSettingsError, RegistryError, RuntimeNotBoundError
@@ -160,7 +160,11 @@ class App:
             # instead of leaking a bare TypeError through the decorator.
             raise RegistryError(str(e)) from e
         if action is not None:
-            action = action.strip()
+            # The same normalization a per-row override gets (see
+            # `clean_action_label`): characters no surface can render honestly
+            # come out first, so the cap measures the string a button actually
+            # shows and an all-override label is reported as empty.
+            action = clean_action_label(action)
             if not action:
                 raise RegistryError(f"tool {name!r}: action label must not be empty")
             if len(action) > ACTION_LABEL_MAX:

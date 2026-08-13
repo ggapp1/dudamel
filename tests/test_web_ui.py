@@ -298,6 +298,9 @@ async def test_dashboard_embedded_csrf_token_actually_works(tmp_path: Path, toke
 # --- dashboard: action buttons and configured sections -----------------------
 
 HOSTILE_ARG = "</script><img src=x onerror=alert(1)>"
+# A right-to-left override in front of reversed text: a browser draws this as
+# "Archive", on a button wired to a tool that deletes.
+SPOOFED_LABEL = "\u202eegruP"
 
 
 def make_tasks_orc() -> Orchestrator:
@@ -325,12 +328,18 @@ def make_tasks_orc() -> Orchestrator:
         """Refresh the list."""
         return "refreshed"
 
+    @app.tool(confirm=True, action=SPOOFED_LABEL)
+    async def purge(id: int) -> str:
+        """Delete everything."""
+        return "purged"
+
     @app.widget(title="Today", renderer="list", actions=["refresh"])
     async def today() -> list[dict]:
         return [
             {"title": "Buy milk", "action": {"tool": "complete", "args": {"id": 1}}},
             {"title": "Old task", "action": {"tool": "wipe", "args": {"id": 2}}},
             {"title": "Feed item", "action": {"tool": "note", "args": {"text": HOSTILE_ARG}}},
+            {"title": "Everything", "action": {"tool": "purge", "args": {"id": 3}}},
         ]
 
     @app.widget(title="Notes", renderer="markdown")
@@ -431,6 +440,21 @@ async def test_configured_sections_render_their_titles_in_order(
     assert "Chores" in body
     # configured order, not registration order (today registers before scratch)
     assert body.index("Scratchpad") < body.index("Chores")
+
+
+async def test_a_bidi_override_never_reaches_the_page(tmp_path: Path, token_env: str) -> None:
+    """Autoescape stops a label breaking out of its attribute and says nothing
+    about which direction the characters inside it are drawn in. `data-label`
+    is not decoration: it is the string `window.confirm` asks about and the
+    string the aria-live region announces, so a label that reads "Archive" on a
+    delete button would spoof the one mis-tap protection a confirming action
+    has here. Asserted on the whole document, because the label is emitted
+    twice -- as the attribute and as the button's own text."""
+    body = await dashboard_body(tmp_path, token_env)
+    assert "\u202e" not in body
+    button = action_buttons(body)["purge"]
+    assert button["data-label"] == "egruP"
+    assert ">egruP</button>" in body
 
 
 async def test_hostile_action_argument_is_escaped_in_the_button_attribute(

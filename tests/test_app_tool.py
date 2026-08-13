@@ -230,6 +230,44 @@ def test_action_label_is_stripped_before_the_length_check() -> None:
     assert app.tools["complete"].action == "x" * 32
 
 
+def test_bidi_and_control_characters_are_stripped_from_a_registered_label() -> None:
+    """A label is drawn on a button, put into a confirm dialog and read out by
+    a screen reader; a direction override makes all three read as something
+    other than the tool they run. Neutralized where the label is accepted, so
+    an HTML surface and a plain-text one cannot disagree about what a button
+    says."""
+    app = App("tasks", description="d")
+
+    @app.tool(action="Nuke\u202e evihcrA\u2069\x07")
+    async def complete(id: int) -> str:
+        """Complete a task."""
+        return "ok"
+
+    assert app.tools["complete"].action == "Nuke evihcrA"
+
+
+def test_a_label_is_sanitized_before_its_length_is_measured() -> None:
+    """Ordering, not cosmetics. Measuring first would approve a label at the
+    cap and then store a shorter one, and would store a label spelled entirely
+    out of overrides as the empty string the non-empty rule exists to refuse."""
+    app = App("tasks", description="d")
+
+    @app.tool(action="x" * 32 + "\u202e\u202a")
+    async def complete(id: int) -> str:
+        """Complete a task."""
+        return "ok"
+
+    assert app.tools["complete"].action == "x" * 32
+
+    other = App("chores", description="d")
+    with pytest.raises(RegistryError, match="must not be empty"):
+
+        @other.tool(action="\u202e\u2066")
+        async def wipe(id: int) -> str:
+            """Delete a task."""
+            return "ok"
+
+
 def test_widget_actions_default_to_empty_tuple() -> None:
     app = App("tasks", description="d")
 
