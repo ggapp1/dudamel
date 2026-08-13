@@ -457,6 +457,24 @@ async def test_a_bidi_override_never_reaches_the_page(tmp_path: Path, token_env:
     assert ">egruP</button>" in body
 
 
+async def test_dashboard_ships_the_duplicate_mutation_guards(
+    tmp_path: Path, token_env: str
+) -> None:
+    """A string check, not a behaviour check: the guards that keep a card's
+    button from being swapped out from under a running action live in
+    `dashboard.html`'s JavaScript, which this suite cannot execute. This
+    asserts only that each load-bearing piece is still present in the page a
+    logged-in user is served -- it proves nothing about what they do, and
+    exists so deleting one is a red test rather than a silent regression."""
+    body = await dashboard_body(tmp_path, token_env)
+    assert "htmx:beforeSwap" in body
+    assert "event.detail.shouldSwap = false" in body
+    assert "htmx:beforeRequest" in body
+    assert "event.preventDefault()" in body
+    assert "button.disabled = true" in body
+    assert 'id="action-status" role="status" aria-live="polite"' in body
+
+
 async def test_hostile_action_argument_is_escaped_in_the_button_attribute(
     tmp_path: Path, token_env: str
 ) -> None:
