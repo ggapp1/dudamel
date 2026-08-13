@@ -1,3 +1,4 @@
+import importlib
 import sys
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
@@ -5,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from dudamel.apps import SUITE_APPS, SuiteApp, missing_requirements, suite_versions_dir
+from dudamel.exceptions import RegistryError
 
 # A stdlib module the test run does not already import, so find_spec has to ask
 # the finders rather than short-circuit on a cached sys.modules entry -- this is
@@ -77,6 +79,34 @@ def test_missing_requirements_reports_module_without_a_spec() -> None:
         assert missing_requirements(entry) == (name,)
     finally:
         del sys.modules[name]
+
+
+@pytest.mark.parametrize("name", ["", "1notes", "Notes", "note-s", "note_s", "a" * 33, "n;drop"])
+def test_invalid_names_are_rejected(name: str) -> None:
+    """A registry entry's name is interpolated into its lane's version table
+    and prefixes every table the app owns, so it is validated by the same rule
+    the `App` constructor applies rather than being trusted to be safe."""
+    with pytest.raises(RegistryError):
+        SuiteApp(name=name, module="m", summary="s")
+
+
+def test_registry_entry_matches_its_app() -> None:
+    """Each entry's `summary` is a COPY of the app's `description`, carried in
+    the registry so `apps list` can describe an app without importing it -- and
+    a copy drifts. The names must match too: the entry names the migration
+    lane while the app's own name prefixes the tables inside it.
+
+    Vacuous today -- the registry ships empty on purpose -- and that is the
+    point: the guard is here before the first entry is, so whoever adds one
+    inherits it instead of having to think of it.
+    """
+    for name, entry in SUITE_APPS.items():
+        app = importlib.import_module(entry.module).app
+        assert app.name == name, f"{name}: the app in {entry.module} is named {app.name!r}"
+        assert entry.summary == app.description, (
+            f"{name}: registry summary {entry.summary!r} has drifted from the "
+            f"app's description {app.description!r}"
+        )
 
 
 def test_entry_is_frozen() -> None:

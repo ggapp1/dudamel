@@ -14,6 +14,9 @@ from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
 
+from dudamel.app import APP_NAME_RE
+from dudamel.exceptions import RegistryError
+
 
 @dataclass(frozen=True)
 class SuiteApp:
@@ -29,6 +32,19 @@ class SuiteApp:
     # Tests point this at a temp directory; real entries leave it None and get
     # the packaged location below.
     versions_dir: Path | None = None
+
+    def __post_init__(self) -> None:
+        # The same rule the `App` constructor enforces, applied here too. This
+        # name is not just a label: it is interpolated into the lane's
+        # bookkeeping table (`migrate.suite_version_table`) and, via the app's
+        # own name, prefixes every table the app owns. Validating it here makes
+        # that safety structural rather than a property of whoever last edited
+        # the registry.
+        if not APP_NAME_RE.match(self.name):
+            raise RegistryError(
+                f"suite app name {self.name!r} must start with [a-z] and contain only"
+                " [a-z0-9]; it names a migration version table and prefixes table names"
+            )
 
 
 # Deliberately empty: the machinery ships before the apps do.

@@ -197,6 +197,34 @@ def test_suite_module_without_an_app_object_is_stage_two(tmp_path, monkeypatch) 
     assert resolution.apps == []
 
 
+def test_name_mismatch_between_entry_and_app_is_stage_two(tmp_path, monkeypatch) -> None:
+    """The registry entry names the migration lane's version table; the app's
+    own name prefixes the tables inside it. If the two disagree, one app's
+    bookkeeping and its data land under different identities -- so the
+    disagreement is a reported error rather than something resolution absorbs.
+    """
+    register(
+        monkeypatch,
+        write_suite_app(tmp_path, monkeypatch, "demo", DEMO_TEMPLATE.format(name="other")),
+    )
+    settings = settings_for(tmp_path, "[apps.demo]\nenabled = true\n")
+    resolution = resolve_apps(Orchestrator(), settings, strict=False)
+    assert [(e.app, e.stage) for e in resolution.errors] == [("demo", 2)]
+    assert "'other'" in resolution.errors[0].message
+    assert resolution.apps == []
+    assert resolution.suite_lanes == []
+
+
+def test_name_mismatch_strict_raises(tmp_path, monkeypatch) -> None:
+    register(
+        monkeypatch,
+        write_suite_app(tmp_path, monkeypatch, "demo", DEMO_TEMPLATE.format(name="other")),
+    )
+    settings = settings_for(tmp_path, "[apps.demo]\nenabled = true\n")
+    with pytest.raises(AppResolutionError, match="must agree"):
+        resolve_apps(Orchestrator(), settings, strict=True)
+
+
 def test_settings_failure_is_stage_three(tmp_path, monkeypatch) -> None:
     register(monkeypatch, write_suite_app(tmp_path, monkeypatch, "demo", DEMO))
     settings = settings_for(tmp_path, "[apps.demo]\nenabled = true\nnope = 1\n")

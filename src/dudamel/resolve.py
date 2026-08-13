@@ -153,6 +153,22 @@ def resolve_apps(orchestrator: Orchestrator, settings: Settings, *, strict: bool
                 f"suite app {entry.name!r}: {entry.module} does not define a module-level `app`",
             )
             continue
+        if app.name != entry.name:
+            # The registry name and the app's own name address different
+            # things -- the lane's bookkeeping table is `entry.name`'s, while
+            # the data tables are prefixed with `app.name` -- so a divergence
+            # would silently split one app's schema across two identities.
+            # It also drives the diagnostic commands: `apps list` keys its
+            # resolved set on `app.name` and its rows on `entry.name`, and
+            # would print `state=error` beside a lane that is in fact running.
+            fail(
+                entry.name,
+                2,
+                f"suite app {entry.name!r}: {entry.module} defines an app named "
+                f"{app.name!r}; the registry entry and the app must agree "
+                "(the name prefixes the app's tables and names its migration lane)",
+            )
+            continue
         imported.append((entry, app))
 
     # --- stage 3: settings --------------------------------------------------
