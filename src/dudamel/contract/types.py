@@ -26,6 +26,11 @@ class Tool:
     # search and fetch have to stay frictionless -- but it taints the turn, so
     # a later mutation stops and asks.
     external: bool = False
+    # The human-facing button label that opts this tool into the deterministic
+    # UI plane. None means it has no UI surface at all. Orthogonal to
+    # `read_only`/`confirm`: those describe what the tool does, this describes
+    # whether an operator can invoke it without going through the model.
+    action: str | None = None
 
     @property
     def untrusted(self) -> bool:
@@ -47,6 +52,22 @@ class Widget:
     renderer: str
     fn: Callable[[], Awaitable[Any]]
     timeout: float = 15.0
+    # Card-level buttons: names of action-labelled tools on the SAME app.
+    # A tuple, not a list -- a dataclass rejects a mutable default outright,
+    # and nothing mutates this after registration.
+    actions: tuple[str, ...] = ()
+
+    @property
+    def qualified_id(self) -> str:
+        """The name config, templates and layout address this widget by.
+
+        Widget ids are function names and are unique only within their own
+        app, so the bare id cannot address a widget across a registry.
+        Qualifying makes uniqueness structural: app names are unique in
+        `Registry` and `App.widgets` is keyed by id, so no two widgets can
+        produce the same qualified id.
+        """
+        return f"{self.app_name}.{self.id}"
 
 
 @dataclass

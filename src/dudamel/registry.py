@@ -67,8 +67,45 @@ class Registry:
                     )
                 self.tools[name] = tool
             self.widgets.extend(app.widgets.values())
+            for widget in app.widgets.values():
+                self._validate_card_actions(app, widget)
             self.jobs.extend(app.jobs.values())
             self.metadatas[app.name] = app.metadata
+
+    @staticmethod
+    def _validate_card_actions(app: App, widget: Widget) -> None:
+        """Card-level buttons must name an action-labelled, zero-argument tool
+        of the widget's OWN app.
+
+        Checked here rather than in the decorator because decorator order does
+        not guarantee the tool is registered when the widget is. Same-app is
+        an invariant, not a convenience: without it an app could put a button
+        on its own card that invokes another app's destructive tool, and the
+        card's title would attribute it to the wrong app.
+        """
+        for tool_name in widget.actions:
+            tool = app.tools.get(tool_name)
+            if tool is None:
+                raise RegistryError(
+                    f"widget {widget.qualified_id!r} declares card action {tool_name!r}, "
+                    f"which is not an action-labelled tool of app {app.name!r}"
+                )
+            if tool.action is None:
+                raise RegistryError(
+                    f"widget {widget.qualified_id!r} declares card action {tool_name!r}, "
+                    "but that tool has no action= label"
+                )
+            required = [
+                name
+                for name, field in tool.schema.arg_model.model_fields.items()
+                if field.is_required()
+            ]
+            if required:
+                raise RegistryError(
+                    f"widget {widget.qualified_id!r} declares card action {tool_name!r}, "
+                    f"which has required parameter(s) {required}; "
+                    "a card button collects no input"
+                )
 
     def add_mcp_tools(self, tools: Sequence[Tool]) -> None:
         """Sanctioned entry point for grafting MCP-discovered tools in after
@@ -97,6 +134,11 @@ class Registry:
             if tool.origin != "mcp":
                 raise RegistryError(
                     f"add_mcp_tools received a non-mcp tool {tool.name!r} (origin={tool.origin!r})"
+                )
+            if tool.action is not None:
+                raise RegistryError(
+                    f"mcp tool {tool.name!r} carries an action label; only locally "
+                    "declared tools may put a button on the homescreen"
                 )
             if not TOOL_NAME_RE.match(tool.name):
                 raise RegistryError(

@@ -41,7 +41,7 @@ async def test_run_widget_list_success_flattens_models_to_dicts() -> None:
     out = await run_widget(make_widget(fn, renderer="list"))
     # validate_widget_payload returns pydantic ListItem models; run_widget must
     # hand back plain JSON-safe data, not pydantic instances.
-    assert out["data"] == [{"title": "t", "subtitle": None, "url": "http://x"}]
+    assert out["data"] == [{"title": "t", "subtitle": None, "url": "http://x", "action": None}]
 
 
 async def test_run_widget_markdown_success() -> None:

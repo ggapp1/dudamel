@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import re
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from typing import TYPE_CHECKING, Any
 
@@ -106,16 +106,27 @@ class App:
         read_only: bool = False,
         confirm: bool = False,
         external: bool = False,
+        action: str | None = None,
         timeout: float = 30.0,
     ) -> Callable:
         if fn is not None:  # bare @app.tool
             return self._register_tool(
-                fn, read_only=read_only, confirm=confirm, external=external, timeout=timeout
+                fn,
+                read_only=read_only,
+                confirm=confirm,
+                external=external,
+                action=action,
+                timeout=timeout,
             )
 
         def wrap(f: Callable) -> Callable:
             return self._register_tool(
-                f, read_only=read_only, confirm=confirm, external=external, timeout=timeout
+                f,
+                read_only=read_only,
+                confirm=confirm,
+                external=external,
+                action=action,
+                timeout=timeout,
             )
 
         return wrap
@@ -128,6 +139,7 @@ class App:
         confirm: bool,
         timeout: float,
         external: bool = False,
+        action: str | None = None,
     ) -> Callable:
         name = fn.__name__
         if not inspect.iscoroutinefunction(fn):
@@ -147,6 +159,15 @@ class App:
             # any other here — fold them into the same RegistryError taxonomy
             # instead of leaking a bare TypeError through the decorator.
             raise RegistryError(str(e)) from e
+        if action is not None:
+            action = action.strip()
+            if not action:
+                raise RegistryError(f"tool {name!r}: action label must not be empty")
+            if len(action) > 32:
+                raise RegistryError(
+                    f"tool {name!r}: action label must be at most 32 characters "
+                    f"(got {len(action)}) — it renders inside a button"
+                )
         self.tools[name] = Tool(
             name=name,
             app_name=self.name,
@@ -156,12 +177,20 @@ class App:
             read_only=read_only,
             confirm=confirm,
             external=external,
+            action=action,
             timeout=timeout,
         )
         return fn
 
     # --- widgets -----------------------------------------------------------
-    def widget(self, *, title: str, renderer: str, timeout: float = 15.0) -> Callable:
+    def widget(
+        self,
+        *,
+        title: str,
+        renderer: str,
+        actions: Sequence[str] = (),
+        timeout: float = 15.0,
+    ) -> Callable:
         if renderer not in RENDERERS:
             raise RegistryError(f"unknown renderer {renderer!r}; choose one of {sorted(RENDERERS)}")
 
@@ -182,7 +211,13 @@ class App:
             if wid in self.widgets:
                 raise RegistryError(f"widget {wid!r} already registered on app {self.name!r}")
             self.widgets[wid] = Widget(
-                id=wid, app_name=self.name, title=title, renderer=renderer, fn=fn, timeout=timeout
+                id=wid,
+                app_name=self.name,
+                title=title,
+                renderer=renderer,
+                fn=fn,
+                timeout=timeout,
+                actions=tuple(actions),
             )
             return fn
 
