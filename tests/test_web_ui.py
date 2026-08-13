@@ -473,6 +473,11 @@ async def test_dashboard_ships_the_duplicate_mutation_guards(
     assert "event.preventDefault()" in body
     assert "button.disabled = true" in body
     assert 'id="action-status" role="status" aria-live="polite"' in body
+    # Disabling a button is half of it: a failed action that never re-enables
+    # its button, or never says what happened, leaves an operator with a dead
+    # control and no reason for it.
+    assert "button.disabled = false" in body
+    assert "announce(label + ' failed: '" in body
 
 
 async def test_hostile_action_argument_is_escaped_in_the_button_attribute(
