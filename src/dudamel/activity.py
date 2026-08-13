@@ -35,13 +35,15 @@ async def log_activity(
     result_preview: str | None = None,
     conversation_id: int | None = None,
     actor: str | None = None,
-    source: str = "router",
+    source: str | None = None,
 ) -> None:
     """Record one tool execution.
 
-    `source` defaults to "router" because that is the only caller that
-    predates the deterministic plane and it is, definitionally, the router.
-    Surfaces that invoke a tool directly pass their own value.
+    Both `actor` and `source` default to None, which reads as unattributed.
+    Every caller names its own surface -- the router included. Defaulting
+    `source` to any one surface would make an omission indistinguishable
+    from a genuine claim, and a wrong attribution in an audit log is worse
+    than a missing one because nothing later can tell the two apart.
     """
     async with db.session() as s:
         s.add(

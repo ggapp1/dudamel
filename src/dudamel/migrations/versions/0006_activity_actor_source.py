@@ -1,9 +1,9 @@
 """record who invoked an activity row and through which surface
 
 Until now every activity row came from the router on the model's behalf, so
-neither question had an answer worth storing. The deterministic plane adds a
-second, human actor on two different surfaces, and an audit log that cannot
-say which one acted is not an audit log.
+neither question had an answer worth storing. The web and Telegram surfaces
+add a second, human actor, and an audit log that cannot say which one acted
+is not an audit log.
 
 Both columns are nullable: rows written before this migration cannot be
 attributed, and backfilling them with a guess would put fiction in the log.
