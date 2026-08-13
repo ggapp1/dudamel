@@ -357,16 +357,19 @@ def _check_core_migrations(db_url: str) -> tuple[bool, str]:
     return False, f"behind head ({sorted(current)} != {sorted(heads)})"
 
 
-def _check_app_migrations_dir(project_dir: Path, *, any_apps: bool) -> tuple[bool, str]:
+def _check_app_migrations_dir(project_dir: Path, *, any_local_apps: bool) -> tuple[bool, str]:
     mig_dir = project_dir / "migrations"
     if not mig_dir.exists():
         return False, "migrations/ not found — run `dudamel db migrate -m init` to create it"
     revisions = list((mig_dir / "versions").glob("*.py")) if (mig_dir / "versions").exists() else []
     if not revisions:
-        # Only advise `db migrate` when there is something to autogenerate: a
-        # project with no apps resolved has no models either, so that command
-        # would print `no changes` and the advice would be a dead end.
-        if not any_apps:
+        # LOCAL apps, not every resolved app: `cmd_db_migrate` autogenerates
+        # against `resolution.local_apps` alone, because a suite app's
+        # revisions ship in the wheel and must never enter the project's own
+        # diff. So a project running only enabled suite apps has models and
+        # still has nothing to generate -- advising `db migrate` there is the
+        # same dead end as advising it in an empty project.
+        if not any_local_apps:
             return True, "present, no revisions yet — normal until an app defines models"
         return True, "present, no revisions yet — run `dudamel db migrate -m init`"
     return True, f"present ({len(revisions)} revision{'s' if len(revisions) != 1 else ''})"
@@ -558,7 +561,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # dudamel.toml wins, and the runtime resolves the project's own migration
     # lane from exactly that. Reading the cwd here would report on a different
     # directory than the one the startup gate gates on.
-    ok, detail = _check_app_migrations_dir(settings.project_dir, any_apps=bool(resolution.apps))
+    ok, detail = _check_app_migrations_dir(
+        settings.project_dir, any_local_apps=bool(resolution.local_apps)
+    )
     lines.append(_line(ok, "app migrations dir", detail))
 
     lines.append(
