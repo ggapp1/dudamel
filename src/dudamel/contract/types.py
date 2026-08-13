@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from dudamel.contract.schema import ToolSchema
 
@@ -20,7 +20,23 @@ class Tool:
     read_only: bool
     confirm: bool
     timeout: float
-    origin: str = "native"  # "native" | "mcp" (mounted via mcp_mount.py)
+    origin: Literal["native", "mcp"] = "native"  # "mcp" = mounted via mcp_mount.py
+    # Whether this tool's return value may contain text an attacker controls.
+    # Orthogonal to `read_only`: a read-only fetch is never gated itself --
+    # search and fetch have to stay frictionless -- but it taints the turn, so
+    # a later mutation stops and asks.
+    external: bool = False
+
+    @property
+    def untrusted(self) -> bool:
+        """Whether this tool's output must be treated as attacker-influenceable.
+
+        The single predicate the taint system reads. A property rather than a
+        stored flag because `origin` is assigned after construction in real
+        code paths (a reconnect force-gating a tool in place), which any
+        value computed once at construction would miss.
+        """
+        return self.external or self.origin == "mcp"
 
 
 @dataclass

@@ -111,3 +111,50 @@ async def test_to_thread_runs_sync_fn():
     app = make_app()
     result = await app.to_thread(lambda: 41 + 1)
     assert result == 42
+
+
+def test_tool_defaults_to_not_external():
+    app = App("notes", description="d")
+
+    @app.tool(read_only=True)
+    async def count_notes() -> str:
+        """Count notes."""
+        return "0"
+
+    assert app.tools["count_notes"].external is False
+    assert app.tools["count_notes"].untrusted is False
+
+
+def test_external_flag_is_recorded_and_makes_the_tool_untrusted():
+    app = App("feeds", description="d")
+
+    @app.tool(read_only=True, external=True)
+    async def read_feed() -> str:
+        """Read a syndicated feed."""
+        return "content"
+
+    tool = app.tools["read_feed"]
+    assert tool.external is True
+    assert tool.untrusted is True
+    # external is orthogonal to read_only: a fetch stays read-only, and it is
+    # the caller's *later* mutations that get gated, not this call.
+    assert tool.read_only is True
+    assert tool.confirm is False
+
+
+def test_mcp_origin_is_untrusted_even_without_the_external_flag():
+    app = App("notes", description="d")
+
+    @app.tool
+    async def save_note(text: str) -> str:
+        """Save a note."""
+        return "saved"
+
+    tool = app.tools["save_note"]
+    assert tool.untrusted is False
+    # Assigned AFTER construction, which is how mcp_mount force-gates tools in
+    # place and how the confirm tests build an mcp-provided tool. A value
+    # computed at construction time would be stale here.
+    tool.origin = "mcp"
+    assert tool.untrusted is True
+    assert tool.external is False  # the declared flag is untouched
