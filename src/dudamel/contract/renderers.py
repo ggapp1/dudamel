@@ -43,12 +43,40 @@ _SAFE_URL_PREFIXES = ("http://", "https://", "mailto:")
 _URL_CONTROL_CHARS = re.compile(r"[\x00-\x20\x7f]")
 
 
+ACTION_LABEL_MAX = 32
+
+
 class ItemAction(BaseModel):
     """An action an app attaches to one list item. Written by the app."""
 
     tool: str
     args: dict[str, Any] = {}
     label: str | None = None  # overrides the tool's own label for this row
+
+    @field_validator("label")
+    @classmethod
+    def _check_label(cls, value: str | None) -> str | None:
+        """Hold a per-row override to the same rule as a registered `action=`
+        label (`App._register_tool`): stripped, non-empty, at most
+        ACTION_LABEL_MAX characters.
+
+        Without this, the override is simply a hole in that rule -- it lands in
+        exactly the same place, a button, and every surface sizes that
+        affordance around a short string. A plain-text surface additionally
+        prints the label next to the row it acts on, where an unbounded one
+        pushes the association off the end of the line.
+        """
+        if value is None:
+            return None
+        label = value.strip()
+        if not label:
+            raise ValueError("action label must not be empty")
+        if len(label) > ACTION_LABEL_MAX:
+            raise ValueError(
+                f"action label must be at most {ACTION_LABEL_MAX} characters "
+                f"(got {len(label)}) — it renders inside a button"
+            )
+        return label
 
 
 class ResolvedAction(BaseModel):

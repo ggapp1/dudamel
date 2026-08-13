@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import AliasChoices, AliasPath, BaseModel, ValidationError
 
-from dudamel.contract.renderers import RENDERERS
+from dudamel.contract.renderers import ACTION_LABEL_MAX, RENDERERS
 from dudamel.contract.schema import ToolSchema
 from dudamel.contract.types import TOOL_NAME_RE, Job, Tool, Widget
 from dudamel.exceptions import AppSettingsError, RegistryError, RuntimeNotBoundError
@@ -163,9 +163,9 @@ class App:
             action = action.strip()
             if not action:
                 raise RegistryError(f"tool {name!r}: action label must not be empty")
-            if len(action) > 32:
+            if len(action) > ACTION_LABEL_MAX:
                 raise RegistryError(
-                    f"tool {name!r}: action label must be at most 32 characters "
+                    f"tool {name!r}: action label must be at most {ACTION_LABEL_MAX} characters "
                     f"(got {len(action)}) — it renders inside a button"
                 )
         self.tools[name] = Tool(

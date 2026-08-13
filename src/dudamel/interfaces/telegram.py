@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import secrets
 from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
@@ -143,8 +144,40 @@ def _fit_single_message(text: str, limit: int = _MAX_MESSAGE_LEN) -> str:
     return text[: limit - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
 
 
+# Characters an app must not be able to put on a digest line: C0/C1 controls
+# and DEL (they break the line structure of a surface that escapes nothing),
+# the Unicode line/paragraph separators U+2028/U+2029 (which clients render as
+# line breaks and which `ListItem`'s ASCII-only url check does not catch), and
+# the bidi overrides, which can reorder a line into something it does not say.
+_UNSAFE_DIGEST_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+# Square brackets delimit a button's anchor, so app text containing them could
+# forge one: a row reading "Buy milk [1 · Done]" in its own title would make an
+# inert line look actionable and make the anchor ambiguous. Folded to
+# parentheses rather than dropped, so the text still reads as its author wrote.
+_ANCHOR_DELIMITERS = str.maketrans({"[": "(", "]": ")"})
+
+
+def _plain(value: object) -> str:
+    """App-authored text, made safe to place on a digest line.
+
+    Every fragment an app controls -- titles, subtitles, urls, stat labels,
+    table cells, error messages, action labels -- goes through this. The
+    digest is plain text with no escaping of any kind, so this is the only
+    place that can hold the line structure and the anchor syntax.
+    """
+    return _UNSAFE_DIGEST_CHARS.sub("", str(value)).translate(_ANCHOR_DELIMITERS)
+
+
 def _card_lines(card: dict[str, Any]) -> list[str]:
-    """One card as plain-text lines, one per renderer shape."""
+    """One card as plain-text lines, one per renderer shape.
+
+    Every app-authored fragment is passed through `_plain`, so no title,
+    subtitle, url or cell can break a line in two or forge a button anchor.
+    """
+    return [_plain(line) for line in _raw_card_lines(card)]
+
+
+def _raw_card_lines(card: dict[str, Any]) -> list[str]:
     if "error" in card:
         return [f"⚠️ {card['title']} — {card['error']}"]
     renderer, data = card["renderer"], card["data"]
@@ -187,24 +220,42 @@ def _button_label(action: dict[str, Any], number: int) -> str:
     human decision either way, so the marker -- not a second tap -- is what
     replaces it. Applied here, where the button is built, so the resolved
     descriptor the web renders is untouched.
+
+    The label is app-authored, so it goes through `_plain` as well: a bracket
+    inside it would break the anchor it is about to be wrapped in, and a
+    control character would split that anchor across lines. Its LENGTH is
+    bounded upstream by `ItemAction`'s contract cap -- a label long enough to
+    outgrow a line has no good rendering here, only a less obvious failure.
     """
     warn = "⚠️ " if action.get("confirm") else ""
-    return f"{number} · {warn}{action['label']}"
+    return f"{number} · {warn}{_plain(action['label'])}"
 
 
 def _pack(
     entries: list[tuple[str, dict[str, Any] | None]], header: str
 ) -> list[tuple[str, list[dict[str, Any]]]]:
-    """Group (line, action) pairs into messages, splitting at item boundaries.
+    """Group (text, action) pairs into messages, splitting at item boundaries.
 
-    An inline keyboard belongs to exactly one message and cannot be truncated
-    alongside its text, so `_fit_single_message` must never be used on a
-    keyboard-bearing digest: it would leave buttons attached to a message
-    whose corresponding lines had been cut -- a button with no visible
-    referent, which is the worst possible affordance on a destructive action.
+    Guarantee: **every button in a message has its label present, intact and
+    exactly once, on the line it acts on -- for any app-supplied title,
+    subtitle, url or label, of any length or content.**
 
-    Packing at item boundaries gives the guarantee instead: every button lands
-    in the message that also contains the line it acts on.
+    Two things buy that, and both live here rather than in the caller:
+
+    - The anchor is composed AFTER the item text is truncated, so the cap can
+      only eat app text and never the anchor. Composing it upstream put the
+      anchor at the end of a line that was then cut to `_MAX_DIGEST_LINE`, and
+      a 300-character title -- nothing in the contract bounds one -- silently
+      ate it, leaving a numbered button whose number appeared nowhere.
+    - Splitting happens at item boundaries, never mid-message: an inline
+      keyboard belongs to exactly one message and cannot be truncated
+      alongside its text, so `_fit_single_message` must never be used on a
+      keyboard-bearing digest. It would leave buttons on a message whose lines
+      had been cut -- a button with no visible referent, the worst possible
+      affordance on a destructive action.
+
+    The remaining half of the guarantee -- that app text cannot forge or break
+    an anchor -- is `_plain`'s, applied to every fragment before it gets here.
     """
     messages: list[tuple[str, list[dict[str, Any]]]] = []
     # The header is capped like any other line, and for the same reason: it is
@@ -216,6 +267,8 @@ def _pack(
     actions: list[dict[str, Any]] = []
     for raw_line, action in entries:
         line = raw_line[:_MAX_DIGEST_LINE]
+        if action is not None:
+            line = f"{line}  [{action['label']}]"
         too_long = len("\n".join([*lines, line])) > _MAX_MESSAGE_LEN
         too_many = action is not None and len(actions) >= _MAX_ACTION_BUTTONS
         if (too_long or too_many) and len(lines) > 1:
@@ -387,7 +440,7 @@ class TelegramInterface:
                 # Markdown-interpreted in the button-less messages and literal
                 # in the keyboard-bearing ones, i.e. the same app-controlled
                 # string read two different ways inside one /home.
-                entries.append((card["title"], None))
+                entries.append((_plain(card["title"]), None))
                 lines = _card_lines(card)
                 items = card.get("data") if card["renderer"] == "list" else None
                 for index, line in enumerate(lines):
@@ -398,15 +451,16 @@ class TelegramInterface:
                         entries.append((line, None))
                         continue
                     numbered += 1
-                    # The button's own label, appended to the line it acts on:
-                    # the association is then visible in the text instead of
-                    # inferred from keyboard order.
-                    button = {**action, "label": _button_label(action, numbered)}
-                    entries.append((f"{line}  [{button['label']}]", button))
+                    # Only the numbered label is decided here. `_pack` writes it
+                    # onto the line, AFTER truncating the app's text, so no
+                    # title can be long enough to push its own button's anchor
+                    # off the end.
+                    entries.append((line, {**action, "label": _button_label(action, numbered)}))
                 for action in card["actions"]:
                     numbered += 1
-                    button = {**action, "label": _button_label(action, numbered)}
-                    entries.append((f"  [{button['label']}]", button))
+                    # No text of its own: `_pack` renders this as the anchor
+                    # alone, indented under the card it belongs to.
+                    entries.append(("", {**action, "label": _button_label(action, numbered)}))
             for text, actions in _pack(entries, section.title or "Home"):
                 await self._send_digest(chat.id, user.id, text, actions)
 
