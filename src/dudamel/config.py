@@ -132,6 +132,21 @@ class McpConfig(BaseModel):
         return self
 
 
+class HomeSection(BaseModel):
+    title: str
+    widgets: list[str] = []
+
+
+class HomeConfig(BaseModel):
+    """Homescreen layout. `[[home.section]]` in dudamel.toml maps to `section`.
+
+    Absent entirely, the dashboard renders exactly as it did before this
+    existed: every widget, in registration order, in one grid.
+    """
+
+    section: list[HomeSection] = []
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="DUDAMEL_",
@@ -165,6 +180,7 @@ class Settings(BaseSettings):
     web: WebConfig = WebConfig()
     telegram: TelegramConfig = TelegramConfig()
     mcp: McpConfig = McpConfig()
+    home: HomeConfig = HomeConfig()
     # Raw per-app config blocks straight from [apps.*]. Values stay untyped
     # here: an app's settings model lives inside that app's module, which is
     # imported only when the app is enabled, so validation happens later

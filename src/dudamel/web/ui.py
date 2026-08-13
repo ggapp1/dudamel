@@ -104,9 +104,9 @@ def add_ui(app: FastAPI, runtime: Runtime, settings: Settings) -> None:
         csrf_token = _session(request)
         if csrf_token is None:
             return RedirectResponse("/login", status_code=303)
-        widgets = await runtime.render_widgets()
+        sections = await runtime.render_home()
         return _TEMPLATES.TemplateResponse(
-            request, "dashboard.html", {"widgets": widgets, "csrf_token": csrf_token}
+            request, "dashboard.html", {"sections": sections, "csrf_token": csrf_token}
         )
 
     @app.get("/chat")
