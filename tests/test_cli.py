@@ -653,6 +653,36 @@ def test_doctor_cookie_secure_line_neither_starts_the_orchestrator_nor_creates_a
     assert "not created yet" in out
 
 
+EXTERNAL_TOOL = '''
+
+@app.tool(read_only=True, external=True)
+async def read_feed() -> str:
+    """Read a syndicated feed."""
+    return "x"
+'''
+
+
+def test_doctor_tool_table_reports_the_external_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An operator reads this table to decide what can run unconfirmed, so it
+    has to say which tools can put outside content in front of the model."""
+    target = scaffold_with_local_app(tmp_path)
+    app_file = target / "apps" / "notebook.py"
+    app_file.write_text(app_file.read_text() + EXTERNAL_TOOL)
+    monkeypatch.chdir(target)
+    capsys.readouterr()  # drain `new`'s output
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    rows = {line.split()[0]: line.split() for line in out.splitlines() if line.split()}
+    # Columns: name, read_only, confirm, external, origin.
+    assert rows["read_feed"] == ["read_feed", "True", "False", "True", "native"]
+    # An ordinary tool still gets the column, reading False -- absence of the
+    # word is not the same as a reported False.
+    assert rows["add_note"] == ["add_note", "False", "False", "False", "native"]
+
+
 # --- token rotate --------------------------------------------------------
 
 
