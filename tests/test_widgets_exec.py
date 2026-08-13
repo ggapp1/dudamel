@@ -2,6 +2,8 @@
 timeout enforcement."""
 
 import asyncio
+from datetime import date
+from enum import Enum
 
 from dudamel.app import App
 from dudamel.contract.types import Tool, Widget
@@ -132,6 +134,11 @@ async def test_run_widget_preserves_identity_on_error() -> None:
 # --- action resolution -------------------------------------------------------
 
 
+class Priority(Enum):
+    HIGH = "high"
+    LOW = "low"
+
+
 def _tasks_app() -> App:
     app = App("tasks", description="d")
 
@@ -149,6 +156,11 @@ def _tasks_app() -> App:
     async def wipe(id: int) -> str:
         """Delete a task."""
         return "gone"
+
+    @app.tool(action="Snooze")
+    async def snooze(until: date, priority: Priority) -> str:
+        """Snooze a task until a date."""
+        return "zzz"
 
     return app
 
@@ -221,12 +233,15 @@ async def test_item_action_naming_an_unknown_tool_degrades_to_an_error_card() ->
     assert "error" in card
     assert "nope" in card["error"]
     assert card["qualified_id"] == "tasks.today"
+    # Part of the error shape: a surface can iterate card["actions"] without
+    # first checking whether this card is an error card.
+    assert card["actions"] == []
 
 
 async def test_item_action_naming_another_apps_tool_degrades_to_an_error_card() -> None:
     """The mapping handed to run_widget holds only this app's labelled tools,
     so a foreign tool is absent by construction rather than by a check."""
-    _tasks_app()
+    _tasks_app()  # a tool named "complete" exists -- on another app, hence absent below
     notes = App("notes", description="d")
 
     @notes.widget(title="T", renderer="list")
@@ -246,6 +261,31 @@ async def test_item_action_with_uncoercible_args_degrades_to_an_error_card() -> 
 
     card = await run_widget(app.widgets["today"], _actions_of(app))
     assert "error" in card
+
+
+async def test_resolved_args_are_json_primitives_not_dates_or_enum_members() -> None:
+    """Coercion hands back a `date` object and an Enum member, but a resolved
+    action promises a surface it can serialize `args` without further thought:
+    both must already be plain strings by the time they reach the card."""
+    app = _tasks_app()
+
+    @app.widget(title="T", renderer="list")
+    async def today() -> list[dict[str, object]]:
+        return [
+            {
+                "title": "Buy milk",
+                "action": {
+                    "tool": "snooze",
+                    "args": {"until": "2026-01-02", "priority": "high"},
+                },
+            }
+        ]
+
+    card = await run_widget(app.widgets["today"], _actions_of(app))
+    args = card["data"][0]["action"]["args"]
+    assert args == {"until": "2026-01-02", "priority": "high"}
+    assert isinstance(args["until"], str) and not isinstance(args["until"], date)
+    assert isinstance(args["priority"], str) and not isinstance(args["priority"], Priority)
 
 
 async def test_card_level_actions_resolve() -> None:
