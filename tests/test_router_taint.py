@@ -356,6 +356,33 @@ async def test_first_mcp_mutation_in_a_clean_turn_is_not_gated(tmp_path) -> None
     await db.dispose()
 
 
+async def test_batch_with_two_mcp_calls_gates_the_mcp_mutation(tmp_path) -> None:
+    """An mcp fetch and an mcp write asked for together, in a turn that has
+    seen nothing untrusted yet: the write is gated by the fetch sitting beside
+    it in the same batch, even though its result has not been read.
+
+    A lone mcp mutation in a clean turn still runs unprompted (above) -- the
+    batch clause is what separates the two. Pairing a fetch with a write in one
+    batch is the shape an injection attempt takes, and the gate applies to
+    every untrusted call, not only to the calls a native app declared."""
+    both = Completion(
+        message=Message(
+            role="assistant",
+            tool_calls=[
+                ToolCall(id="a", name="web__fetch_page", args={"url": "u"}),
+                ToolCall(id="b", name="fs__write_file", args={"path": "n.md", "content": "hi"}),
+            ],
+        ),
+        usage=Usage(1, 1),
+        stop_reason="tool_calls",
+    )
+    router, fp, db = build(tmp_path, [both])
+    reply = await router.handle(channel="t:1", text="x", user_id="u1")
+    assert reply.pending_confirmation_id is not None
+    assert MUTATIONS == []  # the write did not run
+    await db.dispose()
+
+
 async def test_external_read_only_tool_runs_ungated_and_taints_the_turn(tmp_path) -> None:
     """A native tool that returns web content is not gated itself -- fetching
     has to stay frictionless -- but the mutation the model asks for next is."""
