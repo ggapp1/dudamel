@@ -406,6 +406,15 @@ class Runtime:
         state-changing entry point reachable from more than one surface, so
         argument probing against it must not be the one thing the audit log
         cannot see.
+
+        Every one of those rows records `args`, the submitted dict -- never
+        `kwargs`. `ToolSchema.validate` returns attribute values, so a nested
+        model parameter arrives as a model instance and `json_safe` has no
+        branch for one: it would be stored as its `str()`. The model-facing
+        path (`Router`) logs the submitted arguments too, so recording the
+        coerced ones here would mean the same tool, called two ways, produced
+        two shapes of `args` in one table -- and comparing exactly that across
+        the `actor`/`source` columns is what they exist for.
         """
         tool = self._registry.tools.get(tool_name)
         if tool is None or tool.action is None:
@@ -421,8 +430,9 @@ class Runtime:
         except ToolValidationError as e:
             await log_activity(
                 self._db,
-                # The raw args, not `kwargs`: coercion is exactly what failed,
-                # so what was actually submitted is the only thing to record.
+                # The submitted args, like every other outcome here -- and on
+                # this path there is nothing else to record anyway: coercion
+                # is exactly what failed.
                 tool=tool_name,
                 args=args,
                 status="error",
@@ -442,15 +452,15 @@ class Runtime:
         except TimeoutError as e:
             if cm.expired():
                 detail = f"action {tool_name} timed out after {tool.timeout}s"
-                await self._log_action_error(tool_name, kwargs, detail, actor=actor, source=source)
+                await self._log_action_error(tool_name, args, detail, actor=actor, source=source)
                 raise TimeoutError(detail) from e
             await self._log_action_error(
-                tool_name, kwargs, str(e) or type(e).__name__, actor=actor, source=source
+                tool_name, args, str(e) or type(e).__name__, actor=actor, source=source
             )
             raise
         except Exception as e:
             await self._log_action_error(
-                tool_name, kwargs, str(e) or type(e).__name__, actor=actor, source=source
+                tool_name, args, str(e) or type(e).__name__, actor=actor, source=source
             )
             raise
         # The same normalization the model-facing path uses, so one tool
@@ -467,7 +477,7 @@ class Runtime:
         await log_activity(
             self._db,
             tool=tool_name,
-            args=kwargs,
+            args=args,
             status="ok",
             result_preview=text,
             actor=actor,

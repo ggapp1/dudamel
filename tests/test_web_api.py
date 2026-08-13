@@ -7,6 +7,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from pydantic import BaseModel
 from sqlalchemy import select
 
 from dudamel import App, Orchestrator, Runtime
@@ -23,6 +24,11 @@ TOKEN = "s3cr3t-token"  # noqa: S105 — test fixture, not a real credential
 # cap the tools below straddle can never drift away from the enforced one.
 RESULT_CAP = RouterConfig().tool_result_cap
 OVERSHOOT = 808
+
+
+class _Entry(BaseModel):
+    exercise: str
+    sets: int
 
 
 def make_orc() -> Orchestrator:
@@ -77,6 +83,11 @@ def make_orc() -> Orchestrator:
     async def stall() -> str:
         """Raises the timeout its own upstream hit, well inside its deadline."""
         raise TimeoutError("upstream connect timed out")
+
+    @app.tool(action="Nest")
+    async def nest(entry: _Entry) -> str:
+        """Takes a nested model, so its coerced argument is not JSON-shaped."""
+        return f"noted {entry.sets}"
 
     return Orchestrator(apps=[app])
 
@@ -734,6 +745,53 @@ async def test_action_writes_an_activity_row_naming_the_actor_and_surface(
     assert [(r.tool, r.status, r.actor, r.source) for r in rows] == [
         ("complete", "ok", "web", "web")
     ]
+    await rt.stop()
+
+
+async def test_one_tool_records_one_shape_of_args_whoever_called_it(
+    tmp_path: Path, token_env: str
+) -> None:
+    """The `actor`/`source` columns exist to be compared across surfaces, and
+    that only works if the third column means the same thing on both rows.
+    Coerced arguments are attribute values, so a nested model parameter is a
+    model instance by then and reaches the JSON column as its `str()` --
+    `{'entry': "exercise='bench' sets=3"}` from a click and
+    `{'entry': {...}}` from the model. Both rows must carry the structured
+    form, which is what was submitted in each case."""
+    args = {"entry": {"exercise": "bench", "sets": 3}}
+    rt, transport = await build(tmp_path, [fake_tool_call("nest", args), fake_text("noted")])
+    async with client(transport) as c:
+        res = await c.post(
+            "/api/action/nest", json={"args": args}, headers={"Authorization": f"Bearer {TOKEN}"}
+        )
+        assert res.status_code == 200
+    await rt.chat("web:default", "note it", user_id="web")
+
+    async with rt._db.session() as s:
+        rows = (await s.execute(select(Activity).order_by(Activity.id))).scalars().all()
+    assert [r.source for r in rows] == ["web", "router"]
+    assert [r.args for r in rows] == [args, args]
+    await rt.stop()
+
+
+async def test_a_failing_action_records_the_submitted_args_too(
+    tmp_path: Path, token_env: str
+) -> None:
+    """The error paths log through a different call than the success one, so
+    they are pinned separately: an audit query that can only compare
+    successful calls is not an audit query."""
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        await c.post(
+            "/api/action/ransack",
+            json={"args": {"id": "7"}},
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+    async with rt._db.session() as s:
+        rows = (await s.execute(select(Activity))).scalars().all()
+    # "7", not 7: coercion turns it into an int on the way to the tool, and
+    # what an audit row answers for is what the caller sent.
+    assert [(r.tool, r.status, r.args) for r in rows] == [("ransack", "error", {"id": "7"})]
     await rt.stop()
 
 
