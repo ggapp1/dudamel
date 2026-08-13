@@ -1176,6 +1176,25 @@ def test_the_section_header_is_capped_like_any_other_line() -> None:
     assert all(len(text) <= _MAX_MESSAGE_LEN for text, _ in messages)
 
 
+def test_a_section_header_cannot_forge_an_anchor() -> None:
+    """A header repeats on every message of its section, so a bracketed anchor
+    written into one lands beside every button that section produces. It comes
+    from the operator's own config rather than from an app, but the module
+    already length-caps it, so treating it as trusted for the rest of the
+    class would be arbitrary."""
+    action = {"tool": "t", "args": {}, "label": "1 · Done"}
+    (text, _), *rest = _pack([("• Buy milk", action)], "Morning [1 · Done]")
+    assert not rest
+    assert text.count("[1 · Done]") == 1
+    assert text.startswith("Morning (1 · Done)")
+
+
+def test_a_section_header_cannot_add_a_line() -> None:
+    (text, _), *rest = _pack([("• Buy milk", None)], "A\nB")
+    assert not rest
+    assert text.split("\n") == ["AB", "• Buy milk"]
+
+
 async def test_every_button_is_anchored_whatever_the_app_writes(
     tmp_path: Path, token_env: str
 ) -> None:

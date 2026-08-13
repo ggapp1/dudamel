@@ -154,6 +154,18 @@ _UNSAFE_DIGEST_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e
 # forge one: a row reading "Buy milk [1 · Done]" in its own title would make an
 # inert line look actionable and make the anchor ambiguous. Folded to
 # parentheses rather than dropped, so the text still reads as its author wrote.
+#
+# What this buys and what it does not: the machine-checkable property (every
+# button's label appears intact, exactly once, on the line it acts on) holds
+# unconditionally, because a forged anchor cannot be spelled with ASCII
+# brackets after this. What it does NOT buy is the READING of that property by
+# a human -- lookalike delimiters survive, so "［1 · Delete］" (fullwidth) or
+# "【1 · Delete】" in a synced-in title can still make an inert line LOOK
+# actionable, which matters because one tap is consent. A blacklist is
+# unwinnable here: Unicode's Ps/Pe categories run to hundreds of pairs. The
+# structural fix is to move the anchor to a line PREFIX, where app text can
+# never reach position 0 of a rendered line; that is a rendering change, not a
+# sanitizing one, and is deliberately not attempted here.
 _ANCHOR_DELIMITERS = str.maketrans({"[": "(", "]": ")"})
 
 
@@ -258,11 +270,15 @@ def _pack(
     an anchor -- is `_plain`'s, applied to every fragment before it gets here.
     """
     messages: list[tuple[str, list[dict[str, Any]]]] = []
-    # The header is capped like any other line, and for the same reason: it is
-    # repeated on every message of the section, and `HomeSection.title` is an
-    # unconstrained operator-supplied string, so an over-long one would push
-    # every message of that section past the limit at once.
-    header = header[:_MAX_DIGEST_LINE]
+    # The header gets the same treatment as any other line, and for the same
+    # reason: `HomeSection.title` is an unconstrained string, so an over-long
+    # one would push every message of the section past the limit at once, a
+    # newline in it would split into two lines, and brackets in it would forge
+    # an anchor -- next to EVERY button, since the header repeats on every
+    # message. It comes from the operator's own `[[home.section]]` rather than
+    # from an app, but it is already being length-capped for exactly this class
+    # of reason; treating it as trusted for the other half would be arbitrary.
+    header = _plain(header)[:_MAX_DIGEST_LINE]
     lines = [header]
     actions: list[dict[str, Any]] = []
     for raw_line, action in entries:
