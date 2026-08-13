@@ -279,7 +279,7 @@ dev = [
 requires-dist = [
     { name = "aiosqlite", specifier = ">=0.20" },
     { name = "alembic", specifier = ">=1.16" },
-    { name = "apscheduler", specifier = ">=3.10.4,<4" },
+    { name = "apscheduler", specifier = ">=3.10.2,<4" },
     { name = "fastapi", specifier = ">=0.140.0" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "jinja2", specifier = ">=3.1.6" },

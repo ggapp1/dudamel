@@ -214,8 +214,10 @@ class Runtime:
             await asyncio.to_thread(upgrade_core, url)
             # Not gated on migrations/ alone: a project with no lane of its own
             # can still have enabled suite apps whose lanes must be applied.
-            # Skipped entirely when there is nothing to apply, so a plain
-            # project does not pay for a database backup on every start.
+            # Skipped entirely when there is nothing to apply: `upgrade_core`
+            # above already took a backup, and `upgrade_all` takes a second one
+            # of its own, so a project with no lane at all would otherwise pay
+            # for a redundant backup on every start.
             if self._suite_lanes or (project_dir / "migrations").exists():
                 await asyncio.to_thread(upgrade_all, url, project_dir, self._suite_lanes)
         else:

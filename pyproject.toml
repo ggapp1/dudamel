@@ -45,8 +45,9 @@ dependencies = [
     # rely on; below it the option is ignored and a lane whose versions path
     # contains a space, comma or colon fails to resolve.
     "alembic>=1.16",
-    # 3.10.0-3.10.1 import pkg_resources, absent from a bare 3.12+ venv.
-    "apscheduler>=3.10.4,<4",
+    # 3.10.0-3.10.1 import pkg_resources, absent from a bare 3.12+ venv; 3.10.2
+    # dropped that import and passes the suite, so the floor sits there.
+    "apscheduler>=3.10.2,<4",
     "httpx>=0.27",
     "fastapi>=0.140.0",
     "uvicorn>=0.51,<0.52",
