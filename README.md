@@ -128,7 +128,8 @@ like this under your project's `apps/` and add it to the list in
 ### Buttons: running a tool without the model
 
 Give a tool an `action=` label and it gains a second invocation path with no
-model in it — a button on the dashboard, a tap in Telegram:
+model in it — a button on the dashboard, a tap in Telegram (send `/home`,
+see below):
 
 ```python
 @app.tool(action="Done")
@@ -277,7 +278,21 @@ machine it runs on. Two ways to reach it from elsewhere:
   because dudamel's Telegram interface polls Telegram's API outward rather
   than listening for inbound connections. Set `DUDAMEL_TELEGRAM_TOKEN` and
   an allowed-user-id list in `dudamel.toml` and it works from behind any
-  NAT, on cellular, wherever.
+  NAT, on cellular, wherever. Besides ordinary chat, the bot answers one
+  command: **`/home`** sends the same homescreen the dashboard renders as a
+  plain-text digest — a message per `[[home.section]]` (split further if the
+  section outgrows one message), each card's contents as lines, and an inline
+  button under the message for every action on it, numbered so a button names
+  the line it acts on. Tapping one runs
+  that action immediately (a `confirm=True` action's label is prefixed `⚠️ `,
+  because a tap is the whole decision). The buttons belong to the message
+  they were sent with and are single-use; an already-tapped or superseded one
+  answers "That button expired — send /home again". Telegram does not offer
+  `/home` in its command menu unless you add it there yourself via BotFather.
+
+Nothing about `/home` widens who can reach the assistant: the command
+answers only the user ids already on the allow-list, and every button
+carries a one-shot token bound to the user it was issued to.
 
 Forwarding a port on your router to expose the dashboard directly to the
 public internet is not recommended — it puts the dashboard's auth layer
@@ -398,7 +413,13 @@ migrations placed under `data_dir` are ignored.
   there is no dialog to raise — marks the button's label with a `⚠️ ` prefix
   instead. Nothing on this path can be reached by prompt injection: the model
   cannot click. An app must construct a typed action explicitly; no external
-  text is ever parsed into one.
+  text is ever parsed into one. What an action *can* do is write
+  attacker-influenced text into your database without tainting anything —
+  an `external=True` tool may carry an action label, and a click is not a
+  turn, so the taint rule never comes into it. That is intended: the human
+  who clicked is the authority for that call. Judge such a tool by what it
+  writes, the same as any other mutating tool, and mark whatever reads that
+  content back `external=True`.
 - **Token budgets**: `[llm.budget] daily_tokens` in `dudamel.toml` sets a
   hard per-day ceiling per tier, enforced before each call — a runaway
   loop or a misbehaving job can't spend past it.
@@ -572,6 +593,19 @@ burst. All three must be positive; anything else is rejected at startup.
   and `mailto:`, and rejects whitespace and control characters. A widget
   returning any other url — a relative path included — now renders as an
   error card instead. See "Buttons: running a tool without the model".
+- An action label — `@app.tool(action=...)` or a list item's `label`
+  override — now has C0/C1 control characters, `U+2028`/`U+2029` and the
+  bidi overrides `U+202A`–`U+202E`/`U+2066`–`U+2069` stripped out before the
+  32-character cap is applied. A label built only from those characters is
+  now rejected as empty, and one that fit the cap only because of them is
+  now stored shorter.
+- The dashboard's markup changed in two ways that affect custom CSS or
+  anything scraping the page. `data-widget-id` now carries the qualified
+  `app.widget` id rather than the bare widget id. And `#widget-grid` is no
+  longer itself the grid: it holds one `div.grid` per section, each
+  optionally preceded by an `h2.section-title`, so cards now sit one level
+  deeper. A selector like `#widget-grid > .card` needs to become
+  `#widget-grid .card`.
 
 ## Testing your apps
 
