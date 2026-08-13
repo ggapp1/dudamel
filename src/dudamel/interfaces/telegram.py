@@ -23,8 +23,10 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.error import BadRequest
@@ -32,6 +34,7 @@ from telegram.ext import (
     Application,
     ApplicationBuilder,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
@@ -47,6 +50,60 @@ __all__ = ["TelegramInterface", "resolve_token"]
 _MAX_MESSAGE_LEN = 4096
 _STRANGER_COOLDOWN = timedelta(hours=1)
 _MAX_STRANGER_ENTRIES = 1000
+_ACTION_TOKEN_TTL = timedelta(seconds=3600)
+_MAX_ACTION_TOKENS = 512
+_MAX_ACTION_BUTTONS = 20
+_MAX_DIGEST_LINE = 256
+
+
+class _ActionTokens:
+    """Short-lived handles for homescreen action buttons.
+
+    Telegram caps callback_data at 64 bytes, so a button cannot carry its
+    tool's arguments the way a confirmation button carries an id. It carries
+    a token instead and this maps it back.
+
+    Bounded two ways on purpose: entries expire AND the map is capped by LRU
+    eviction. Age alone cannot bound it -- enough distinct buttons issued
+    inside the TTL window leaves every entry fresh, so an age filter removes
+    nothing. This is the same two-bound shape `_last_stranger_reply` uses.
+    """
+
+    def __init__(self) -> None:
+        self._entries: OrderedDict[str, tuple[str, dict[str, Any], int, datetime]] = OrderedDict()
+
+    def issue(self, tool: str, args: dict[str, Any], user_id: int) -> str:
+        token = secrets.token_urlsafe(8)
+        self._entries[token] = (tool, args, user_id, datetime.now(UTC))
+        self._entries.move_to_end(token)
+        while len(self._entries) > _MAX_ACTION_TOKENS:
+            self._entries.popitem(last=False)
+        return token
+
+    def consume(self, token: str, user_id: int) -> tuple[str, dict[str, Any]] | None:
+        """Take the entry for `token` if it belongs to `user_id` and is live.
+
+        Removal happens HERE, before the caller runs anything, so a double-tap
+        cannot execute twice: the second call finds nothing. Consuming after
+        execution instead would leave the window open for a second tap while
+        the first call is still awaiting. There is no await between the lookup
+        and the delete, so concurrent callbacks on one event loop cannot both
+        succeed.
+
+        A user mismatch deliberately does NOT consume: otherwise any
+        allow-listed user could disarm another's buttons by tapping them,
+        turning an authorization failure into a denial of service.
+        """
+        entry = self._entries.get(token)
+        if entry is None:
+            return None
+        tool, args, owner, issued_at = entry
+        if owner != user_id:
+            return None
+        del self._entries[token]
+        if datetime.now(UTC) - issued_at > _ACTION_TOKEN_TTL:
+            return None
+        return tool, args
 
 
 def resolve_token(settings: Settings) -> str | None:
@@ -79,6 +136,68 @@ def _fit_single_message(text: str, limit: int = _MAX_MESSAGE_LEN) -> str:
     return text[: limit - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
 
 
+def _card_lines(card: dict[str, Any]) -> list[str]:
+    """One card as plain-text lines, one per renderer shape."""
+    if "error" in card:
+        return [f"⚠️ {card['title']} — {card['error']}"]
+    renderer, data = card["renderer"], card["data"]
+    if renderer == "stat":
+        value = f"{data['value']}"
+        if data.get("unit"):
+            value += f" {data['unit']}"
+        if data.get("delta") is not None:
+            value += f" (Δ {data['delta']})"
+        return [f"{data['label']}: {value}"]
+    if renderer == "list":
+        lines = []
+        for item in data:
+            line = f"• {item['title']}"
+            if item.get("subtitle"):
+                line += f" — {item['subtitle']}"
+            if item.get("url"):
+                line += f" {item['url']}"
+            lines.append(line)
+        return lines or ["(empty)"]
+    if renderer == "table":
+        rows = [" | ".join(str(c) for c in data["columns"])]
+        rows += [" | ".join(str(c) for c in row) for row in data["rows"]]
+        return rows
+    return str(data).splitlines() or ["(empty)"]
+
+
+def _pack(
+    entries: list[tuple[str, dict[str, Any] | None]], header: str
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    """Group (line, action) pairs into messages, splitting at item boundaries.
+
+    An inline keyboard belongs to exactly one message and cannot be truncated
+    alongside its text, so `_fit_single_message` must never be used on a
+    keyboard-bearing digest: it would leave buttons attached to a message
+    whose corresponding lines had been cut -- a button with no visible
+    referent, which is the worst possible affordance on a destructive action.
+
+    Packing at item boundaries gives the guarantee instead: every button lands
+    in the message that also contains the line it acts on.
+    """
+    messages: list[tuple[str, list[dict[str, Any]]]] = []
+    lines = [header]
+    actions: list[dict[str, Any]] = []
+    for raw_line, action in entries:
+        line = raw_line[:_MAX_DIGEST_LINE]
+        too_long = len("\n".join([*lines, line])) > _MAX_MESSAGE_LEN
+        too_many = action is not None and len(actions) >= _MAX_ACTION_BUTTONS
+        if (too_long or too_many) and len(lines) > 1:
+            messages.append(("\n".join(lines), actions))
+            lines, actions = [header, line], ([action] if action is not None else [])
+            continue
+        lines.append(line)
+        if action is not None:
+            actions.append(action)
+    if len(lines) > 1:
+        messages.append(("\n".join(lines), actions))
+    return messages
+
+
 class TelegramInterface:
     """Wraps a PTB `Application`. Construction builds the Application and
     registers handlers (cheap, no network — network only happens in
@@ -94,7 +213,9 @@ class TelegramInterface:
         self._runtime = runtime
         self._settings = settings
         self._last_stranger_reply: OrderedDict[int, datetime] = OrderedDict()
+        self._action_tokens = _ActionTokens()
         self._app: Application = ApplicationBuilder().token(token).build()
+        self._app.add_handler(CommandHandler("home", self._on_home))
         self._app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message))
         self._app.add_handler(CallbackQueryHandler(self._on_callback))
         self._app.add_error_handler(self._on_error)
@@ -217,6 +338,52 @@ class TelegramInterface:
         else:
             await self._send_text(chat.id, reply.text)
 
+    async def _on_home(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        message = update.message
+        if message is None or message.from_user is None:
+            return
+        chat, user = message.chat, message.from_user
+        if not (self._chat_authorized(chat.type) and self._is_allowed(user.id)):
+            return
+        for section in await self._runtime.render_home():
+            entries: list[tuple[str, dict[str, Any] | None]] = []
+            for card in section.cards:
+                entries.append((f"*{card['title']}*", None))
+                lines = _card_lines(card)
+                items = card.get("data") if card["renderer"] == "list" else None
+                for index, line in enumerate(lines):
+                    action = None
+                    if items is not None and index < len(items):
+                        action = items[index].get("action")
+                    entries.append((line, action))
+                for action in card["actions"]:
+                    entries.append((f"  [{action['label']}]", action))
+            header = section.title or "Home"
+            for text, actions in _pack(entries, header):
+                await self._send_digest(chat.id, user.id, text, actions)
+
+    async def _send_digest(
+        self, chat_id: int, user_id: int, text: str, actions: list[dict[str, Any]]
+    ) -> None:
+        if not actions:
+            await self._send_text(chat_id, text)
+            return
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        action["label"],
+                        callback_data=(
+                            "act:"
+                            + self._action_tokens.issue(action["tool"], action["args"], user_id)
+                        ),
+                    )
+                ]
+                for action in actions
+            ]
+        )
+        await self._app.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+
     async def _on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
         if query is None or query.data is None:
@@ -227,6 +394,28 @@ class TelegramInterface:
         if not (self._chat_authorized(chat_type) and self._is_allowed(user.id)):
             await self._app.bot.answer_callback_query(
                 query.id, text="Not authorized.", show_alert=True
+            )
+            return
+        if query.data.startswith("act:"):
+            resolved = self._action_tokens.consume(query.data.removeprefix("act:"), user.id)
+            if resolved is None:
+                await self._app.bot.answer_callback_query(
+                    query.id, text="That button expired — send /home again.", show_alert=True
+                )
+                return
+            tool, args = resolved
+            try:
+                await self._runtime.run_action(tool, args, actor=str(user.id), source="telegram")
+            except Exception as e:
+                await self._app.bot.answer_callback_query(
+                    query.id, text=f"Failed: {e}", show_alert=True
+                )
+                return
+            # The digest is deliberately not edited: the token is spent, so
+            # its buttons cannot fire again, and editing adds failure modes
+            # (message too old, edit rejected) for something /home regenerates.
+            await self._app.bot.answer_callback_query(
+                query.id, text="Done — send /home for a fresh view."
             )
             return
         parts = query.data.split(":")

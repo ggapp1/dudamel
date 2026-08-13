@@ -6,6 +6,7 @@ instead of hitting the Bot API.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,17 @@ from telegram.error import BadRequest
 
 from dudamel import App, Orchestrator, Runtime
 from dudamel.config import Settings, TelegramConfig, TierConfig
-from dudamel.interfaces.telegram import TelegramInterface, resolve_token
+from dudamel.interfaces.telegram import (
+    _ACTION_TOKEN_TTL,
+    _MAX_ACTION_BUTTONS,
+    _MAX_ACTION_TOKENS,
+    _MAX_MESSAGE_LEN,
+    TelegramInterface,
+    _ActionTokens,
+    _card_lines,
+    _pack,
+    resolve_token,
+)
 from dudamel.llm.testing import FakeProvider, fake_text, fake_tool_call
 
 TOKEN = "123456:FAKETOKENFAKETOKENFAKETOKENFAKETOK"  # noqa: S105 — test fixture, not a real secret
@@ -172,6 +183,20 @@ def make_orc() -> Orchestrator:
         """Delete stuff."""
         return "wiped"
 
+    @app.tool(action="Done")
+    async def complete(id: int) -> str:
+        """Complete a task."""
+        return "done"
+
+    @app.tool(action="Break")
+    async def explode() -> str:
+        """Fail on purpose."""
+        raise RuntimeError("kaboom")
+
+    @app.widget(title="Tasks", renderer="list", actions=["explode"])
+    async def today() -> list[dict[str, object]]:
+        return [{"title": "Buy milk", "action": {"tool": "complete", "args": {"id": 4}}}]
+
     return Orchestrator(apps=[app])
 
 
@@ -262,6 +287,23 @@ def spy_resolve_confirmation(rt: Runtime) -> list[dict[str, Any]]:
         return await original(confirmation_id, approved=approved, user_id=user_id)
 
     rt.resolve_confirmation = wrapper  # type: ignore[method-assign]
+    return calls
+
+
+def spy_run_action(rt: Runtime) -> list[dict[str, Any]]:
+    """Record every action execution that gets past the button's token.
+
+    Same wrap-the-Runtime-method shape as `spy_chat`: the real tool still
+    runs, so the recorded calls are executions, not merely intents.
+    """
+    calls: list[dict[str, Any]] = []
+    original = rt.run_action
+
+    async def wrapper(tool_name: str, args: dict[str, Any], *, actor: str, source: str):
+        calls.append({"tool": tool_name, "args": args, "actor": actor, "source": source})
+        return await original(tool_name, args, actor=actor, source=source)
+
+    rt.run_action = wrapper  # type: ignore[method-assign]
     return calls
 
 
@@ -717,4 +759,209 @@ async def test_start_stop_use_lifecycle_api_not_run_polling(tmp_path: Path, toke
     await interface.stop()
     assert fake_app.updater.calls == ["stop"]
     assert fake_app.calls == ["initialize", "start", "stop", "shutdown"]
+    await rt.stop()
+
+
+# --- homescreen action tokens -------------------------------------------------
+
+
+def test_a_token_resolves_once() -> None:
+    tokens = _ActionTokens()
+    token = tokens.issue("complete", {"id": 4}, user_id=7)
+    assert tokens.consume(token, user_id=7) == ("complete", {"id": 4})
+    assert tokens.consume(token, user_id=7) is None
+
+
+def test_a_token_belongs_to_the_user_it_was_issued_to() -> None:
+    tokens = _ActionTokens()
+    token = tokens.issue("complete", {"id": 4}, user_id=7)
+    assert tokens.consume(token, user_id=8) is None
+    # and the rightful owner's button still works: a wrong-user tap must not
+    # disarm it, or any allow-listed user could deny service to another
+    assert tokens.consume(token, user_id=7) == ("complete", {"id": 4})
+
+
+def test_an_expired_token_does_not_resolve() -> None:
+    tokens = _ActionTokens()
+    token = tokens.issue("complete", {"id": 4}, user_id=7)
+    entry = tokens._entries[token]
+    tokens._entries[token] = (*entry[:3], entry[3] - _ACTION_TOKEN_TTL - timedelta(seconds=1))
+    assert tokens.consume(token, user_id=7) is None
+
+
+def test_the_map_is_bounded_by_lru_eviction() -> None:
+    """Age alone cannot bound the map: every entry issued inside the TTL
+    window is fresh, so an age filter removes nothing. LRU eviction caps it
+    unconditionally."""
+    tokens = _ActionTokens()
+    first = tokens.issue("complete", {"id": 0}, user_id=7)
+    for n in range(1, _MAX_ACTION_TOKENS + 1):
+        tokens.issue("complete", {"id": n}, user_id=7)
+    assert tokens.consume(first, user_id=7) is None
+    assert len(tokens._entries) == _MAX_ACTION_TOKENS
+
+
+def test_an_unknown_token_does_not_resolve() -> None:
+    assert _ActionTokens().consume("nope", user_id=7) is None
+
+
+# --- digest rendering ---------------------------------------------------------
+
+
+def test_stat_card_renders_one_line() -> None:
+    card = {
+        "qualified_id": "w.now",
+        "title": "Weather",
+        "renderer": "stat",
+        "data": {"label": "Temp", "value": 12, "unit": "C", "delta": -2.0},
+        "actions": [],
+    }
+    assert _card_lines(card) == ["Temp: 12 C (Δ -2.0)"]
+
+
+def test_error_card_renders_a_warning_line() -> None:
+    card = {
+        "qualified_id": "w.now",
+        "title": "Weather",
+        "renderer": "stat",
+        "error": "boom",
+        "actions": [],
+    }
+    assert _card_lines(card) == ["⚠️ Weather — boom"]
+
+
+def test_packing_never_separates_a_button_from_its_line() -> None:
+    """Long sections split across messages; every button must land in the
+    message that also contains the item text it acts on."""
+    entries = [(f"• item {n}", {"tool": "t", "args": {}, "label": "Go"}) for n in range(60)]
+    messages = _pack(entries, "Today")
+    assert len(messages) > 1
+    for text, actions in messages:
+        assert len(actions) <= _MAX_ACTION_BUTTONS
+        assert text.count("• item ") == len(actions)
+        assert len(text) <= _MAX_MESSAGE_LEN
+
+
+# --- /home and its buttons ------------------------------------------------------
+
+
+async def _home(interface: TelegramInterface, user_id: int = 111) -> None:
+    message = make_message("/home", from_user=make_user(id=user_id))
+    await interface._on_home(make_update(message=message), None)
+
+
+def _button_data(bot: FakeBot, label: str) -> str:
+    for sent in bot.sent:
+        keyboard = sent["reply_markup"]
+        if keyboard is None:
+            continue
+        for row in keyboard.inline_keyboard:
+            for button in row:
+                if button.text == label:
+                    return button.callback_data
+    raise AssertionError(f"no button labelled {label!r} was sent")
+
+
+def _first_button_data(bot: FakeBot) -> str:
+    return _button_data(bot, "Done")
+
+
+def _tap(data: str, *, user_id: int = 111, query_id: str = "cbq1") -> Update:
+    query = CallbackQuery(
+        id=query_id,
+        from_user=make_user(id=user_id),
+        chat_instance="ci1",
+        message=make_message(None, chat=make_chat(), from_user=make_user(id=user_id)),
+        data=data,
+    )
+    return make_update(callback_query=query, update_id=2)
+
+
+async def test_home_sends_the_digest_to_an_allowlisted_user(tmp_path: Path, token_env: str) -> None:
+    rt, interface = await build(tmp_path, [], telegram=TelegramConfig(allowed_user_ids=[111]))
+    await _home(interface)
+    bot: FakeBot = interface._app.bot
+    assert any("Buy milk" in sent["text"] for sent in bot.sent)
+    await rt.stop()
+
+
+async def test_home_from_a_stranger_sends_nothing(tmp_path: Path, token_env: str) -> None:
+    rt, interface = await build(tmp_path, [], telegram=TelegramConfig(allowed_user_ids=[999]))
+    await _home(interface)
+    assert interface._app.bot.sent == []
+    await rt.stop()
+
+
+async def test_tapping_an_action_runs_it_once_and_answers(tmp_path: Path, token_env: str) -> None:
+    rt, interface = await build(tmp_path, [], telegram=TelegramConfig(allowed_user_ids=[111]))
+    calls = spy_run_action(rt)
+    await _home(interface)
+    bot: FakeBot = interface._app.bot
+    data = _first_button_data(bot)
+
+    await interface._on_callback(_tap(data), None)
+
+    assert calls == [{"tool": "complete", "args": {"id": 4}, "actor": "111", "source": "telegram"}]
+    assert bot.answered[-1]["id"] == "cbq1"
+    await rt.stop()
+
+
+async def test_a_second_tap_does_nothing_and_reports_expiry(tmp_path: Path, token_env: str) -> None:
+    rt, interface = await build(tmp_path, [], telegram=TelegramConfig(allowed_user_ids=[111]))
+    calls = spy_run_action(rt)
+    await _home(interface)
+    bot: FakeBot = interface._app.bot
+    data = _first_button_data(bot)
+
+    await interface._on_callback(_tap(data), None)
+    await interface._on_callback(_tap(data, query_id="cbq2"), None)
+
+    assert len(calls) == 1  # the second tap never reached the tool
+    assert "expired" in bot.answered[-1]["text"]
+    await rt.stop()
+
+
+async def test_concurrent_taps_on_one_token_execute_once(tmp_path: Path, token_env: str) -> None:
+    """The token is consumed before the tool runs, so two callbacks racing on
+    one event loop cannot both get past the lookup."""
+    rt, interface = await build(tmp_path, [], telegram=TelegramConfig(allowed_user_ids=[111]))
+    calls = spy_run_action(rt)
+    await _home(interface)
+    data = _first_button_data(interface._app.bot)
+
+    await asyncio.gather(
+        interface._on_callback(_tap(data, query_id="a"), None),
+        interface._on_callback(_tap(data, query_id="b"), None),
+    )
+
+    assert len(calls) == 1
+    await rt.stop()
+
+
+async def test_another_users_tap_neither_runs_nor_disarms(tmp_path: Path, token_env: str) -> None:
+    rt, interface = await build(tmp_path, [], telegram=TelegramConfig(allowed_user_ids=[111, 222]))
+    calls = spy_run_action(rt)
+    await _home(interface, user_id=111)
+    data = _first_button_data(interface._app.bot)
+
+    await interface._on_callback(_tap(data, user_id=222, query_id="other"), None)
+    assert calls == []
+
+    await interface._on_callback(_tap(data, user_id=111, query_id="owner"), None)
+    assert [call["actor"] for call in calls] == ["111"]
+    await rt.stop()
+
+
+async def test_a_failing_action_is_reported_on_the_callback(tmp_path: Path, token_env: str) -> None:
+    """A tool that raises must surface as an answered callback, not as an
+    exception escaping the handler."""
+    rt, interface = await build(tmp_path, [], telegram=TelegramConfig(allowed_user_ids=[111]))
+    await _home(interface)
+    bot: FakeBot = interface._app.bot
+    data = _button_data(bot, "Break")
+
+    await interface._on_callback(_tap(data, query_id="cbq9"), None)
+
+    assert bot.answered[-1]["id"] == "cbq9"
+    assert "kaboom" in bot.answered[-1]["text"]
     await rt.stop()
