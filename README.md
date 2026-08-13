@@ -168,8 +168,15 @@ async def recent() -> str: ...
 ```
 
 Either form may only name an action-labelled tool of the widget's **own**
-app; anything else is a registration error raised at startup, not something
-that renders and fails on click.
+app, but the two are checked at different moments, because only one of them
+is known before the widget runs. A card-level `actions=[...]` entry that
+names an unknown tool, an unlabelled one, another app's, or one with a
+required parameter is a **registration error at startup** — the assistant
+refuses to start. A per-item action is data the widget returns, so it can
+only be judged when the widget runs: one naming an unknown, unlabelled or
+other-app tool, or whose `args` don't coerce against that tool's schema,
+degrades the widget to an **error card** — the whole card, its data
+included, not just the offending button.
 
 Two rules about widget payloads tightened alongside this. A list item's `url`
 now accepts only `http://`, `https://` and `mailto:`, and rejects whitespace
@@ -561,6 +568,10 @@ burst. All three must be positive; anything else is rejected at startup.
   Previously this annotation was ignored. If you rely on such a tool
   running without a confirmation step, register it explicitly or adjust
   the server's annotations.
+- A `list` widget item's `url` is now restricted to `http://`, `https://`
+  and `mailto:`, and rejects whitespace and control characters. A widget
+  returning any other url — a relative path included — now renders as an
+  error card instead. See "Buttons: running a tool without the model".
 
 ## Testing your apps
 

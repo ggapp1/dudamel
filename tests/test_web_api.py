@@ -55,7 +55,7 @@ def make_orc() -> Orchestrator:
     @app.tool(action="Refuse")
     async def refuse(id: int) -> str:
         """Fails the way ordinary Python app code fails."""
-        raise ValueError("task 7 does not exist")
+        raise ValueError("note 7 does not exist")
 
     @app.tool(action="Ransack")
     async def ransack(id: int) -> str:
@@ -754,7 +754,7 @@ async def test_a_tool_raising_valueerror_is_502_while_bad_arguments_stay_400(
 
         raised = await c.post("/api/action/refuse", json={"args": {"id": 7}}, headers=headers)
         assert raised.status_code == 502
-        assert raised.json()["detail"] == "task 7 does not exist"
+        assert raised.json()["detail"] == "note 7 does not exist"
     await rt.stop()
 
 

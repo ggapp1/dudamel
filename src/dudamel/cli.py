@@ -40,6 +40,7 @@ from sqlalchemy import create_engine, text
 from dudamel import apps as suite
 from dudamel.apps import missing_requirements
 from dudamel.config import Settings, TierConfig
+from dudamel.contract.renderers import ACTION_LABEL_MAX
 from dudamel.exceptions import DudamelError
 from dudamel.interfaces.telegram import resolve_token as resolve_telegram_token
 from dudamel.llm.probe import probe_tool_calling
@@ -513,13 +514,18 @@ def _render_tool_table(orchestrator: Orchestrator) -> str:
     tools = sorted(orchestrator.registry.tools.values(), key=lambda t: t.name)
     if not tools:
         return "no tools registered"
+    # `action` is `ACTION_LABEL_MAX` + 2, so an at-cap label cannot push
+    # `origin` out of alignment -- the contract caps the label, and a column
+    # narrower than the cap would misalign exactly the rows this column was
+    # added to show.
     header = (
-        f"{'name':<28}{'read_only':<12}{'confirm':<10}{'external':<10}{'action':<12}{'origin':<8}"
+        f"{'name':<28}{'read_only':<12}{'confirm':<10}{'external':<10}"
+        f"{'action':<{ACTION_LABEL_MAX + 2}}{'origin':<8}"
     )
     rows = [header, "-" * len(header)]
     rows.extend(
         f"{t.name:<28}{str(t.read_only):<12}{str(t.confirm):<10}{str(t.external):<10}"
-        f"{(t.action or '-'):<12}{t.origin:<8}"
+        f"{(t.action or '-'):<{ACTION_LABEL_MAX + 2}}{t.origin:<8}"
         for t in tools
     )
     return "\n".join(rows)
@@ -623,6 +629,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print("\n".join(lines))
     print()
 
+    configured = [wid for section in settings.home.section for wid in section.widgets]
+
     if import_error is not None:
         print(_line(False, f"app import ({_DEFAULT_MODULE})", import_error))
     else:
@@ -662,27 +670,39 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 "safety flags visible then"
             )
 
-    # Homescreen layout. Both conditions degrade silently at render time (an
-    # unknown id is skipped, a repeat renders once at its first mention), which
-    # is the right runtime behaviour and exactly why they need a voice here:
-    # otherwise a typo in `[[home.section]]` is indistinguishable from a widget
-    # that never ran. Reported, never fatal -- doctor's exit code says nothing
-    # about a layout, the same as every other ✗ line it prints.
-    configured = [wid for section in settings.home.section for wid in section.widgets]
-    # Read off the RESOLVED apps, for the same reason the tool table above is:
-    # a suite app enabled purely in dudamel.toml is in `resolution.apps` and
-    # not in the project's own registry, and judging its widget ids against the
-    # latter would call every one of them dead. Read from each app directly
-    # rather than through a reconstructed Registry, which can raise on a
-    # cross-app collision the table above already reports.
-    registered = {w.qualified_id for app in resolution.apps for w in app.widgets.values()}
-    for wid in configured:
-        if wid not in registered:
-            print(_line(False, "home layout", f"{wid} is not a registered widget"))
+        # Homescreen layout, first half. Both layout conditions degrade
+        # silently at render time (an unknown id is skipped, a repeat renders
+        # once at its first mention), which is the right runtime behaviour and
+        # exactly why they need a voice here: otherwise a typo in
+        # `[[home.section]]` is indistinguishable from a widget that never ran.
+        # Reported, never fatal -- doctor's exit code says nothing about a
+        # layout, the same as every other ✗ line it prints.
+        #
+        # Inside the `else`, and for the same reason the tool table is: with no
+        # importable assistant there are no resolved apps, so EVERY configured
+        # id would be called dead. The operator would then go edit dudamel.toml
+        # chasing a problem that does not exist, in precisely the situation
+        # doctor exists to disambiguate. The import line above is the finding.
+        #
+        # Judged against the RESOLVED apps, not the project's own registry:
+        # `resolution.apps` is the exact set the dashboard renders from, so it
+        # is right in both directions -- a suite app enabled purely in
+        # dudamel.toml is resolved but not in the registry (its ids are live),
+        # and a local app switched off with `enabled = false` is in the
+        # registry but not resolved (its ids are dead). Read from each app
+        # directly rather than through a reconstructed Registry, which can
+        # raise on a cross-app collision the table above already reports.
+        registered = {w.qualified_id for app in resolution.apps for w in app.widgets.values()}
+        for wid in configured:
+            if wid not in registered:
+                print(_line(False, "home layout", f"{wid} is not a registered widget"))
+
+    # Second half, unguarded: this one reads config against itself and needs no
+    # registry at all, so a broken assistant.py does not make it unanswerable.
     seen: set[str] = set()
     for wid in configured:
         if wid in seen:
-            print(_line(False, "home layout", f"{wid} is listed in more than one section"))
+            print(_line(False, "home layout", f"{wid} is listed more than once"))
         seen.add(wid)
     return 0
 
