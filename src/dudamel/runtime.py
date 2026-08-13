@@ -373,6 +373,8 @@ class Runtime:
                 "tool": r.tool,
                 "args": r.args,
                 "status": r.status,
+                "actor": r.actor,
+                "source": r.source,
                 "result_preview": r.result_preview,
                 "created_at": r.created_at,
             }
