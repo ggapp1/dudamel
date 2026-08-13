@@ -105,18 +105,29 @@ class App:
         *,
         read_only: bool = False,
         confirm: bool = False,
+        external: bool = False,
         timeout: float = 30.0,
     ) -> Callable:
         if fn is not None:  # bare @app.tool
-            return self._register_tool(fn, read_only=read_only, confirm=confirm, timeout=timeout)
+            return self._register_tool(
+                fn, read_only=read_only, confirm=confirm, external=external, timeout=timeout
+            )
 
         def wrap(f: Callable) -> Callable:
-            return self._register_tool(f, read_only=read_only, confirm=confirm, timeout=timeout)
+            return self._register_tool(
+                f, read_only=read_only, confirm=confirm, external=external, timeout=timeout
+            )
 
         return wrap
 
     def _register_tool(
-        self, fn: Callable, *, read_only: bool, confirm: bool, timeout: float
+        self,
+        fn: Callable,
+        *,
+        read_only: bool,
+        confirm: bool,
+        timeout: float,
+        external: bool = False,
     ) -> Callable:
         name = fn.__name__
         if not inspect.iscoroutinefunction(fn):
@@ -144,6 +155,7 @@ class App:
             schema=schema,
             read_only=read_only,
             confirm=confirm,
+            external=external,
             timeout=timeout,
         )
         return fn
