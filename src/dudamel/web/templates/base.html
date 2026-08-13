@@ -60,6 +60,18 @@
     .chat-input { display: flex; gap: .5rem; margin-top: 1rem; }
     .chat-input input[type=text] { flex: 1; padding: .4rem; }
     button { cursor: pointer; }
+    .sr-only {
+      position: absolute; width: 1px; height: 1px;
+      padding: 0; margin: -1px; overflow: hidden;
+      clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+    }
+    .section-title {
+      font-size: 1rem; text-transform: uppercase; letter-spacing: .06em;
+      opacity: .6; margin: 1.5rem 0 .75rem;
+    }
+    .card-actions { margin-top: .75rem; display: flex; gap: .5rem; flex-wrap: wrap; }
+    button.action { font-size: .8rem; padding: .2rem .5rem; }
+    button.action[disabled] { opacity: .5; cursor: progress; }
   </style>
 </head>
 <body>

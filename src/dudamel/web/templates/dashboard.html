@@ -1,55 +1,120 @@
 {% extends "base.html" %}
 {% block title %}dudamel — dashboard{% endblock %}
 {% block content %}
+{% macro action_button(action) %}
+<button type="button" class="action"
+        data-tool="{{ action.tool }}"
+        {# Single-quoted deliberately: `| tojson` escapes <, >, & and ' (not "),
+           so the JSON's own double quotes must not be the attribute delimiter. #}
+        data-args='{{ action.args | tojson }}'
+        data-label="{{ action.label }}"
+        {% if action.confirm %}data-confirm="1"{% endif %}
+        onclick="runAction(this)">{{ action.label }}</button>
+{% endmacro %}
 <h1>Dashboard</h1>
 <input type="hidden" id="csrf-token" value="{{ csrf_token }}">
-<div id="widget-grid" class="grid"
-     hx-get="/" hx-trigger="every 30s" hx-select="#widget-grid" hx-swap="outerHTML">
-  {% for widget in widgets %}
-    {% if 'error' in widget %}
-      <div class="card error" data-widget-id="{{ widget.id }}">
-        <h3>{{ widget.title }}</h3>
-        <p>Widget failed: {{ widget.error }}</p>
-      </div>
-    {% elif widget.renderer == 'stat' %}
-      <div class="card" data-widget-id="{{ widget.id }}">
-        <h3>{{ widget.title }}</h3>
-        <div class="stat-value">{{ widget.data.value }}{% if widget.data.unit %} {{ widget.data.unit }}{% endif %}</div>
-        {% if widget.data.delta is not none %}<div class="stat-delta">Δ {{ widget.data.delta }}</div>{% endif %}
-      </div>
-    {% elif widget.renderer == 'table' %}
-      <div class="card" data-widget-id="{{ widget.id }}">
-        <h3>{{ widget.title }}</h3>
-        <table>
-          <thead><tr>{% for c in widget.data.columns %}<th>{{ c }}</th>{% endfor %}</tr></thead>
-          <tbody>
-            {% for row in widget.data.rows %}
-              <tr>{% for cell in row %}<td>{{ cell }}</td>{% endfor %}</tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-    {% elif widget.renderer == 'list' %}
-      <div class="card" data-widget-id="{{ widget.id }}">
-        <h3>{{ widget.title }}</h3>
-        <ul>
-          {% for item in widget.data %}
-            <li>
-              {% if item.url %}<a href="{{ item.url }}">{{ item.title }}</a>{% else %}{{ item.title }}{% endif %}
-              {% if item.subtitle %} — {{ item.subtitle }}{% endif %}
-            </li>
-          {% endfor %}
-        </ul>
-      </div>
-    {% elif widget.renderer == 'markdown' %}
-      <div class="card" data-widget-id="{{ widget.id }}">
-        <h3>{{ widget.title }}</h3>
-        <!-- v1: pre-escaped plain text, no markdown parsing (see ui.py docstring) -->
-        <pre class="markdown">{{ widget.data }}</pre>
-      </div>
-    {% endif %}
+<div id="action-status" role="status" aria-live="polite" class="sr-only"></div>
+<div id="widget-grid"
+     hx-get="/" hx-trigger="every 30s, refresh" hx-select="#widget-grid" hx-swap="outerHTML">
+  {% for section in sections %}
+    {% if section.title %}<h2 class="section-title">{{ section.title }}</h2>{% endif %}
+    <div class="grid">
+      {% for widget in section.cards %}
+        <div class="card{% if 'error' in widget %} error{% endif %}"
+             data-widget-id="{{ widget.qualified_id }}">
+          <h3>{{ widget.title }}</h3>
+          {% if 'error' in widget %}
+            <p>Widget failed: {{ widget.error }}</p>
+          {% elif widget.renderer == 'stat' %}
+            <div class="stat-value">{{ widget.data.value }}{% if widget.data.unit %} {{ widget.data.unit }}{% endif %}</div>
+            {% if widget.data.delta is not none %}<div class="stat-delta">Δ {{ widget.data.delta }}</div>{% endif %}
+          {% elif widget.renderer == 'table' %}
+            <table>
+              <thead><tr>{% for c in widget.data.columns %}<th>{{ c }}</th>{% endfor %}</tr></thead>
+              <tbody>
+                {% for row in widget.data.rows %}
+                  <tr>{% for cell in row %}<td>{{ cell }}</td>{% endfor %}</tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          {% elif widget.renderer == 'list' %}
+            <ul>
+              {% for item in widget.data %}
+                <li>
+                  {% if item.url %}<a href="{{ item.url }}">{{ item.title }}</a>{% else %}{{ item.title }}{% endif %}
+                  {% if item.subtitle %} — {{ item.subtitle }}{% endif %}
+                  {% if item.action %}{{ action_button(item.action) }}{% endif %}
+                </li>
+              {% endfor %}
+            </ul>
+          {% elif widget.renderer == 'markdown' %}
+            <!-- v1: pre-escaped plain text, no markdown parsing (see ui.py docstring) -->
+            <pre class="markdown">{{ widget.data }}</pre>
+          {% endif %}
+          {% if widget.actions %}
+            <div class="card-actions">
+              {% for action in widget.actions %}{{ action_button(action) }}{% endfor %}
+            </div>
+          {% endif %}
+        </div>
+      {% endfor %}
+    </div>
   {% else %}
     <p>No widgets registered.</p>
   {% endfor %}
 </div>
+
+<script>
+  let inFlight = 0;
+
+  function csrfToken() {
+    return document.getElementById('csrf-token').value;
+  }
+
+  function announce(message) {
+    document.getElementById('action-status').textContent = message;
+  }
+
+  // Suspend the polling refresh while an action is running. Without this the
+  // poll can swap #widget-grid mid-request, destroying the disabled button
+  // and leaving a re-enabled one over stale data — which is exactly the state
+  // that invites a duplicate click.
+  document.body.addEventListener('htmx:beforeRequest', function (event) {
+    if (inFlight > 0 && event.detail.elt.id === 'widget-grid') {
+      event.preventDefault();
+    }
+  });
+
+  async function runAction(button) {
+    const label = button.dataset.label;
+    if (button.dataset.confirm && !window.confirm('Run "' + label + '"?')) return;
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+    inFlight += 1;
+    announce(label + ': running');
+    try {
+      const response = await fetch('/api/action/' + encodeURIComponent(button.dataset.tool), {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', 'x-csrf-token': csrfToken()},
+        body: JSON.stringify({args: JSON.parse(button.dataset.args)}),
+      });
+      if (!response.ok) {
+        announce(label + ' failed: ' + (await response.text()));
+        button.disabled = false;
+        button.removeAttribute('aria-busy');
+        inFlight -= 1;
+        return;
+      }
+      announce(label + ': done');
+      inFlight -= 1;
+      htmx.trigger('#widget-grid', 'refresh');
+      return;
+    } catch (error) {
+      announce(label + ' failed: ' + error);
+      button.disabled = false;
+      button.removeAttribute('aria-busy');
+    }
+    inFlight -= 1;
+  }
+</script>
 {% endblock %}

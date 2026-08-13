@@ -28,6 +28,7 @@ from dudamel.exceptions import (
     ToolValidationError,
     UnknownActionError,
 )
+from dudamel.home import ComposedSection, compose_home
 from dudamel.llm.anthropic import AnthropicProvider
 from dudamel.llm.client import LLMClient, Tier
 from dudamel.llm.openai_compat import OpenAICompatProvider
@@ -359,6 +360,12 @@ class Runtime:
                 )
             )
         )
+
+    async def render_home(self) -> list[ComposedSection]:
+        """Every widget's card, grouped and ordered by `[[home.section]]`.
+
+        The single composition both the dashboard and Telegram render from."""
+        return compose_home(await self.render_widgets(), self._settings.home.section)
 
     async def _log_action_error(
         self, tool_name: str, args: dict[str, Any], detail: str, *, actor: str, source: str
