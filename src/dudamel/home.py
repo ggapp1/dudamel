@@ -31,15 +31,24 @@ def compose_home(cards: list[dict[str, Any]], sections: list[HomeSection]) -> li
     - No sections at all yields one untitled section in registration order --
       precisely the behaviour that predates layout config.
 
-    A widget named in two sections renders in the first. A section that
-    resolves to no cards is omitted rather than rendered empty.
+    A widget named twice renders once, at its first mention -- whether the
+    two mentions are in different sections or in the same one. A card is a
+    live control surface, so a duplicate is not merely untidy: it is two
+    buttons firing the same mutation from two places that then disagree about
+    what they show. A section that resolves to no cards is omitted rather
+    than rendered empty.
     """
     by_id = {card["qualified_id"]: card for card in cards}
     composed: list[ComposedSection] = []
     placed: set[str] = set()
     for section in sections:
-        chosen = [by_id[wid] for wid in section.widgets if wid in by_id and wid not in placed]
-        placed.update(card["qualified_id"] for card in chosen)
+        chosen = []
+        for wid in section.widgets:
+            # `placed` is updated inside the loop, not after it, so a repeat
+            # within this same section is caught as well as one across sections.
+            if wid in by_id and wid not in placed:
+                placed.add(wid)
+                chosen.append(by_id[wid])
         if chosen:
             composed.append(ComposedSection(title=section.title, cards=chosen))
     remaining = [card for card in cards if card["qualified_id"] not in placed]

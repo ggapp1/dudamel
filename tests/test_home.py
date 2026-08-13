@@ -62,6 +62,17 @@ def test_a_widget_named_twice_renders_in_the_first_section_only() -> None:
     assert [s.title for s in composed] == ["Today"]
 
 
+def test_a_widget_named_twice_in_one_section_renders_once() -> None:
+    """A duplicated card is two live buttons for the same mutation, so a repeat
+    within a single section collapses exactly as a cross-section one does."""
+    composed = compose_home(
+        [_card("tasks.today"), _card("notes.recent")],
+        [HomeSection(title="Today", widgets=["tasks.today", "notes.recent", "tasks.today"])],
+    )
+    assert len(composed) == 1
+    assert [c["qualified_id"] for c in composed[0].cards] == ["tasks.today", "notes.recent"]
+
+
 def test_a_section_that_resolves_to_nothing_is_omitted() -> None:
     composed = compose_home([_card("tasks.today")], [HomeSection(title="Empty", widgets=["x.y"])])
     assert [s.title for s in composed] == [None]
