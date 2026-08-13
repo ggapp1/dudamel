@@ -347,6 +347,25 @@ def suite_lane_pending(db_url: str, app_name: str, versions_dir: Path) -> bool:
     return current_heads(db_url, suite_version_table(app_name)) != lane_scripts
 
 
+def project_lane_pending(db_url: str, project_dir: Path) -> bool:
+    """Whether the project's own lane has revisions the database has not
+    applied. The other half of `pending_migrations`, exposed for the same
+    reason as `suite_lane_pending`: `dudamel apps list`'s lane column must not
+    hold a second, drifting copy of the comparison. A project that has never
+    generated a revision has no migrations/ at all and is never pending.
+    """
+    migrations_dir = project_dir / "migrations"
+    if not migrations_dir.exists():
+        return False
+    app_scripts = script_heads(str(migrations_dir))
+    if not app_scripts:
+        return False
+    # Version table matches migrations_app_template/env.py's
+    # context.configure(version_table="alembic_version_apps"), the same table
+    # upgrade_apps() writes to via _app_config -> command.upgrade.
+    return current_heads(db_url, "alembic_version_apps") != app_scripts
+
+
 def pending_migrations(
     db_url: str,
     project_dir: Path,
@@ -370,13 +389,7 @@ def pending_migrations(
         if suite_lane_pending(db_url, app_name, versions_dir):
             pending.append(f"app {app_name!r} schema is behind head")
 
-    migrations_dir = project_dir / "migrations"
-    if migrations_dir.exists():
-        app_scripts = script_heads(str(migrations_dir))
-        # Version table matches migrations_app_template/env.py's
-        # context.configure(version_table="alembic_version_apps"), the same
-        # table upgrade_apps() writes to via _app_config -> command.upgrade.
-        if app_scripts and current_heads(db_url, "alembic_version_apps") != app_scripts:
-            pending.append("app schema is behind head")
+    if project_lane_pending(db_url, project_dir):
+        pending.append("app schema is behind head")
 
     return pending

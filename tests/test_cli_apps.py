@@ -242,10 +242,51 @@ def test_apps_list_includes_local_apps(
     assert "local" in row
     assert "my own app" in row
     assert "enabled" in row
-    # A local app has no lane of its own -- it lives in the project's shared
-    # migrations/ lane, which is not the same claim as "never consulted".
-    assert "project" in row
+    # The lane column is a status for every row, local ones included; with no
+    # database on disk yet that status is "no db", never a bare dash (which
+    # means "not consulted").
+    assert "no db" in row
     assert "—" not in row
+
+
+def test_apps_list_reports_the_shared_lane_for_local_apps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A local app's tables live in the project's shared migrations/ lane, so
+    its lane column is that lane's state -- the same status vocabulary the
+    suite rows use, from the same comparison the startup gate makes."""
+    register(monkeypatch)
+    project = write_project(
+        tmp_path,
+        "",
+        assistant="""
+        from dudamel import App, Orchestrator
+
+        mine = App("mine", description="my own app")
+        off = App("off", description="switched off")
+
+        orchestrator = Orchestrator(apps=[mine, off])
+        """,
+    )
+    (project / "dudamel.toml").write_text("[apps.off]\nenabled = false\n")
+    url = db_url_for(project)
+    upgrade_core(url)
+    ensure_app_migrations(project)
+    (project / "migrations" / "versions" / "a1.py").write_text(PROJECT_REV)
+    monkeypatch.chdir(project)
+
+    assert main(["apps", "list"]) == 0
+    rows = {line.split()[0]: line for line in capsys.readouterr().out.splitlines()[2:]}
+    assert "pending" in rows["mine"]
+    # Switched off: nothing was consulted on its behalf, so no status is
+    # claimed for it either.
+    assert "disabled" in rows["off"]
+    assert "—" in rows["off"]
+
+    upgrade_apps(url, project)
+    assert main(["apps", "list"]) == 0
+    rows = {line.split()[0]: line for line in capsys.readouterr().out.splitlines()[2:]}
+    assert "at head" in rows["mine"]
 
 
 def test_apps_list_survives_a_missing_project_module(
@@ -352,6 +393,42 @@ def test_doctor_reads_the_project_lane_from_settings_project_dir(
     assert "✓ pending migrations" in capsys.readouterr().out
 
 
+def test_db_migrate_writes_the_lane_doctor_asks_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The remedy doctor prints has to be one that satisfies it. With an
+    explicit `project_dir`, `db migrate` must create the lane where doctor and
+    the startup gate read it -- otherwise the operator loops forever on a
+    command that cannot close the check it was told to close."""
+    register(monkeypatch)
+    project = write_project(
+        tmp_path,
+        'project_dir = "sub"\n',
+        assistant="""
+        from dudamel import App, Orchestrator
+
+        blog = App("blog", description="d")
+
+        orchestrator = Orchestrator(apps=[blog])
+        """,
+    )
+    (project / "sub").mkdir()
+    monkeypatch.chdir(project)
+
+    assert main(["doctor"]) == 0
+    assert "✗ app migrations dir: migrations/ not found" in capsys.readouterr().out
+
+    assert main(["db", "migrate", "-m", "init"]) == 0
+    capsys.readouterr()
+    assert (project / "sub" / "migrations").exists()
+    assert not (project / "migrations").exists()
+
+    assert main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "✓ app migrations dir: present" in out
+    assert "✓ pending migrations" in out
+
+
 def test_doctor_tool_table_covers_apps_enabled_only_in_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -366,6 +443,41 @@ def test_doctor_tool_table_covers_apps_enabled_only_in_config(
     out = capsys.readouterr().out
     assert "app resolution: 1 enabled" in out
     assert "read_papers" in out
+
+
+def test_doctor_reports_a_cross_app_tool_collision_instead_of_dying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Two apps declaring the same tool name each resolve cleanly -- the guard
+    lives in Registry, which only sees them together. `dudamel run` refuses
+    such a project, which is exactly when an operator reaches for doctor, so
+    the collision has to be a reported line and not the end of the report."""
+    install_papers(tmp_path, monkeypatch, revision=False)
+    project = write_project(
+        tmp_path,
+        "[apps.papers]\nenabled = true\n",
+        assistant="""
+        from dudamel import App, Orchestrator
+
+        blog = App("blog", description="d")
+
+
+        @blog.tool
+        async def read_papers() -> str:
+            \"\"\"Collides with the suite app's tool.\"\"\"
+            return "no"
+
+
+        orchestrator = Orchestrator(apps=[blog])
+        """,
+    )
+    monkeypatch.chdir(project)
+    assert main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "app resolution: 2 enabled" in out
+    assert "✗ tool table" in out
+    assert "read_papers" in out
+    assert "cookie_secure" in out  # the rest of the report still printed
 
 
 def test_doctor_does_not_create_a_missing_sqlite_file(

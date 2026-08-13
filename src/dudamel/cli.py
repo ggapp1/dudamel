@@ -27,7 +27,8 @@ import secrets
 import shutil
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from functools import partial
 from importlib.resources import files
 from pathlib import Path
 from types import ModuleType
@@ -48,6 +49,7 @@ from dudamel.migrate import (
     ensure_app_migrations,
     generate_app_migration,
     pending_migrations,
+    project_lane_pending,
     script_heads,
     suite_lane_pending,
     sync_url,
@@ -260,10 +262,17 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_db_migrate(args: argparse.Namespace) -> int:
-    project_dir = Path.cwd()
-    settings = Settings.load(project_dir)
-    orchestrator = _load_orchestrator(project_dir, _DEFAULT_MODULE)
+    cwd = Path.cwd()
+    settings = Settings.load(cwd)
+    orchestrator = _load_orchestrator(cwd, _DEFAULT_MODULE)
     resolution = resolve_apps(orchestrator, settings, strict=True)
+    # The lane lives under `settings.project_dir` -- the cwd unless dudamel.toml
+    # says otherwise. `assistant.py` is still imported from the cwd (that is
+    # where the operator ran the command), but the migration lane has to be the
+    # one the startup gate and `doctor` read, or this command writes revisions
+    # into a directory nothing else ever looks at and its own remedy line
+    # ("run `dudamel db migrate -m init`") can never be satisfied.
+    project_dir = settings.project_dir
     # Apply core migrations first to ensure schema is ready for app autogenerate
     upgrade_core(settings.database_url)
     # LOCAL apps only. A suite app's revisions ship in the wheel, so its tables
@@ -597,7 +606,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         # safety flags. `mcp` is carried over because it belongs to the
         # project's orchestrator, not to any app -- same reconstruction
         # `cmd_run` hands to `serve`.
-        print(_render_tool_table(Orchestrator(apps=resolution.apps, mcp=orchestrator.mcp)))
+        #
+        # Guarded, because that reconstruction is also the FIRST place the
+        # cross-app collision guards in `Registry.__init__` run: `resolve_apps`
+        # validates each app alone, so two apps that each declare the same tool
+        # name resolve cleanly and collide only here. That is a configuration
+        # `dudamel run` also refuses -- precisely when an operator reaches for
+        # doctor -- so it has to be a reported line, not the end of the report.
+        try:
+            table = _render_tool_table(Orchestrator(apps=resolution.apps, mcp=orchestrator.mcp))
+        except Exception as e:
+            table = _line(False, "tool table", str(e))
+        print(table)
         # `doctor` never starts the orchestrator, so MCP-mounted tools (only
         # discovered by actually connecting to each server -- see
         # mcp_mount.py) aren't in the table above yet; this makes that gap
@@ -613,17 +633,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 # --- apps list ---------------------------------------------------------------
 
-# The lane column for a row whose lane was never consulted: a disabled,
-# uninstallable or errored app is described from registry metadata alone --
-# never imported, never compared against the database -- so anything other than
-# a dash would be a claim the command did not check.
+# The lane column holds ONE kind of thing: the migration state of the lane that
+# app's tables live in. It is filled in only for apps that actually resolved --
+# a disabled, uninstallable or errored app is not going to run, is described
+# from registry metadata alone (a suite app is never even imported), and its
+# lane is never compared against the database, so a status there would be a
+# claim the command did not check. Those rows get this dash instead.
 _NO_LANE = "—"
-
-# A local app has no lane of its own; its tables live in the project's shared
-# migrations/ lane, which `doctor` reports as one line. Distinct from _NO_LANE,
-# which means "not consulted" -- the same glyph for both would say the wrong
-# thing about one of them.
-_PROJECT_LANE = "project"
 
 _APPS_LIST_HEADERS = ("name", "origin", "state", "lane", "notes")
 
@@ -637,18 +653,21 @@ def _app_state(name: str, *, enabled: bool, resolved: set[str], errored: set[str
     return "disabled" if not enabled else "error"
 
 
-def _lane_status(db_url: str, app_name: str, versions_dir: Path) -> str:
-    """One suite lane's migration state as a column value.
+def _lane_status(db_url: str, is_pending: Callable[[], bool]) -> str:
+    """One lane's migration state as a column value.
 
-    Never raises and never connects to a database that does not exist yet:
-    `apps list` describes a configuration, so an unreadable lane is a value in
-    the table, not a failed command.
+    `is_pending` is the same comparison the startup gate makes, per lane
+    (`migrate.suite_lane_pending` for a suite app, `migrate.project_lane_pending`
+    for the shared lane every local app's tables live in). Never raises and
+    never connects to a database that does not exist yet: `apps list` describes
+    a configuration, so an unreadable lane is a value in the table, not a failed
+    command.
     """
     path = _sqlite_file_path(db_url)
     if path is not None and not path.exists():
         return "no db"
     try:
-        return "pending" if suite_lane_pending(db_url, app_name, versions_dir) else "at head"
+        return "pending" if is_pending() else "at head"
     except Exception:
         return "unknown"
 
@@ -694,12 +713,21 @@ def cmd_apps_list(args: argparse.Namespace) -> int:
                     resolved=resolved,
                     errored=errored,
                 ),
-                _lane_status(settings.database_url, name, lanes[name])
+                _lane_status(
+                    settings.database_url,
+                    partial(suite_lane_pending, settings.database_url, name, lanes[name]),
+                )
                 if name in lanes
                 else _NO_LANE,
                 note,
             )
         )
+    # One shared lane for every local app -- `migrations/` under project_dir --
+    # so its state is read once and repeated per row rather than per app.
+    project_lane = _lane_status(
+        settings.database_url,
+        partial(project_lane_pending, settings.database_url, settings.project_dir),
+    )
     for name, app in sorted(orchestrator.registry.apps.items()):
         if name in suite_apps:
             continue  # the name collision is reported as an error below
@@ -707,7 +735,8 @@ def cmd_apps_list(args: argparse.Namespace) -> int:
         # is registered in Python, so it runs unless config switches it off.
         enabled = bool(settings.apps.get(name, {}).get("enabled", True))
         state = _app_state(name, enabled=enabled, resolved=resolved, errored=errored)
-        rows.append((name, "local", state, _PROJECT_LANE, app.description))
+        lane = project_lane if name in resolved else _NO_LANE
+        rows.append((name, "local", state, lane, app.description))
 
     if rows:
         print(_render_apps_table(rows))
