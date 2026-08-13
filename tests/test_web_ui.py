@@ -262,3 +262,32 @@ def test_add_ui_without_create_api_raises(tmp_path: Path) -> None:
     rt = Runtime(orc, settings, providers={"standard": FakeProvider([])})
     with pytest.raises(RuntimeError, match="create_api"):
         add_ui(FastAPI(), rt, settings)
+
+
+# --- dashboard: embedded CSRF token for card actions -------------------------
+
+
+async def test_dashboard_embedded_csrf_token_actually_works(tmp_path: Path, token_env: str) -> None:
+    """The dashboard's card buttons POST to /api/action/{tool} from the
+    browser under the session cookie, so the page has to ship a genuine,
+    currently-valid CSRF token — the same hidden field the chat page uses."""
+    rt, _settings, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        await login(c, token_env)
+        resp = await c.get("/")
+        assert resp.status_code == 200
+        match = re.search(r'id="csrf-token" value="([^"]+)"', resp.text)
+        assert match, "dashboard must embed a #csrf-token hidden field"
+
+        no_csrf = await c.post("/api/action/log_workout", json={"args": {"exercise": "squat"}})
+        assert no_csrf.status_code == 403
+
+        # log_workout carries no action label, so the token gets it past the
+        # CSRF gate and no further -- which is what proves the token is real.
+        with_csrf = await c.post(
+            "/api/action/log_workout",
+            json={"args": {"exercise": "squat"}},
+            headers={"x-csrf-token": match.group(1)},
+        )
+        assert with_csrf.status_code == 404
+    await rt.stop()

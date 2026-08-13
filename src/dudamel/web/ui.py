@@ -14,9 +14,10 @@ own session store or duplicates login logic; sessions stay strictly
 ``web/api.py``'s concern.
 
 State changes (sending a chat message, approving/declining a pending
-confirmation) are NOT re-implemented here. Each page ships a few lines of
-vanilla JS that call the JSON API's existing, already-CSRF-protected
-``/api/chat`` and ``/api/confirm/{id}`` endpoints directly from the browser,
+confirmation, running a card action) are NOT re-implemented here. Each page
+ships a few lines of vanilla JS that call the JSON API's existing,
+already-CSRF-protected ``/api/chat``, ``/api/confirm/{id}`` and
+``/api/action/{tool}`` endpoints directly from the browser,
 using the session cookie already on the page and a CSRF token embedded in a
 hidden form field (``#csrf-token``) — the standard "CSRF token embedded in
 forms for cookie POSTs" mitigation for cookie-authenticated state changes.
@@ -103,7 +104,9 @@ def add_ui(app: FastAPI, runtime: Runtime, settings: Settings) -> None:
         if csrf_token is None:
             return RedirectResponse("/login", status_code=303)
         widgets = await runtime.render_widgets()
-        return _TEMPLATES.TemplateResponse(request, "dashboard.html", {"widgets": widgets})
+        return _TEMPLATES.TemplateResponse(
+            request, "dashboard.html", {"widgets": widgets, "csrf_token": csrf_token}
+        )
 
     @app.get("/chat")
     async def chat_page(request: Request) -> Any:
