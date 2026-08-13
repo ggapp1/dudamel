@@ -164,7 +164,7 @@ class _BatchOutcome:
     results: list[Message] = field(default_factory=list)  # completed + skipped
     pending_call: ToolCall | None = None  # first confirm-gated call, if any
     executed_any: bool = False
-    saw_mcp_result: bool = False
+    saw_untrusted_result: bool = False
 
 
 class Router:
@@ -574,7 +574,7 @@ class Router:
             called_tool_names |= {c.name for c in msg.tool_calls}
             outcome = await self._execute_batch(conv_id, msg.tool_calls, turn_tainted=turn_tainted)
             executed_any = executed_any or outcome.executed_any
-            turn_tainted = turn_tainted or outcome.saw_mcp_result
+            turn_tainted = turn_tainted or outcome.saw_untrusted_result
             if outcome.pending_call is not None:
                 return await self._suspend(
                     conv_id,
@@ -622,7 +622,7 @@ class Router:
         taints too.
         """
         tool = self._registry.tools.get(name)
-        return tool is None or tool.origin == "mcp"
+        return tool is None or tool.untrusted
 
     def _window_tainted(self, window: list[Message]) -> bool:
         for m in window:
@@ -638,24 +638,27 @@ class Router:
         from. Never derived from the summarizer's own output."""
         return self._window_tainted(dropped_messages)
 
-    def _needs_confirm(self, tool: Tool, *, turn_tainted: bool, batch_has_mcp: bool) -> bool:
+    def _needs_confirm(self, tool: Tool, *, turn_tainted: bool, batch_has_untrusted: bool) -> bool:
         """Whether this call must be approved by the user before it runs.
 
-        The taint rule: once a turn has seen output from an untrusted (mcp)
-        tool, anything the model does next may be acting on injected
-        instructions rather than the user's request, so mutations stop and ask.
+        The taint rule: once a turn has seen output from an untrusted source,
+        anything the model does next may be acting on injected instructions
+        rather than the user's request, so mutations stop and ask. Untrusted
+        means an mcp tool or a native tool declared `external` -- one predicate,
+        `Tool.untrusted`, whatever the provenance.
 
-        The two origins are gated on deliberately different signals:
+        A mutation is gated once the turn is tainted, and also when the same
+        batch contains another untrusted call. The batch clause is defensive:
+        the calls were chosen together, and pairing a fetch with a write in one
+        batch is the shape an injection attempt takes.
 
-        - A NATIVE mutation is gated once the turn is tainted, and also when
-          the same batch contains an mcp call. The batch clause is defensive:
-          the calls were chosen together, and pairing a fetch with a write in
-          one batch is the shape an injection attempt takes.
-        - An MCP mutation is gated on turn taint ONLY. Adding the batch clause
-          would gate every mutating mcp tool unconditionally -- such a tool
-          makes `batch_has_mcp` true by its own presence -- which is exactly
-          the confirm-on-everything outcome that makes mcp unusable. Before a
-          single mcp result has been seen there is nothing injected to act on.
+        `batch_has_untrusted` excludes the call being judged, and that
+        exclusion is what lets one rule cover both origins. A tool that is
+        itself untrusted AND mutating -- an unannotated mcp write, or a native
+        tool that fetches and stores -- would otherwise make the batch
+        untrusted by its own presence and be gated on every call, which is the
+        confirm-on-everything outcome that makes mcp unusable. Before any
+        untrusted result has been seen there is nothing injected to act on.
 
         Read-only tools are never gated, whatever their origin; fetch and
         search are the common case and must stay frictionless.
@@ -666,28 +669,35 @@ class Router:
             return False
         if tool.read_only:
             return False
-        if tool.origin == "native":
-            return turn_tainted or batch_has_mcp
-        return turn_tainted
+        return turn_tainted or batch_has_untrusted
 
     async def _execute_batch(
         self, conv_id: int, calls: list[ToolCall], *, turn_tainted: bool
     ) -> _BatchOutcome:
         outcome = _BatchOutcome()
-        # Strict lookup on purpose, unlike `_untrusted_name`'s fail-closed
-        # rule for names read back out of history: a name the LIVE registry
-        # doesn't know is a model invention, and the only text it produces is
-        # the router's own "unknown tool" error. Nothing untrusted was
-        # fetched, so nothing is tainted.
-        batch_has_mcp = any(
-            (t := self._registry.tools.get(c.name)) is not None and t.origin == "mcp" for c in calls
+        # Counted once and adjusted per call: the predicate each call is judged
+        # against must EXCLUDE that call (see `_needs_confirm`). Doing it by
+        # subtraction rather than by name is what makes two calls to the same
+        # untrusted tool each count against the other.
+        #
+        # Strict lookup on purpose, unlike `_untrusted_name`'s fail-closed rule
+        # for names read back out of history: a name the LIVE registry doesn't
+        # know is a model invention, and the only text it produces is the
+        # router's own "unknown tool" error. Nothing untrusted was fetched, so
+        # nothing is tainted.
+        untrusted_total = sum(
+            1 for c in calls if (t := self._registry.tools.get(c.name)) is not None and t.untrusted
         )
         plan: list[tuple[ToolCall, str]] = []  # (call, action: run|pending|skip|...)
         for call in calls:
             tool = self._registry.tools.get(call.name)
             if tool is None:
                 plan.append((call, "unknown"))
-            elif self._needs_confirm(tool, turn_tainted=turn_tainted, batch_has_mcp=batch_has_mcp):
+            elif self._needs_confirm(
+                tool,
+                turn_tainted=turn_tainted,
+                batch_has_untrusted=untrusted_total - (1 if tool.untrusted else 0) > 0,
+            ):
                 if outcome.pending_call is None:
                     outcome.pending_call = call
                     plan.append((call, "pending"))
@@ -698,12 +708,12 @@ class Router:
 
         async def run_one(call: ToolCall) -> Message:
             tool = self._registry.tools[call.name]
-            if tool.origin == "mcp":
-                # Taint on EVERY mcp-origin outcome — validation error,
-                # timeout, exception, or success — not just success. A
-                # raising/timing-out MCP tool still feeds attacker-influenceable
-                # error text to the model and must not escape the taint gate.
-                outcome.saw_mcp_result = True
+            if tool.untrusted:
+                # Taint on EVERY outcome of an untrusted call — validation
+                # error, timeout, exception, or success — not just success. A
+                # raising tool still feeds attacker-influenceable error text to
+                # the model and must not escape the taint gate.
+                outcome.saw_untrusted_result = True
             try:
                 kwargs = tool.schema.validate(call.args)
             except ToolValidationError as e:
