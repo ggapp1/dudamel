@@ -451,6 +451,42 @@ def test_doctor_tool_table_shows_the_action_label(
     assert "Done" not in add_row
 
 
+def test_doctor_tool_table_stays_aligned_under_a_label_at_the_contract_cap() -> None:
+    """The contract caps a label at ACTION_LABEL_MAX, so the column has to hold
+    one -- otherwise the longest labels, the ones most worth reading, are the
+    rows whose remaining columns slide out of line."""
+    from dudamel import App
+    from dudamel.contract.renderers import ACTION_LABEL_MAX
+
+    app = App("notebook", description="Keep short notes")
+    at_cap = "Mark as done and archive it now"[:ACTION_LABEL_MAX].ljust(ACTION_LABEL_MAX, "x")
+    assert len(at_cap) == ACTION_LABEL_MAX and " " in at_cap
+
+    @app.tool
+    async def plain() -> str:
+        """No button."""
+        return ""
+
+    @app.tool(action="Done")
+    async def short() -> str:
+        """A short label."""
+        return ""
+
+    @app.tool(action=at_cap)
+    async def long() -> str:
+        """A label at the cap."""
+        return ""
+
+    rows = cli._render_tool_table(Orchestrator(apps=[app])).splitlines()
+    header, _rule, *body = rows
+    origin_col = header.index("origin")
+    for row in body:
+        assert row.index("native") == origin_col, row
+    assert at_cap in next(row for row in body if row.startswith("long"))
+    # the unlabelled tool reads as a dash, not as blank
+    assert "-" in next(row for row in body if row.startswith("plain"))
+
+
 def test_doctor_reports_a_layout_id_that_is_not_a_registered_widget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -491,7 +527,50 @@ def test_doctor_reports_a_widget_listed_in_two_sections(
 
     assert cli.main(["doctor"]) == 0
     out = capsys.readouterr().out
-    assert "more than one section" in out
+    assert "notebook.recent is listed more than once" in out
+
+
+def test_doctor_reports_a_layout_id_whose_app_is_switched_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A local app switched off in config is still registered in `assistant.py`
+    but no longer renders, so its ids are dead ids. Judged against the app's
+    own registration they would look live, and the one line telling the
+    operator why the section is empty would never print."""
+    target = scaffold_with_action_app(tmp_path)
+    config = target / "dudamel.toml"
+    config.write_text(
+        config.read_text()
+        + "\n[apps.notebook]\nenabled = false\n"
+        + '\n[[home.section]]\ntitle = "Today"\nwidgets = ["notebook.recent"]\n'
+    )
+    monkeypatch.chdir(target)
+    capsys.readouterr()
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "notebook.recent is not a registered widget" in out
+
+
+def test_doctor_does_not_call_layout_ids_dead_when_the_assistant_cannot_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With no importable assistant there are no resolved apps, so every id
+    would look dead. That would send the operator editing dudamel.toml over a
+    problem that does not exist; the import failure is the one finding."""
+    target = scaffold_with_action_app(tmp_path)
+    (target / "assistant.py").write_text("raise RuntimeError('boom')\n")
+    config = target / "dudamel.toml"
+    config.write_text(
+        config.read_text() + '\n[[home.section]]\ntitle = "Today"\nwidgets = ["notebook.recent"]\n'
+    )
+    monkeypatch.chdir(target)
+    capsys.readouterr()
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "raised on import" in out
+    assert "is not a registered widget" not in out
 
 
 def test_doctor_on_a_fresh_project_does_not_advise_a_migrate_that_would_do_nothing(
