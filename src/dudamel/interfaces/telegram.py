@@ -28,7 +28,13 @@ from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from telegram import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    Update,
+)
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
@@ -41,6 +47,7 @@ from telegram.ext import (
 )
 
 from dudamel.config import Settings
+from dudamel.exceptions import UnknownActionError
 from dudamel.runtime import Runtime
 
 logger = logging.getLogger("dudamel.interfaces.telegram")
@@ -165,6 +172,26 @@ def _card_lines(card: dict[str, Any]) -> list[str]:
     return str(data).splitlines() or ["(empty)"]
 
 
+def _button_label(action: dict[str, Any], number: int) -> str:
+    """The label one tap-target carries, in the keyboard AND in the digest text.
+
+    Numbered because a keyboard offers no other way to say which line a button
+    acts on: a list where two items both offer "Done" would otherwise render
+    two identical buttons whose only distinguishing feature is their order,
+    and one tap is consent, so a mis-read there completes the wrong item. The
+    number makes every label in a message unique and repeats it, in brackets,
+    on the line the button acts on.
+
+    A `confirm=True` action is marked. On the web that flag raises a browser
+    dialog before the POST; a Telegram tap has no dialog, and one tap is the
+    human decision either way, so the marker -- not a second tap -- is what
+    replaces it. Applied here, where the button is built, so the resolved
+    descriptor the web renders is untouched.
+    """
+    warn = "⚠️ " if action.get("confirm") else ""
+    return f"{number} · {warn}{action['label']}"
+
+
 def _pack(
     entries: list[tuple[str, dict[str, Any] | None]], header: str
 ) -> list[tuple[str, list[dict[str, Any]]]]:
@@ -180,6 +207,11 @@ def _pack(
     in the message that also contains the line it acts on.
     """
     messages: list[tuple[str, list[dict[str, Any]]]] = []
+    # The header is capped like any other line, and for the same reason: it is
+    # repeated on every message of the section, and `HomeSection.title` is an
+    # unconstrained operator-supplied string, so an over-long one would push
+    # every message of that section past the limit at once.
+    header = header[:_MAX_DIGEST_LINE]
     lines = [header]
     actions: list[dict[str, Any]] = []
     for raw_line, action in entries:
@@ -347,42 +379,77 @@ class TelegramInterface:
             return
         for section in await self._runtime.render_home():
             entries: list[tuple[str, dict[str, Any] | None]] = []
+            numbered = 0
             for card in section.cards:
-                entries.append((f"*{card['title']}*", None))
+                # No Markdown anywhere in the digest: card titles are plain, so
+                # the whole thing goes out under one parser. The alternative --
+                # bolding titles -- would have widget-authored item text
+                # Markdown-interpreted in the button-less messages and literal
+                # in the keyboard-bearing ones, i.e. the same app-controlled
+                # string read two different ways inside one /home.
+                entries.append((card["title"], None))
                 lines = _card_lines(card)
                 items = card.get("data") if card["renderer"] == "list" else None
                 for index, line in enumerate(lines):
                     action = None
                     if items is not None and index < len(items):
                         action = items[index].get("action")
-                    entries.append((line, action))
+                    if action is None:
+                        entries.append((line, None))
+                        continue
+                    numbered += 1
+                    # The button's own label, appended to the line it acts on:
+                    # the association is then visible in the text instead of
+                    # inferred from keyboard order.
+                    button = {**action, "label": _button_label(action, numbered)}
+                    entries.append((f"{line}  [{button['label']}]", button))
                 for action in card["actions"]:
-                    entries.append((f"  [{action['label']}]", action))
-            header = section.title or "Home"
-            for text, actions in _pack(entries, header):
+                    numbered += 1
+                    button = {**action, "label": _button_label(action, numbered)}
+                    entries.append((f"  [{button['label']}]", button))
+            for text, actions in _pack(entries, section.title or "Home"):
                 await self._send_digest(chat.id, user.id, text, actions)
 
     async def _send_digest(
         self, chat_id: int, user_id: int, text: str, actions: list[dict[str, Any]]
     ) -> None:
-        if not actions:
-            await self._send_text(chat_id, text)
-            return
-        keyboard = InlineKeyboardMarkup(
-            [
+        """Send one packed digest message, plain (never Markdown — see `_on_home`).
+
+        `_pack` already fits the text inside the per-message limit, so this
+        never splits: splitting is what would tear a keyboard off its lines.
+        """
+        keyboard = (
+            InlineKeyboardMarkup(
                 [
-                    InlineKeyboardButton(
-                        action["label"],
-                        callback_data=(
-                            "act:"
-                            + self._action_tokens.issue(action["tool"], action["args"], user_id)
-                        ),
-                    )
+                    [
+                        InlineKeyboardButton(
+                            action["label"],
+                            callback_data=(
+                                "act:"
+                                + self._action_tokens.issue(action["tool"], action["args"], user_id)
+                            ),
+                        )
+                    ]
+                    for action in actions
                 ]
-                for action in actions
-            ]
+            )
+            if actions
+            else None
         )
-        await self._app.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+        try:
+            await self._app.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+        except BadRequest as e:
+            # Widget-authored text can be rejected for reasons the length cap
+            # doesn't cover. Degrade to a short note, and -- unlike
+            # `_send_confirmation`, which keeps its buttons because losing them
+            # strands the user mid-turn -- DROP the keyboard: a button whose
+            # lines were not delivered is exactly the referent-less button
+            # `_pack` exists to prevent, and /home regenerates it anyway.
+            logger.warning("telegram digest send rejected (%s); using plain fallback", e)
+            await self._app.bot.send_message(
+                chat_id=chat_id,
+                text="A homescreen section could not be delivered. Send /home to retry.",
+            )
 
     async def _on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -399,24 +466,27 @@ class TelegramInterface:
         if query.data.startswith("act:"):
             resolved = self._action_tokens.consume(query.data.removeprefix("act:"), user.id)
             if resolved is None:
-                await self._app.bot.answer_callback_query(
-                    query.id, text="That button expired — send /home again.", show_alert=True
-                )
+                await self._answer(query.id, "That button expired — send /home again.", alert=True)
                 return
             tool, args = resolved
             try:
                 await self._runtime.run_action(tool, args, actor=str(user.id), source="telegram")
-            except Exception as e:
-                await self._app.bot.answer_callback_query(
-                    query.id, text=f"Failed: {e}", show_alert=True
-                )
+            except UnknownActionError:
+                # The realistic case is a digest outliving the app that owned
+                # the button (disabled, or its action label removed); "Failed"
+                # would misdescribe it as a tool that ran and broke.
+                await self._answer(query.id, "That action is no longer available.", alert=True)
                 return
-            # The digest is deliberately not edited: the token is spent, so
-            # its buttons cannot fire again, and editing adds failure modes
-            # (message too old, edit rejected) for something /home regenerates.
-            await self._app.bot.answer_callback_query(
-                query.id, text="Done — send /home for a fresh view."
-            )
+            except Exception as e:
+                await self._answer(query.id, f"Failed: {e}", alert=True)
+                return
+            # The digest is deliberately not edited. Editing adds failure modes
+            # (message too old, edit rejected) for something /home regenerates,
+            # and the stale keyboard is inert: THIS token is spent. Note that
+            # says nothing about the action -- two /home calls leave two live
+            # buttons for the same item, and tapping both runs it twice, so
+            # whether that is safe is the app's business, not this module's.
+            await self._answer(query.id, "Done — send /home for a fresh view.")
             return
         parts = query.data.split(":")
         if len(parts) != 3 or parts[0] != "confirm" or parts[2] not in ("yes", "no"):
@@ -445,6 +515,22 @@ class TelegramInterface:
             else:
                 await self._edit_confirmation_result(message, reply.text)
         await self._app.bot.answer_callback_query(query.id)
+
+    async def _answer(self, query_id: str, text: str, *, alert: bool = False) -> None:
+        """Answer a callback query with text Telegram will actually accept.
+
+        `answerCallbackQuery.text` is capped at 200 characters and PTB does not
+        truncate it for us, so an unbounded message (a tool's exception string
+        -- a SQLAlchemy IntegrityError runs to hundreds of characters) is
+        rejected by the API. That rejection would surface as a BadRequest from
+        a handler that has already run the tool, leaving the operator told
+        nothing at the moment they most need telling.
+        """
+        await self._app.bot.answer_callback_query(
+            query_id,
+            text=_fit_single_message(text, CallbackQuery.MAX_ANSWER_TEXT_LENGTH),
+            show_alert=alert,
+        )
 
     async def _edit_confirmation_result(self, message: Message, text: str) -> None:
         """Replace a confirmation prompt's text and drop its inline keyboard,
