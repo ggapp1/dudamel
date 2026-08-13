@@ -34,7 +34,17 @@ async def log_activity(
     status: str,
     result_preview: str | None = None,
     conversation_id: int | None = None,
+    actor: str | None = None,
+    source: str | None = None,
 ) -> None:
+    """Record one tool execution.
+
+    Both `actor` and `source` default to None, which reads as unattributed.
+    Every caller names its own surface -- the router included. Defaulting
+    `source` to any one surface would make an omission indistinguishable
+    from a genuine claim, and a wrong attribution in an audit log is worse
+    than a missing one because nothing later can tell the two apart.
+    """
     async with db.session() as s:
         s.add(
             Activity(
@@ -43,5 +53,7 @@ async def log_activity(
                 args=json_safe(args),
                 status=status,
                 result_preview=(result_preview or "")[:_PREVIEW_CAP] or None,
+                actor=actor,
+                source=source,
             )
         )

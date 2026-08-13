@@ -307,6 +307,7 @@ class Router:
                 status=status,
                 result_preview=result_preview,
                 conversation_id=conversation_id,
+                source="router",
             )
         except Exception as e:  # noqa: BLE001 — bookkeeping must never kill a turn
             # With the traceback: the catch is broad, so what lands here may

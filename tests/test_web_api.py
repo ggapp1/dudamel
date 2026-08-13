@@ -1,23 +1,34 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import timedelta
 from pathlib import Path
 
 import httpx
 import pytest
+from pydantic import BaseModel
 from sqlalchemy import select
 
 from dudamel import App, Orchestrator, Runtime
-from dudamel.config import Settings, TierConfig, WebConfig
+from dudamel.config import RouterConfig, Settings, TierConfig, WebConfig
 from dudamel.llm.testing import Completion, FakeProvider, fake_text, fake_tool_call
-from dudamel.models_core import PendingConfirmation
+from dudamel.models_core import Activity, PendingConfirmation
 from dudamel.router import _utcnow
 from dudamel.web.api import create_api
 from dudamel.web.auth import CSRF_HEADER
 from dudamel.web.throttle import MAX_FAILURES
 
 TOKEN = "s3cr3t-token"  # noqa: S105 — test fixture, not a real credential
+# Read from the same config default `make_settings` leaves in place, so the
+# cap the tools below straddle can never drift away from the enforced one.
+RESULT_CAP = RouterConfig().tool_result_cap
+OVERSHOOT = 808
+
+
+class _Entry(BaseModel):
+    exercise: str
+    sets: int
 
 
 def make_orc() -> Orchestrator:
@@ -36,6 +47,47 @@ def make_orc() -> Orchestrator:
     @app.widget(title="Streak", renderer="markdown")
     async def streak() -> str:
         return "3 days"
+
+    @app.tool(action="Done")
+    async def complete(id: int) -> str:
+        """Complete a task."""
+        return f"done {id}"
+
+    @app.tool(action="Boom")
+    async def explode() -> str:
+        """Always fails."""
+        raise RuntimeError("kaboom")
+
+    @app.tool(action="Refuse")
+    async def refuse(id: int) -> str:
+        """Fails the way ordinary Python app code fails."""
+        raise ValueError("note 7 does not exist")
+
+    @app.tool(action="Ransack")
+    async def ransack(id: int) -> str:
+        """Fails on an ordinary dict access, the way app code does."""
+        return {"a": 1}[str(id)]
+
+    @app.tool(action="Spew")
+    async def spew() -> str:
+        """Returns more than the result cap allows."""
+        return "x" * (RESULT_CAP + OVERSHOOT)
+
+    @app.tool(action="Nap", timeout=0.01)
+    async def nap() -> str:
+        """Outlives its own deadline."""
+        await asyncio.sleep(5)
+        return "never"
+
+    @app.tool(action="Stall")
+    async def stall() -> str:
+        """Raises the timeout its own upstream hit, well inside its deadline."""
+        raise TimeoutError("upstream connect timed out")
+
+    @app.tool(action="Nest")
+    async def nest(entry: _Entry) -> str:
+        """Takes a nested model, so its coerced argument is not JSON-shaped."""
+        return f"noted {entry.sets}"
 
     return Orchestrator(apps=[app])
 
@@ -568,3 +620,338 @@ async def test_localhost_bind_without_token_starts(
         create_api(rt, settings)  # must not raise
     finally:
         await rt.stop()
+
+
+# --- card actions: running one labelled tool, no model in the path -------------
+
+
+async def test_action_runs_with_bearer_auth(tmp_path: Path, token_env: str) -> None:
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        res = await c.post(
+            "/api/action/complete",
+            json={"args": {"id": 4}},
+            headers={"Authorization": f"Bearer {token_env}"},
+        )
+        assert res.status_code == 200
+        assert res.json() == {"ok": True, "result": "done 4"}
+    await rt.stop()
+
+
+async def test_action_coerces_string_arguments(tmp_path: Path, token_env: str) -> None:
+    """A "4" that comes back as "done 4" proves coercion ran; the browser
+    sends JSON, but nothing guarantees the type it sends."""
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        res = await c.post(
+            "/api/action/complete",
+            json={"args": {"id": "4"}},
+            headers={"Authorization": f"Bearer {token_env}"},
+        )
+        assert res.json()["result"] == "done 4"
+    await rt.stop()
+
+
+async def test_unlabelled_tool_is_not_an_action(tmp_path: Path, token_env: str) -> None:
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        res = await c.post(
+            "/api/action/log_workout",
+            json={"args": {"exercise": "squat"}},
+            headers={"Authorization": f"Bearer {token_env}"},
+        )
+        assert res.status_code == 404
+    await rt.stop()
+
+
+async def test_unknown_tool_is_404(tmp_path: Path, token_env: str) -> None:
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        res = await c.post(
+            "/api/action/nope",
+            json={"args": {}},
+            headers={"Authorization": f"Bearer {token_env}"},
+        )
+        assert res.status_code == 404
+    await rt.stop()
+
+
+async def test_bad_arguments_are_400(tmp_path: Path, token_env: str) -> None:
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        res = await c.post(
+            "/api/action/complete",
+            json={"args": {"id": "abc"}},
+            headers={"Authorization": f"Bearer {token_env}"},
+        )
+        assert res.status_code == 400
+    await rt.stop()
+
+
+async def test_a_raising_tool_is_502(tmp_path: Path, token_env: str) -> None:
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        res = await c.post(
+            "/api/action/explode",
+            json={"args": {}},
+            headers={"Authorization": f"Bearer {token_env}"},
+        )
+        assert res.status_code == 502
+        assert "kaboom" in res.text
+    await rt.stop()
+
+
+async def test_action_requires_authentication(tmp_path: Path, token_env: str) -> None:
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        res = await c.post("/api/action/complete", json={"args": {"id": 4}})
+        assert res.status_code == 401
+    await rt.stop()
+
+
+async def test_cookie_action_needs_csrf_and_succeeds_with_it(
+    tmp_path: Path, token_env: str
+) -> None:
+    """The end-to-end path the dashboard actually uses."""
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        login = await c.post("/login", json={"token": token_env})
+        csrf_token = login.json()["csrf_token"]
+
+        no_csrf = await c.post("/api/action/complete", json={"args": {"id": 4}})
+        assert no_csrf.status_code == 403
+
+        with_csrf = await c.post(
+            "/api/action/complete",
+            json={"args": {"id": 4}},
+            headers={CSRF_HEADER: csrf_token},
+        )
+        assert with_csrf.status_code == 200
+    await rt.stop()
+
+
+async def test_action_writes_an_activity_row_naming_the_actor_and_surface(
+    tmp_path: Path, token_env: str
+) -> None:
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        await c.post(
+            "/api/action/complete",
+            json={"args": {"id": 4}},
+            headers={"Authorization": f"Bearer {token_env}"},
+        )
+    async with rt._db.session() as s:
+        rows = (await s.execute(select(Activity))).scalars().all()
+    assert [(r.tool, r.status, r.actor, r.source) for r in rows] == [
+        ("complete", "ok", "bearer", "web")
+    ]
+    await rt.stop()
+
+
+async def test_a_browser_session_and_an_api_client_are_distinguishable(
+    tmp_path: Path, token_env: str
+) -> None:
+    """`source` already says the request arrived over the web, so repeating
+    that as the actor recorded nothing. How the caller authenticated is the
+    one distinction this endpoint actually has: a script holding the token
+    against a browser someone logged into."""
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        login = await c.post("/login", json={"token": token_env})
+        await c.post(
+            "/api/action/complete",
+            json={"args": {"id": 4}},
+            headers={CSRF_HEADER: login.json()["csrf_token"]},
+        )
+    async with rt._db.session() as s:
+        rows = (await s.execute(select(Activity))).scalars().all()
+    assert [(r.actor, r.source) for r in rows] == [("session", "web")]
+    await rt.stop()
+
+
+async def test_one_tool_records_one_shape_of_args_whoever_called_it(
+    tmp_path: Path, token_env: str
+) -> None:
+    """The `actor`/`source` columns exist to be compared across surfaces, and
+    that only works if the third column means the same thing on both rows.
+    Coerced arguments are attribute values, so a nested model parameter is a
+    model instance by then and reaches the JSON column as its `str()` --
+    `{'entry': "exercise='bench' sets=3"}` from a click and
+    `{'entry': {...}}` from the model. Both rows must carry the structured
+    form, which is what was submitted in each case."""
+    args = {"entry": {"exercise": "bench", "sets": 3}}
+    rt, transport = await build(tmp_path, [fake_tool_call("nest", args), fake_text("noted")])
+    async with client(transport) as c:
+        res = await c.post(
+            "/api/action/nest", json={"args": args}, headers={"Authorization": f"Bearer {TOKEN}"}
+        )
+        assert res.status_code == 200
+    await rt.chat("web:default", "note it", user_id="web")
+
+    async with rt._db.session() as s:
+        rows = (await s.execute(select(Activity).order_by(Activity.id))).scalars().all()
+    assert [r.source for r in rows] == ["web", "router"]
+    assert [r.args for r in rows] == [args, args]
+    await rt.stop()
+
+
+async def test_a_failing_action_records_the_submitted_args_too(
+    tmp_path: Path, token_env: str
+) -> None:
+    """The error paths log through a different call than the success one, so
+    they are pinned separately: an audit query that can only compare
+    successful calls is not an audit query."""
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        await c.post(
+            "/api/action/ransack",
+            json={"args": {"id": "7"}},
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+    async with rt._db.session() as s:
+        rows = (await s.execute(select(Activity))).scalars().all()
+    # "7", not 7: coercion turns it into an int on the way to the tool, and
+    # what an audit row answers for is what the caller sent.
+    assert [(r.tool, r.status, r.args) for r in rows] == [("ransack", "error", {"id": "7"})]
+    await rt.stop()
+
+
+async def test_a_tool_raising_valueerror_is_502_while_bad_arguments_stay_400(
+    tmp_path: Path, token_env: str
+) -> None:
+    """The pair is the point. ValueError is the most idiomatic failure in
+    Python app code, so a tool body raises it routinely -- and if that is
+    indistinguishable from arguments that would not coerce, the endpoint
+    hands back the tool's own message under a status telling the caller their
+    input was malformed."""
+    rt, transport = await build(tmp_path, [])
+    headers = {"Authorization": f"Bearer {token_env}"}
+    async with client(transport) as c:
+        coercion = await c.post("/api/action/refuse", json={"args": {"id": "abc"}}, headers=headers)
+        assert coercion.status_code == 400
+        assert "invalid arguments" in coercion.json()["detail"]
+
+        raised = await c.post("/api/action/refuse", json={"args": {"id": 7}}, headers=headers)
+        assert raised.status_code == 502
+        assert raised.json()["detail"] == "note 7 does not exist"
+    await rt.stop()
+
+
+async def test_a_failed_action_writes_an_error_row_naming_the_actor_and_surface(
+    tmp_path: Path, token_env: str
+) -> None:
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        await c.post(
+            "/api/action/explode",
+            json={"args": {}},
+            headers={"Authorization": f"Bearer {token_env}"},
+        )
+    async with rt._db.session() as s:
+        rows = (await s.execute(select(Activity))).scalars().all()
+    assert [(r.tool, r.status, r.actor, r.source) for r in rows] == [
+        ("explode", "error", "bearer", "web")
+    ]
+    assert rows[0].result_preview == "kaboom"
+    await rt.stop()
+
+
+async def test_refused_arguments_are_recorded_too(tmp_path: Path, token_env: str) -> None:
+    """An authenticated, state-changing endpoint reachable from more than one
+    surface: argument probing against it must not be the one thing the audit
+    log cannot see. The row keeps the arguments as submitted, since coercing
+    them is precisely what failed."""
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        res = await c.post(
+            "/api/action/complete",
+            json={"args": {"id": "abc"}},
+            headers={"Authorization": f"Bearer {token_env}"},
+        )
+        assert res.status_code == 400
+    async with rt._db.session() as s:
+        rows = (await s.execute(select(Activity))).scalars().all()
+    assert [(r.tool, r.status, r.actor, r.source) for r in rows] == [
+        ("complete", "error", "bearer", "web")
+    ]
+    assert rows[0].args == {"id": "abc"}
+    await rt.stop()
+
+
+async def test_an_oversized_result_is_capped_and_says_so(tmp_path: Path, token_env: str) -> None:
+    """Truncating silently leaves an operator reading output that stops
+    mid-word with no way to tell that from the tool's own output. The marker
+    is the one the model-facing plane already uses."""
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        res = await c.post(
+            "/api/action/spew",
+            json={"args": {}},
+            headers={"Authorization": f"Bearer {token_env}"},
+        )
+    assert res.status_code == 200
+    result = res.json()["result"]
+    assert result == "x" * RESULT_CAP + f"…[truncated {OVERSHOOT} chars]"
+    await rt.stop()
+
+
+async def test_an_expired_deadline_says_it_timed_out(tmp_path: Path, token_env: str) -> None:
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        res = await c.post(
+            "/api/action/nap",
+            json={"args": {}},
+            headers={"Authorization": f"Bearer {token_env}"},
+        )
+    assert res.status_code == 502
+    assert res.json()["detail"] == "action nap timed out after 0.01s"
+    await rt.stop()
+
+
+async def test_a_tool_raised_timeout_keeps_its_own_message(tmp_path: Path, token_env: str) -> None:
+    """A tool whose upstream connect times out raises TimeoutError from well
+    inside its own deadline. Reporting that as "timed out after 30.0s" would
+    fabricate a deadline that never fired and lose the real cause."""
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        res = await c.post(
+            "/api/action/stall",
+            json={"args": {}},
+            headers={"Authorization": f"Bearer {token_env}"},
+        )
+    assert res.status_code == 502
+    assert res.json()["detail"] == "upstream connect timed out"
+    async with rt._db.session() as s:
+        rows = (await s.execute(select(Activity))).scalars().all()
+    assert [(r.tool, r.status, r.result_preview) for r in rows] == [
+        ("stall", "error", "upstream connect timed out")
+    ]
+    await rt.stop()
+
+
+async def test_a_tool_raising_keyerror_is_502_while_an_unknown_name_stays_404(
+    tmp_path: Path, token_env: str
+) -> None:
+    """The same pair as the ValueError one, for the other exception the
+    endpoint reads as a verdict about the request. A dict access on absent
+    data is everyday app code; answering it 404 would claim the action does
+    not exist immediately after it ran and wrote an error row, and 404 is a
+    status a client is entitled to stop retrying on."""
+    rt, transport = await build(tmp_path, [])
+    headers = {"Authorization": f"Bearer {token_env}"}
+    async with client(transport) as c:
+        unknown = await c.post("/api/action/nope", json={"args": {}}, headers=headers)
+        assert unknown.status_code == 404
+        assert unknown.json()["detail"] == "no action 'nope'"
+
+        raised = await c.post("/api/action/ransack", json={"args": {"id": 7}}, headers=headers)
+        assert raised.status_code == 502
+        # KeyError's str() is the repr of the missing key -- the tool's own
+        # detail either way, not a claim about the action's existence.
+        assert raised.json()["detail"] == "'7'"
+    async with rt._db.session() as s:
+        rows = (await s.execute(select(Activity))).scalars().all()
+    # Only the tool that actually ran leaves a row; the unknown name never
+    # reached one.
+    assert [(r.tool, r.status) for r in rows] == [("ransack", "error")]
+    await rt.stop()

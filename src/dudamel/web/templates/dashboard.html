@@ -1,54 +1,191 @@
 {% extends "base.html" %}
 {% block title %}dudamel — dashboard{% endblock %}
 {% block content %}
+{% macro action_button(action) %}
+<button type="button" class="action"
+        data-tool="{{ action.tool }}"
+        {# Single-quoted deliberately: `| tojson` escapes <, >, & and ' (not "),
+           so the JSON's own double quotes must not be the attribute delimiter. #}
+        data-args='{{ action.args | tojson }}'
+        data-label="{{ action.label }}"
+        {% if action.confirm %}data-confirm="1"{% endif %}
+        onclick="runAction(this)">{{ action.label }}</button>
+{% endmacro %}
 <h1>Dashboard</h1>
-<div id="widget-grid" class="grid"
-     hx-get="/" hx-trigger="every 30s" hx-select="#widget-grid" hx-swap="outerHTML">
-  {% for widget in widgets %}
-    {% if 'error' in widget %}
-      <div class="card error" data-widget-id="{{ widget.id }}">
-        <h3>{{ widget.title }}</h3>
-        <p>Widget failed: {{ widget.error }}</p>
-      </div>
-    {% elif widget.renderer == 'stat' %}
-      <div class="card" data-widget-id="{{ widget.id }}">
-        <h3>{{ widget.title }}</h3>
-        <div class="stat-value">{{ widget.data.value }}{% if widget.data.unit %} {{ widget.data.unit }}{% endif %}</div>
-        {% if widget.data.delta is not none %}<div class="stat-delta">Δ {{ widget.data.delta }}</div>{% endif %}
-      </div>
-    {% elif widget.renderer == 'table' %}
-      <div class="card" data-widget-id="{{ widget.id }}">
-        <h3>{{ widget.title }}</h3>
-        <table>
-          <thead><tr>{% for c in widget.data.columns %}<th>{{ c }}</th>{% endfor %}</tr></thead>
-          <tbody>
-            {% for row in widget.data.rows %}
-              <tr>{% for cell in row %}<td>{{ cell }}</td>{% endfor %}</tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-    {% elif widget.renderer == 'list' %}
-      <div class="card" data-widget-id="{{ widget.id }}">
-        <h3>{{ widget.title }}</h3>
-        <ul>
-          {% for item in widget.data %}
-            <li>
-              {% if item.url %}<a href="{{ item.url }}">{{ item.title }}</a>{% else %}{{ item.title }}{% endif %}
-              {% if item.subtitle %} — {{ item.subtitle }}{% endif %}
-            </li>
-          {% endfor %}
-        </ul>
-      </div>
-    {% elif widget.renderer == 'markdown' %}
-      <div class="card" data-widget-id="{{ widget.id }}">
-        <h3>{{ widget.title }}</h3>
-        <!-- v1: pre-escaped plain text, no markdown parsing (see ui.py docstring) -->
-        <pre class="markdown">{{ widget.data }}</pre>
-      </div>
-    {% endif %}
+<input type="hidden" id="csrf-token" value="{{ csrf_token }}">
+<div id="action-status" role="status" aria-live="polite" class="sr-only"></div>
+<div id="widget-grid"
+     hx-get="/" hx-trigger="every 30s, refresh" hx-select="#widget-grid" hx-swap="outerHTML">
+  {% for section in sections %}
+    {% if section.title %}<h2 class="section-title">{{ section.title }}</h2>{% endif %}
+    <div class="grid">
+      {% for widget in section.cards %}
+        <div class="card{% if 'error' in widget %} error{% endif %}"
+             data-widget-id="{{ widget.qualified_id }}">
+          <h3>{{ widget.title }}</h3>
+          {% if 'error' in widget %}
+            <p>Widget failed: {{ widget.error }}</p>
+          {% elif widget.renderer == 'stat' %}
+            <div class="stat-value">{{ widget.data.value }}{% if widget.data.unit %} {{ widget.data.unit }}{% endif %}</div>
+            {% if widget.data.delta is not none %}<div class="stat-delta">Δ {{ widget.data.delta }}</div>{% endif %}
+          {% elif widget.renderer == 'table' %}
+            <table>
+              <thead><tr>{% for c in widget.data.columns %}<th>{{ c }}</th>{% endfor %}</tr></thead>
+              <tbody>
+                {% for row in widget.data.rows %}
+                  <tr>{% for cell in row %}<td>{{ cell }}</td>{% endfor %}</tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          {% elif widget.renderer == 'list' %}
+            <ul>
+              {% for item in widget.data %}
+                <li>
+                  {% if item.url %}<a href="{{ item.url }}">{{ item.title }}</a>{% else %}{{ item.title }}{% endif %}
+                  {% if item.subtitle %} — {{ item.subtitle }}{% endif %}
+                  {% if item.action %}{{ action_button(item.action) }}{% endif %}
+                </li>
+              {% endfor %}
+            </ul>
+          {% elif widget.renderer == 'markdown' %}
+            <!-- v1: pre-escaped plain text, no markdown parsing (see ui.py docstring) -->
+            <pre class="markdown">{{ widget.data }}</pre>
+          {% endif %}
+          {% if widget.actions %}
+            <div class="card-actions">
+              {% for action in widget.actions %}{{ action_button(action) }}{% endfor %}
+            </div>
+          {% endif %}
+        </div>
+      {% endfor %}
+    </div>
   {% else %}
     <p>No widgets registered.</p>
   {% endfor %}
 </div>
+
+<script>
+  // How many actions are outstanding, and whether the grid still owes a
+  // refresh for one that succeeded. `refreshPending` means "a refresh is owed
+  // until one demonstrably happened" -- it is cleared by an observed swap of
+  // the grid, never by having asked for one. This script lives outside
+  // #widget-grid, the only thing ever swapped here, so both survive a swap.
+  let inFlight = 0;
+  let refreshPending = false;
+
+  // Comfortably longer than the server's own deadline (a tool's default
+  // timeout is 30s, an MCP call's likewise), so this fires only when the
+  // connection has genuinely stalled and never races a slow-but-alive tool
+  // into a false failure. Without any limit a dead connection would pin
+  // inFlight above zero and freeze the grid until a reload.
+  const ACTION_TIMEOUT_MS = 60000;
+
+  function csrfToken() {
+    return document.getElementById('csrf-token').value;
+  }
+
+  function announce(message) {
+    document.getElementById('action-status').textContent = message;
+  }
+
+  function isGrid(element) {
+    return Boolean(element) && element.id === 'widget-grid';
+  }
+
+  // The invariant is "#widget-grid is never swapped while an action is
+  // outstanding", not merely "no new poll starts". A swap mid-action destroys
+  // the disabled button and puts an enabled one over data that predates the
+  // action — exactly the state that invites a duplicate mutation. Suppressing
+  // only the request would still let a poll that was ALREADY in flight when
+  // the button was clicked land its stale HTML, so the swap itself is where
+  // the invariant has to be enforced; the request guard just avoids the
+  // pointless round trip.
+  document.body.addEventListener('htmx:beforeRequest', function (event) {
+    if (inFlight > 0 && isGrid(event.detail.elt)) {
+      event.preventDefault();
+    }
+  });
+
+  document.body.addEventListener('htmx:beforeSwap', function (event) {
+    if (inFlight > 0 && (isGrid(event.detail.target) || isGrid(event.detail.elt))) {
+      event.detail.shouldSwap = false;
+    }
+  });
+
+  // A refresh counts as delivered only when a swap of the grid is actually
+  // observed. htmx.trigger returning proves nothing: a request made while
+  // another is in flight on the same element is queued and replayed after the
+  // swap, and the replay is dropped without a throw if the element it captured
+  // was detached by the outerHTML swap. The grid's own poll clears the flag
+  // too, and that is not always the same data the action was waiting for: a
+  // poll already in flight when the button was clicked can land afterwards
+  // carrying pre-mutation HTML. So the guarantee is a bound, not freshness --
+  // a committed mutation shows up within one poll interval at worst.
+  document.body.addEventListener('htmx:afterSwap', function (event) {
+    if (isGrid(event.detail.elt) || isGrid(event.target)) {
+      refreshPending = false;
+    }
+  });
+
+  // The single exit every action path takes, so inFlight is decremented
+  // exactly once per increment. A refresh is deferred until the LAST
+  // outstanding action finishes: triggering it earlier would only have it
+  // suppressed by the swap guard above, and the flag would then keep it owed
+  // anyway.
+  function finishAction(succeeded) {
+    inFlight -= 1;
+    refreshPending = refreshPending || succeeded;
+    if (inFlight > 0 || !refreshPending) return;
+    // inFlight is 0 here, so this refresh passes its own guard. Nothing is
+    // cleared here: if the trigger throws, is queued away or has its swap
+    // suppressed, the refresh stays owed and the next completed action -- or
+    // the 30s poll -- makes good on it.
+    htmx.trigger('#widget-grid', 'refresh');
+  }
+
+  async function runAction(button) {
+    const label = button.dataset.label;
+    if (button.dataset.confirm && !window.confirm('Run "' + label + '"?')) return;
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+    let succeeded = false;
+    // The increment is the LAST statement before `try`, and everything that
+    // can throw — `announce` included, since it dereferences an element it
+    // does not own — is inside it. A throw between the two would leak a
+    // permanently elevated inFlight past the `finally` that exists to rule
+    // exactly that out.
+    inFlight += 1;
+    try {
+      announce(label + ': running');
+      const response = await fetch('/api/action/' + encodeURIComponent(button.dataset.tool), {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', 'x-csrf-token': csrfToken()},
+        body: JSON.stringify({args: JSON.parse(button.dataset.args)}),
+        signal: AbortSignal.timeout(ACTION_TIMEOUT_MS),
+      });
+      if (response.ok) {
+        succeeded = true;
+        announce(label + ': done');
+      } else {
+        announce(label + ' failed: ' + (await response.text()));
+      }
+    } catch (error) {
+      // Includes the abort above: a stall is reported and recovered from like
+      // any other failure rather than wedging the counter.
+      announce(label + ' failed: ' + error);
+    } finally {
+      // `finally` runs exactly once on every path, including one where the
+      // catch block itself throws, and a throw from here cannot re-enter
+      // catch — so there is no second-decrement hazard to avoid. The one cost
+      // weighed: a throw from finishAction would mask the original error.
+      // A successful action's button stays disabled until the refresh
+      // replaces it.
+      if (!succeeded) {
+        button.disabled = false;
+        button.removeAttribute('aria-busy');
+      }
+      finishAction(succeeded);
+    }
+  }
+</script>
 {% endblock %}

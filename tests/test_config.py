@@ -156,3 +156,34 @@ def test_nested_env_delimiter_does_not_break_existing_sections(tmp_path: Path, m
     settings = Settings.load(tmp_path)
     assert settings.web.port == 9999
     assert settings.llm_budget.daily_tokens == 12
+
+
+def test_home_sections_load_from_toml(tmp_path: Path) -> None:
+    (tmp_path / "dudamel.toml").write_text(
+        '[[home.section]]\ntitle = "Today"\nwidgets = ["tasks.today", "weather.now"]\n'
+        '\n[[home.section]]\ntitle = "Archive"\nwidgets = ["notes.recent"]\n'
+    )
+    settings = Settings.load(tmp_path)
+    assert [s.title for s in settings.home.section] == ["Today", "Archive"]
+    assert settings.home.section[0].widgets == ["tasks.today", "weather.now"]
+
+
+def test_no_home_block_yields_no_sections(tmp_path: Path) -> None:
+    (tmp_path / "dudamel.toml").write_text("[web]\nport = 8788\n")
+    assert Settings.load(tmp_path).home.section == []
+
+
+def test_a_misspelled_section_key_is_refused_at_load(tmp_path: Path) -> None:
+    """`widget` for `widgets` would otherwise produce a section holding no
+    widgets, which composition drops as empty -- the section vanishes and
+    nothing anywhere says why. The enclosing Settings model ignores extras;
+    that must not reach down into these."""
+    (tmp_path / "dudamel.toml").write_text('[[home.section]]\ntitle = "Today"\nwidget = ["a.b"]\n')
+    with pytest.raises(ValueError, match="widget"):
+        Settings.load(tmp_path)
+
+
+def test_a_misspelled_home_key_is_refused_at_load(tmp_path: Path) -> None:
+    (tmp_path / "dudamel.toml").write_text('[[home.sections]]\ntitle = "Today"\n')
+    with pytest.raises(ValueError, match="sections"):
+        Settings.load(tmp_path)

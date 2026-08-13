@@ -125,6 +125,104 @@ picks the model up automatically — no separate schema file. Save a file
 like this under your project's `apps/` and add it to the list in
 `assistant.py` to run it.
 
+### Buttons: running a tool without the model
+
+Give a tool an `action=` label and it gains a second invocation path with no
+model in it — a button on the dashboard, a tap in Telegram (send `/home`,
+see below):
+
+```python
+@app.tool(action="Done")
+async def archive_note(id: int) -> str:
+    """Archive a note."""
+    ...
+```
+
+It is still one tool, not two. The model can call `archive_note` exactly as
+before, and both paths coerce arguments against the same signature-derived
+schema. The label is the whole opt-in: a tool without one has no UI surface
+at all, and the action endpoint answers `404` for it rather than running it.
+`uv run dudamel doctor` prints an `action` column in its tool table, so which
+tools carry a button is visible right next to their safety flags.
+
+There are two ways to put one on a card. A `list` widget can attach an action
+to an individual item, with that row's arguments already filled in:
+
+```python
+@app.widget(title="Open notes", renderer="list")
+async def open_notes() -> list[dict]:
+    return [
+        {
+            "title": "Buy milk",
+            "action": {"tool": "archive_note", "args": {"id": 7}, "label": "Done"},
+        },
+    ]
+```
+
+`label` is optional and overrides the tool's own label for that one row. A
+card-level button, by contrast, collects no input, so it may only name a tool
+with no required parameters:
+
+```python
+@app.widget(title="Notes", renderer="markdown", actions=["archive_all"])
+async def recent() -> str: ...
+```
+
+Either form may only name an action-labelled tool of the widget's **own**
+app, but the two are checked at different moments, because only one of them
+is known before the widget runs. A card-level `actions=[...]` entry that
+names an unknown tool, an unlabelled one, another app's, or one with a
+required parameter is a **registration error at startup** — the assistant
+refuses to start. A per-item action is data the widget returns, so it can
+only be judged when the widget runs: one naming an unknown, unlabelled or
+other-app tool, or whose `args` don't coerce against that tool's schema,
+degrades the widget to an **error card** — the whole card, its data
+included, not just the offending button.
+
+Two rules about widget payloads tightened alongside this. A list item's `url`
+now accepts only `http://`, `https://` and `mailto:`, and rejects whitespace
+and ASCII control characters — a widget returning anything else degrades to
+an error card. And a per-item action `label` is capped at 32 characters, the
+same limit a registered `action=` label has, because both render inside a
+button.
+
+### Grouping the dashboard: `[[home.section]]`
+
+By default the dashboard renders every widget in one flat grid, in
+registration order. `[[home.section]]` in `dudamel.toml` groups them into
+titled sections instead, addressing each widget as `<app>.<widget>`:
+
+```toml
+[[home.section]]
+title = "Today"
+widgets = ["workouts.week_volume", "notebook.recent"]
+
+[[home.section]]
+title = "Later"
+widgets = ["notebook.someday"]
+```
+
+Three rules about *which widgets go where*, each chosen so a configuration
+mistake degrades rather than breaks:
+
+- an id naming no registered widget is **ignored** — a widget legitimately
+  disappears when its app is switched off, and that must not blank the page;
+- a registered widget named in **no** section still renders, in a trailing
+  untitled section, so enabling an app can never make its cards invisible;
+- **no `[home]` block at all** means the previous flat grid, unchanged.
+
+A widget named twice renders once, at its first mention. Neither of the quiet
+cases is left unexplained: `dudamel doctor` reports a layout id that matches
+no widget and a widget listed in more than one section.
+
+The *spelling of the keys themselves* is the one thing here that is not
+degraded, deliberately. A key these blocks do not define — `widget` for
+`widgets`, or `[[home.sections]]` for `[[home.section]]` — is refused when
+`dudamel.toml` is read, naming the key path, and the assistant does not
+start. There is nothing useful to degrade to: such a section would hold no
+widgets, be dropped as empty, and take a whole group off the page with no id
+to report and nothing left to notice it by.
+
 ## Backends without native tool calling
 
 Some local models — especially smaller ones served through an
@@ -188,7 +286,21 @@ machine it runs on. Two ways to reach it from elsewhere:
   because dudamel's Telegram interface polls Telegram's API outward rather
   than listening for inbound connections. Set `DUDAMEL_TELEGRAM_TOKEN` and
   an allowed-user-id list in `dudamel.toml` and it works from behind any
-  NAT, on cellular, wherever.
+  NAT, on cellular, wherever. Besides ordinary chat, the bot answers one
+  command: **`/home`** sends the same homescreen the dashboard renders as a
+  plain-text digest — a message per `[[home.section]]` (split further if the
+  section outgrows one message), each card's contents as lines, and an inline
+  button under the message for every action on it, numbered so a button names
+  the line it acts on. Tapping one runs
+  that action immediately (a `confirm=True` action's label is prefixed `⚠️ `,
+  because a tap is the whole decision). The buttons belong to the message
+  they were sent with and are single-use; an already-tapped or superseded one
+  answers "That button expired — send /home again". Telegram does not offer
+  `/home` in its command menu unless you add it there yourself via BotFather.
+
+Nothing about `/home` widens who can reach the assistant: the command
+answers only the user ids already on the allow-list, and every button
+carries a one-shot token bound to the user it was issued to.
 
 Forwarding a port on your router to expose the dashboard directly to the
 public internet is not recommended — it puts the dashboard's auth layer
@@ -301,6 +413,21 @@ migrations placed under `data_dir` are ignored.
   approve or refuse (unless you have turned taint off). Taint applies
   to the turn that fetches, not to the data: if your app stores fetched
   content and reads it back later, mark the reading tool `external=True` too.
+- **Card actions run without the model**: a button click is the human
+  decision the confirmation gate exists to obtain, so an action is never
+  queued for confirmation. A tool marked `confirm=True` still asks first, on
+  the surface the click came from: the dashboard raises a browser dialog
+  before it posts, and Telegram — where one tap is the whole decision and
+  there is no dialog to raise — marks the button's label with a `⚠️ ` prefix
+  instead. Nothing on this path can be reached by prompt injection: the model
+  cannot click. An app must construct a typed action explicitly; no external
+  text is ever parsed into one. What an action *can* do is write
+  attacker-influenced text into your database without tainting anything —
+  an `external=True` tool may carry an action label, and a click is not a
+  turn, so the taint rule never comes into it. That is intended: the human
+  who clicked is the authority for that call. Judge such a tool by what it
+  writes, the same as any other mutating tool, and mark whatever reads that
+  content back `external=True`.
 - **Token budgets**: `[llm.budget] daily_tokens` in `dudamel.toml` sets a
   hard per-day ceiling per tier, enforced before each call — a runaway
   loop or a misbehaving job can't spend past it.
@@ -470,6 +597,23 @@ burst. All three must be positive; anything else is rejected at startup.
   Previously this annotation was ignored. If you rely on such a tool
   running without a confirmation step, register it explicitly or adjust
   the server's annotations.
+- A `list` widget item's `url` is now restricted to `http://`, `https://`
+  and `mailto:`, and rejects whitespace and control characters. A widget
+  returning any other url — a relative path included — now renders as an
+  error card instead. See "Buttons: running a tool without the model".
+- An action label — `@app.tool(action=...)` or a list item's `label`
+  override — now has C0/C1 control characters, `U+2028`/`U+2029` and the
+  bidi overrides `U+202A`–`U+202E`/`U+2066`–`U+2069` stripped out before the
+  32-character cap is applied. A label built only from those characters is
+  now rejected as empty, and one that fit the cap only because of them is
+  now stored shorter.
+- The dashboard's markup changed in two ways that affect custom CSS or
+  anything scraping the page. `data-widget-id` now carries the qualified
+  `app.widget` id rather than the bare widget id. And `#widget-grid` is no
+  longer itself the grid: it holds one `div.grid` per section, each
+  optionally preceded by an `h2.section-title`, so cards now sit one level
+  deeper. A selector like `#widget-grid > .card` needs to become
+  `#widget-grid .card`.
 
 ## Testing your apps
 

@@ -14,11 +14,21 @@ from typing import Any
 
 from sqlalchemy import select
 
+from dudamel.activity import json_safe, log_activity
 from dudamel.compaction import Compactor
 from dudamel.config import Settings, TierConfig
+from dudamel.contract.types import Tool
 from dudamel.convo import ConversationStore
 from dudamel.db import Database
-from dudamel.exceptions import DudamelError, LLMError, RegistryError
+from dudamel.exceptions import (
+    ActionArgumentError,
+    DudamelError,
+    LLMError,
+    RegistryError,
+    ToolValidationError,
+    UnknownActionError,
+)
+from dudamel.home import ComposedSection, compose_home
 from dudamel.llm.anthropic import AnthropicProvider
 from dudamel.llm.client import LLMClient, Tier
 from dudamel.llm.openai_compat import OpenAICompatProvider
@@ -327,10 +337,153 @@ class Runtime:
         async with self._db.session() as s:
             await s.execute(select(1))
 
+    def _app_actions(self, app_name: str) -> dict[str, Tool]:
+        """The action-labelled tools of one app, for widget rendering.
+
+        Scoped to a single app deliberately: this is what makes a per-item
+        action naming another app's tool impossible rather than merely
+        forbidden.
+        """
+        app = self._registry.apps.get(app_name)
+        if app is None:
+            return {}
+        return {name: tool for name, tool in app.tools.items() if tool.action is not None}
+
     async def render_widgets(self) -> list[dict[str, Any]]:
         """Run every registered widget concurrently. Data-plane guarantee: no
         model is ever invoked here (widgets.run_widget calls only widget.fn())."""
-        return list(await asyncio.gather(*(run_widget(w) for w in self._registry.widgets)))
+        return list(
+            await asyncio.gather(
+                *(
+                    run_widget(widget, self._app_actions(widget.app_name))
+                    for widget in self._registry.widgets
+                )
+            )
+        )
+
+    async def render_home(self) -> list[ComposedSection]:
+        """Every widget's card, grouped and ordered by `[[home.section]]`.
+
+        The single composition both the dashboard and Telegram render from."""
+        return compose_home(await self.render_widgets(), self._settings.home.section)
+
+    async def _log_action_error(
+        self, tool_name: str, args: dict[str, Any], detail: str, *, actor: str, source: str
+    ) -> None:
+        await log_activity(
+            self._db,
+            tool=tool_name,
+            args=args,
+            status="error",
+            result_preview=detail,
+            actor=actor,
+            source=source,
+        )
+
+    async def run_action(
+        self, tool_name: str, args: dict[str, Any], *, actor: str, source: str
+    ) -> str:
+        """Execute one operator-invoked tool on the deterministic plane.
+
+        Deliberately NOT routed through `Router`: there is no model in this
+        path, so there is no window to build, no turn to taint, and no
+        confirmation to obtain -- the operator clicking a button IS the human
+        decision the confirm machine exists to get.
+
+        Raises UnknownActionError if `tool_name` is not an action-labelled
+        tool, ActionArgumentError (a ValueError) if `args` do not coerce, and
+        whatever the tool raises otherwise -- except that OUR deadline
+        expiring raises a TimeoutError that says so.
+
+        Both of those are typed rather than the bare `KeyError`/`ValueError`
+        the two conditions would naturally produce, and for the same reason:
+        a tool body raising either one is a tool failure, and a caller that
+        could not tell it apart from a lookup or coercion failure would
+        misreport a tool that actually ran.
+
+        Every outcome past the name lookup writes exactly one activity row,
+        the refused-arguments one included: this is an authenticated,
+        state-changing entry point reachable from more than one surface, so
+        argument probing against it must not be the one thing the audit log
+        cannot see.
+
+        Every one of those rows records `args`, the submitted dict -- never
+        `kwargs`. `ToolSchema.validate` returns attribute values, so a nested
+        model parameter arrives as a model instance and `json_safe` has no
+        branch for one: it would be stored as its `str()`. The model-facing
+        path (`Router`) logs the submitted arguments too, so recording the
+        coerced ones here would mean the same tool, called two ways, produced
+        two shapes of `args` in one table -- and comparing exactly that across
+        the `actor`/`source` columns is what they exist for.
+        """
+        tool = self._registry.tools.get(tool_name)
+        if tool is None or tool.action is None:
+            raise UnknownActionError(f"no action {tool_name!r}")
+        try:
+            # The registry's own coercion, not a bare model_validate +
+            # model_dump: `validate` returns attribute values, so a nested
+            # model parameter reaches the tool as the model instance the tool
+            # annotated, where model_dump() would hand it a plain dict. Same
+            # coercion the model-facing path uses, so one tool cannot receive
+            # two different shapes of argument depending on who invoked it.
+            kwargs = tool.schema.validate(args)
+        except ToolValidationError as e:
+            await log_activity(
+                self._db,
+                # The submitted args, like every other outcome here -- and on
+                # this path there is nothing else to record anyway: coercion
+                # is exactly what failed.
+                tool=tool_name,
+                args=args,
+                status="error",
+                result_preview=str(e),
+                actor=actor,
+                source=source,
+            )
+            raise ActionArgumentError(str(e)) from e
+        try:
+            # `asyncio.timeout`, not `wait_for`: `cm.expired()` is true only
+            # when OUR deadline fired, so a tool raising TimeoutError itself
+            # (an OS connect timeout IS TimeoutError since 3.10) keeps its own
+            # message instead of being reported as a fabricated deadline. The
+            # same idiom widgets.py and scheduler.py use.
+            async with asyncio.timeout(tool.timeout) as cm:
+                result = await tool.fn(**kwargs)
+        except TimeoutError as e:
+            if cm.expired():
+                detail = f"action {tool_name} timed out after {tool.timeout}s"
+                await self._log_action_error(tool_name, args, detail, actor=actor, source=source)
+                raise TimeoutError(detail) from e
+            await self._log_action_error(
+                tool_name, args, str(e) or type(e).__name__, actor=actor, source=source
+            )
+            raise
+        except Exception as e:
+            await self._log_action_error(
+                tool_name, args, str(e) or type(e).__name__, actor=actor, source=source
+            )
+            raise
+        # The same normalization the model-facing path uses, so one tool
+        # cannot present two different shapes depending on who called it.
+        text = result if isinstance(result, str) else json.dumps(json_safe(result))
+        cap = self._settings.router.tool_result_cap
+        if len(text) > cap:
+            # Marker format copied verbatim from window.truncate_tool_result,
+            # which can't be reused here: it takes and returns a `Message`.
+            # Silent truncation would leave an operator reading output that
+            # ends mid-word with no way to tell that from the tool's own
+            # output.
+            text = text[:cap] + f"…[truncated {len(text) - cap} chars]"
+        await log_activity(
+            self._db,
+            tool=tool_name,
+            args=args,
+            status="ok",
+            result_preview=text,
+            actor=actor,
+            source=source,
+        )
+        return text
 
     async def recent_messages(self, channel: str, limit: int = 200) -> list[dict[str, Any]]:
         """Chat history for `channel` — used by the dashboard's /chat page.
@@ -353,6 +506,8 @@ class Runtime:
                 "tool": r.tool,
                 "args": r.args,
                 "status": r.status,
+                "actor": r.actor,
+                "source": r.source,
                 "result_preview": r.result_preview,
                 "created_at": r.created_at,
             }

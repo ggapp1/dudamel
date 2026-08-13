@@ -54,6 +54,32 @@ async def add_note(title: str) -> str:
     return f"Noted: {title}"
 '''
 
+LOCAL_APP_WITH_ACTION = '''from dudamel import App
+
+app = App("notebook", description="Keep short notes")
+
+
+class Entry(app.Model, table="entries"):
+    title: str
+
+
+@app.tool
+async def add_note(title: str) -> str:
+    """Write down a note."""
+    return f"Noted: {title}"
+
+
+@app.tool(action="Done")
+async def archive_note(id: int) -> str:
+    """Archive a note."""
+    return "archived"
+
+
+@app.widget(title="Notes", renderer="markdown")
+async def recent() -> str:
+    return "nothing yet"
+'''
+
 LOCAL_ASSISTANT = """from apps.notebook import app as notebook_app
 
 from dudamel import Orchestrator
@@ -71,6 +97,15 @@ def scaffold_with_local_app(tmp_path: Path, name: str = "proj") -> Path:
     developer following the project README does."""
     target = scaffold(tmp_path, name)
     (target / "apps" / "notebook.py").write_text(LOCAL_APP)
+    (target / "assistant.py").write_text(LOCAL_ASSISTANT)
+    return target
+
+
+def scaffold_with_action_app(tmp_path: Path, name: str = "proj") -> Path:
+    """The same project, whose app also declares a button-labelled tool and a
+    widget -- what the homescreen diagnostics have anything to say about."""
+    target = scaffold(tmp_path, name)
+    (target / "apps" / "notebook.py").write_text(LOCAL_APP_WITH_ACTION)
     (target / "assistant.py").write_text(LOCAL_ASSISTANT)
     return target
 
@@ -396,6 +431,148 @@ def test_doctor_runs_green_on_scaffolded_project_even_fully_offline(
     assert "no revisions yet" not in out
 
 
+def test_doctor_tool_table_shows_the_action_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The table an operator reads to decide what runs unconfirmed must also
+    say which tools carry a button, since a labelled tool is invocable with no
+    model in the path."""
+    target = scaffold_with_action_app(tmp_path)
+    monkeypatch.chdir(target)
+    assert cli.main(["db", "migrate", "-m", "init"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "action" in out
+    archive_row = next(line for line in out.splitlines() if line.startswith("archive_note"))
+    assert "Done" in archive_row
+    add_row = next(line for line in out.splitlines() if line.startswith("add_note"))
+    assert "Done" not in add_row
+
+
+def test_doctor_tool_table_stays_aligned_under_a_label_at_the_contract_cap() -> None:
+    """The contract caps a label at ACTION_LABEL_MAX, so the column has to hold
+    one -- otherwise the longest labels, the ones most worth reading, are the
+    rows whose remaining columns slide out of line."""
+    from dudamel import App
+    from dudamel.contract.renderers import ACTION_LABEL_MAX
+
+    app = App("notebook", description="Keep short notes")
+    at_cap = "Mark as done and archive it now"[:ACTION_LABEL_MAX].ljust(ACTION_LABEL_MAX, "x")
+    assert len(at_cap) == ACTION_LABEL_MAX and " " in at_cap
+
+    @app.tool
+    async def plain() -> str:
+        """No button."""
+        return ""
+
+    @app.tool(action="Done")
+    async def short() -> str:
+        """A short label."""
+        return ""
+
+    @app.tool(action=at_cap)
+    async def long() -> str:
+        """A label at the cap."""
+        return ""
+
+    rows = cli._render_tool_table(Orchestrator(apps=[app])).splitlines()
+    header, _rule, *body = rows
+    origin_col = header.index("origin")
+    for row in body:
+        assert row.index("native") == origin_col, row
+    assert at_cap in next(row for row in body if row.startswith("long"))
+    # the unlabelled tool reads as a dash, not as blank
+    assert "-" in next(row for row in body if row.startswith("plain"))
+
+
+def test_doctor_reports_a_layout_id_that_is_not_a_registered_widget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A dead layout id renders nothing and says nothing on the dashboard --
+    by design, so that disabling an app degrades rather than breaks. Doctor is
+    where it becomes visible, as a reported line and not a failure exit."""
+    target = scaffold_with_action_app(tmp_path)
+    config = target / "dudamel.toml"
+    config.write_text(
+        config.read_text()
+        + '\n[[home.section]]\ntitle = "Today"\nwidgets = ["notebook.recent", "gone.away"]\n'
+    )
+    monkeypatch.chdir(target)
+    assert cli.main(["db", "migrate", "-m", "init"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "gone.away" in out
+    assert "notebook.recent is not a registered widget" not in out
+
+
+def test_doctor_reports_a_widget_listed_in_two_sections(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A widget named twice renders once, at its first mention; the later
+    mention is silently dropped, so doctor names it."""
+    target = scaffold_with_action_app(tmp_path)
+    config = target / "dudamel.toml"
+    config.write_text(
+        config.read_text()
+        + '\n[[home.section]]\ntitle = "A"\nwidgets = ["notebook.recent"]\n'
+        + '\n[[home.section]]\ntitle = "B"\nwidgets = ["notebook.recent"]\n'
+    )
+    monkeypatch.chdir(target)
+    assert cli.main(["db", "migrate", "-m", "init"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "notebook.recent is listed more than once" in out
+
+
+def test_doctor_reports_a_layout_id_whose_app_is_switched_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A local app switched off in config is still registered in `assistant.py`
+    but no longer renders, so its ids are dead ids. Judged against the app's
+    own registration they would look live, and the one line telling the
+    operator why the section is empty would never print."""
+    target = scaffold_with_action_app(tmp_path)
+    config = target / "dudamel.toml"
+    config.write_text(
+        config.read_text()
+        + "\n[apps.notebook]\nenabled = false\n"
+        + '\n[[home.section]]\ntitle = "Today"\nwidgets = ["notebook.recent"]\n'
+    )
+    monkeypatch.chdir(target)
+    capsys.readouterr()
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "notebook.recent is not a registered widget" in out
+
+
+def test_doctor_does_not_call_layout_ids_dead_when_the_assistant_cannot_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With no importable assistant there are no resolved apps, so every id
+    would look dead. That would send the operator editing dudamel.toml over a
+    problem that does not exist; the import failure is the one finding."""
+    target = scaffold_with_action_app(tmp_path)
+    (target / "assistant.py").write_text("raise RuntimeError('boom')\n")
+    config = target / "dudamel.toml"
+    config.write_text(
+        config.read_text() + '\n[[home.section]]\ntitle = "Today"\nwidgets = ["notebook.recent"]\n'
+    )
+    monkeypatch.chdir(target)
+    capsys.readouterr()
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "raised on import" in out
+    assert "is not a registered widget" not in out
+
+
 def test_doctor_on_a_fresh_project_does_not_advise_a_migrate_that_would_do_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -676,11 +853,11 @@ def test_doctor_tool_table_reports_the_external_flag(
     assert cli.main(["doctor"]) == 0
     out = capsys.readouterr().out
     rows = {line.split()[0]: line.split() for line in out.splitlines() if line.split()}
-    # Columns: name, read_only, confirm, external, origin.
-    assert rows["read_feed"] == ["read_feed", "True", "False", "True", "native"]
+    # Columns: name, read_only, confirm, external, action, origin.
+    assert rows["read_feed"] == ["read_feed", "True", "False", "True", "-", "native"]
     # An ordinary tool still gets the column, reading False -- absence of the
     # word is not the same as a reported False.
-    assert rows["add_note"] == ["add_note", "False", "False", "False", "native"]
+    assert rows["add_note"] == ["add_note", "False", "False", "False", "-", "native"]
 
 
 # --- token rotate --------------------------------------------------------

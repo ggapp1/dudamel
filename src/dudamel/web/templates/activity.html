@@ -3,17 +3,19 @@
 {% block content %}
 <h1>Activity</h1>
 <table>
-  <thead><tr><th>When</th><th>Tool</th><th>Status</th><th>Result</th></tr></thead>
+  <thead><tr><th>When</th><th>Tool</th><th>Status</th><th>Source</th><th>Actor</th><th>Result</th></tr></thead>
   <tbody>
     {% for row in rows %}
       <tr>
         <td>{{ row.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
         <td>{{ row.tool }}</td>
         <td>{{ row.status }}</td>
+        <td>{{ row.source or '' }}</td>
+        <td>{{ row.actor or '' }}</td>
         <td>{{ row.result_preview or '' }}</td>
       </tr>
     {% else %}
-      <tr><td colspan="4">No activity yet.</td></tr>
+      <tr><td colspan="6">No activity yet.</td></tr>
     {% endfor %}
   </tbody>
 </table>

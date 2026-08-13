@@ -158,3 +158,131 @@ def test_mcp_origin_is_untrusted_even_without_the_external_flag():
     tool.origin = "mcp"
     assert tool.untrusted is True
     assert tool.external is False  # the declared flag is untouched
+
+
+def test_tool_action_label_is_stored_and_stripped() -> None:
+    app = App("tasks", description="d")
+
+    @app.tool(action="  Done  ")
+    async def complete(id: int) -> str:
+        """Complete a task."""
+        return "ok"
+
+    assert app.tools["complete"].action == "Done"
+
+
+def test_tool_without_action_has_none() -> None:
+    app = App("tasks", description="d")
+
+    @app.tool
+    async def plain(id: int) -> str:
+        """Plain."""
+        return "ok"
+
+    assert app.tools["plain"].action is None
+
+
+def test_blank_action_label_is_rejected() -> None:
+    app = App("tasks", description="d")
+    with pytest.raises(RegistryError, match="must not be empty"):
+
+        @app.tool(action="   ")
+        async def complete(id: int) -> str:
+            """Complete a task."""
+            return "ok"
+
+
+def test_overlong_action_label_is_rejected() -> None:
+    app = App("tasks", description="d")
+    with pytest.raises(RegistryError, match="at most 32 characters"):
+
+        @app.tool(action="x" * 33)
+        async def complete(id: int) -> str:
+            """Complete a task."""
+            return "ok"
+
+
+def test_action_label_of_exactly_the_limit_is_accepted() -> None:
+    """32 characters is the longest label that fits, not the first that does
+    not -- pinned from the accepting side so the comparison cannot quietly
+    tighten to `>=`."""
+    app = App("tasks", description="d")
+    label = "x" * 32
+
+    @app.tool(action=label)
+    async def complete(id: int) -> str:
+        """Complete a task."""
+        return "ok"
+
+    assert app.tools["complete"].action == label
+
+
+def test_action_label_is_stripped_before_the_length_check() -> None:
+    """Padding is not length: a label that only exceeds the limit because of
+    surrounding whitespace is accepted, and stored stripped."""
+    app = App("tasks", description="d")
+
+    @app.tool(action="  " + "x" * 32)
+    async def complete(id: int) -> str:
+        """Complete a task."""
+        return "ok"
+
+    assert app.tools["complete"].action == "x" * 32
+
+
+def test_bidi_and_control_characters_are_stripped_from_a_registered_label() -> None:
+    """A label is drawn on a button, put into a confirm dialog and read out by
+    a screen reader; a direction override makes all three read as something
+    other than the tool they run. Neutralized where the label is accepted, so
+    an HTML surface and a plain-text one cannot disagree about what a button
+    says."""
+    app = App("tasks", description="d")
+
+    @app.tool(action="Nuke\u202e evihcrA\u2069\x07")
+    async def complete(id: int) -> str:
+        """Complete a task."""
+        return "ok"
+
+    assert app.tools["complete"].action == "Nuke evihcrA"
+
+
+def test_a_label_is_sanitized_before_its_length_is_measured() -> None:
+    """Ordering, not cosmetics. Measuring first would approve a label at the
+    cap and then store a shorter one, and would store a label spelled entirely
+    out of overrides as the empty string the non-empty rule exists to refuse."""
+    app = App("tasks", description="d")
+
+    @app.tool(action="x" * 32 + "\u202e\u202a")
+    async def complete(id: int) -> str:
+        """Complete a task."""
+        return "ok"
+
+    assert app.tools["complete"].action == "x" * 32
+
+    other = App("chores", description="d")
+    with pytest.raises(RegistryError, match="must not be empty"):
+
+        @other.tool(action="\u202e\u2066")
+        async def wipe(id: int) -> str:
+            """Delete a task."""
+            return "ok"
+
+
+def test_widget_actions_default_to_empty_tuple() -> None:
+    app = App("tasks", description="d")
+
+    @app.widget(title="T", renderer="markdown")
+    async def card() -> str:
+        return "hi"
+
+    assert app.widgets["card"].actions == ()
+
+
+def test_widget_qualified_id_is_app_dot_widget() -> None:
+    app = App("tasks", description="d")
+
+    @app.widget(title="T", renderer="markdown")
+    async def today() -> str:
+        return "hi"
+
+    assert app.widgets["today"].qualified_id == "tasks.today"

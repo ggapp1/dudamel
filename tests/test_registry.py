@@ -1,8 +1,15 @@
 import pytest
 
 from dudamel import App, Orchestrator
+from dudamel.contract.schema import ToolSchema
+from dudamel.contract.types import Tool
 from dudamel.exceptions import RegistryError
 from dudamel.registry import Registry
+
+
+async def _noop() -> str:
+    """Noop."""
+    return "ok"
 
 
 def app_with_tool(app_name: str, tool_name: str) -> App:
@@ -59,3 +66,117 @@ def test_orchestrator_is_pure():
     assert orc.mcp == ["uvx mcp-server-fetch"]  # stored, not launched
     # purity: no scheduler, no subprocesses, no event loop, no db binding
     assert a._database is None
+
+
+def _labelled_app() -> App:
+    app = App("tasks", description="d")
+
+    @app.tool(action="Refresh")
+    async def refresh() -> str:
+        """Refresh."""
+        return "ok"
+
+    return app
+
+
+def test_card_action_naming_a_labelled_zero_arg_tool_is_accepted() -> None:
+    app = _labelled_app()
+
+    @app.widget(title="T", renderer="markdown", actions=["refresh"])
+    async def card() -> str:
+        return "hi"
+
+    registry = Registry([app])
+    assert registry.widgets[0].actions == ("refresh",)
+
+
+def test_card_action_naming_an_unknown_tool_is_rejected() -> None:
+    app = App("tasks", description="d")
+
+    @app.widget(title="T", renderer="markdown", actions=["nope"])
+    async def card() -> str:
+        return "hi"
+
+    with pytest.raises(RegistryError, match="not an action-labelled tool"):
+        Registry([app])
+
+
+def test_card_action_naming_an_unlabelled_tool_is_rejected() -> None:
+    app = App("tasks", description="d")
+
+    @app.tool
+    async def plain() -> str:
+        """Plain."""
+        return "ok"
+
+    @app.widget(title="T", renderer="markdown", actions=["plain"])
+    async def card() -> str:
+        return "hi"
+
+    with pytest.raises(RegistryError, match="has no action= label"):
+        Registry([app])
+
+
+def test_card_action_with_a_required_parameter_is_rejected() -> None:
+    app = App("tasks", description="d")
+
+    @app.tool(action="Do")
+    async def needs_arg(id: int) -> str:
+        """Needs an arg."""
+        return "ok"
+
+    @app.widget(title="T", renderer="markdown", actions=["needs_arg"])
+    async def card() -> str:
+        return "hi"
+
+    with pytest.raises(RegistryError, match="required parameter"):
+        Registry([app])
+
+
+def test_card_action_with_only_optional_parameters_is_accepted() -> None:
+    """The rule is "nothing the button would have to collect", not "no
+    parameters at all". A parameter with a default is supplied by the tool
+    itself, so a card button can still invoke it with no input."""
+    app = App("tasks", description="d")
+
+    @app.tool(action="Refresh")
+    async def refresh(limit: int = 10) -> str:
+        """Refresh."""
+        return str(limit)
+
+    @app.widget(title="T", renderer="markdown", actions=["refresh"])
+    async def card() -> str:
+        return "hi"
+
+    registry = Registry([app])
+    assert registry.widgets[0].actions == ("refresh",)
+
+
+def test_card_action_naming_another_apps_tool_is_rejected() -> None:
+    other = _labelled_app()
+    mine = App("notes", description="d")
+
+    @mine.widget(title="T", renderer="markdown", actions=["refresh"])
+    async def card() -> str:
+        return "hi"
+
+    with pytest.raises(RegistryError, match="not an action-labelled tool"):
+        Registry([other, mine])
+
+
+def test_mcp_tool_may_not_carry_an_action_label() -> None:
+    registry = Registry([])
+    tool = Tool(
+        name="srv__thing",
+        app_name="srv",
+        description="d",
+        fn=_noop,
+        schema=ToolSchema(_noop),
+        read_only=True,
+        confirm=False,
+        timeout=1.0,
+        origin="mcp",
+        action="Click me",
+    )
+    with pytest.raises(RegistryError, match="action label"):
+        registry.add_mcp_tools([tool])

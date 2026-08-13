@@ -287,7 +287,7 @@ async def test_taint_survives_suspension_gap(tmp_path) -> None:
     registry.tools["cloud_fetch"].origin = "mcp"  # simulate an MCP-provided read
 
     r1 = await router.handle(channel="t:1", text="do it", user_id="u1")
-    assert r1.pending_confirmation_id  # set_pref gated by batch_has_mcp
+    assert r1.pending_confirmation_id  # set_pref gated by batch_has_untrusted
     assert MUTATED == [] and READS == ["fetch"]  # mcp read ran, mutation held
 
     r2 = await router.resolve_confirmation(r1.pending_confirmation_id, approved=True, user_id="u1")
