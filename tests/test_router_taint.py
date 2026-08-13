@@ -486,3 +486,31 @@ async def test_window_mode_taints_across_turns_from_an_external_call(tmp_path) -
     assert second.pending_confirmation_id is not None
     assert MUTATIONS == []
     await db.dispose()
+
+
+async def test_dropped_span_with_an_external_call_is_tainted(tmp_path) -> None:
+    """The persisted half of the rule: a Summary row's `tainted` column is
+    computed from the span about to be dropped, and that column seeds taint
+    for every later turn. A span containing a native tool that returned web
+    content must be recorded as tainted, or the condensed injected content is
+    trusted from then on."""
+    router, fp, db = build(tmp_path, [], taint_mode="turn")
+    span = [
+        Message(role="assistant", tool_calls=[ToolCall(id="m1", name="read_feed", args={})]),
+        Message(role="tool", text="FEED CONTENT", tool_call_id="m1"),
+    ]
+    assert router._dropped_tainted(span) is True
+    await db.dispose()
+
+
+async def test_dropped_span_with_an_ordinary_native_call_is_not_tainted(tmp_path) -> None:
+    """The other side of the branch: an ordinary native tool in the dropped
+    span leaves the summary clean. Without this, a `_dropped_tainted` that
+    returned True unconditionally would pass the test above."""
+    router, fp, db = build(tmp_path, [], taint_mode="turn")
+    span = [
+        Message(role="assistant", tool_calls=[ToolCall(id="m1", name="count_notes", args={})]),
+        Message(role="tool", text="0", tool_call_id="m1"),
+    ]
+    assert router._dropped_tainted(span) is False
+    await db.dispose()
