@@ -17,12 +17,18 @@ import pytest
 
 from dudamel.apps import SuiteApp
 from dudamel.cli import main
-from dudamel.migrate import upgrade_all, upgrade_core
+from dudamel.migrate import ensure_app_migrations, upgrade_all, upgrade_apps, upgrade_core
 
 SUITE_MODULE = """
 from dudamel import App
 
 app = App("papers", description="arXiv digests")
+
+
+@app.tool
+async def read_papers() -> str:
+    \"\"\"Read today's digest.\"\"\"
+    return "ok"
 """
 
 SUITE_REV = '''"""papers init
@@ -41,6 +47,28 @@ depends_on = None
 
 def upgrade() -> None:
     op.create_table("papers_paper", sa.Column("id", sa.Integer(), primary_key=True))
+
+
+def downgrade() -> None:
+    raise NotImplementedError
+'''
+
+PROJECT_REV = '''"""blog init
+
+Revision ID: a1
+Revises:
+"""
+import sqlalchemy as sa
+from alembic import op
+
+revision = "a1"
+down_revision = None
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    op.create_table("blog_post", sa.Column("id", sa.Integer(), primary_key=True))
 
 
 def downgrade() -> None:
@@ -214,6 +242,10 @@ def test_apps_list_includes_local_apps(
     assert "local" in row
     assert "my own app" in row
     assert "enabled" in row
+    # A local app has no lane of its own -- it lives in the project's shared
+    # migrations/ lane, which is not the same claim as "never consulted".
+    assert "project" in row
+    assert "—" not in row
 
 
 def test_apps_list_survives_a_missing_project_module(
@@ -290,6 +322,50 @@ def test_doctor_survives_an_assistant_that_raises(
     assert "boom" in out
     assert "database connection" in out
     assert "app resolution: 0 enabled, 0 error(s)" in out
+
+
+def test_doctor_reads_the_project_lane_from_settings_project_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An explicit `project_dir` in dudamel.toml wins, and the runtime resolves
+    the project's own migration lane from exactly that. Reading the cwd instead
+    would let doctor report a green schema on a project whose unapplied lane
+    the startup gate then refuses to start on."""
+    register(monkeypatch)
+    project = write_project(tmp_path, 'project_dir = "sub"\n')
+    sub = project / "sub"
+    sub.mkdir()
+    url = db_url_for(project)
+    upgrade_core(url)  # core is current; only the project lane is not
+    ensure_app_migrations(sub)
+    (sub / "migrations" / "versions" / "a1.py").write_text(PROJECT_REV)
+    assert not (project / "migrations").exists()
+    monkeypatch.chdir(project)
+
+    assert main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "✗ pending migrations: app schema is behind head" in out
+    assert "✓ app migrations dir: present (1 revision)" in out
+
+    upgrade_apps(url, sub)
+    assert main(["doctor"]) == 0
+    assert "✓ pending migrations" in capsys.readouterr().out
+
+
+def test_doctor_tool_table_covers_apps_enabled_only_in_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The tool table is what an operator reads to decide what may run
+    unconfirmed, and doctor announces the app two lines above it: a suite app
+    enabled purely in dudamel.toml is not in the project's own registry, so a
+    table built from that registry would omit its tools."""
+    install_papers(tmp_path, monkeypatch, revision=False)
+    project = write_project(tmp_path, "[apps.papers]\nenabled = true\n")
+    monkeypatch.chdir(project)
+    assert main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "app resolution: 1 enabled" in out
+    assert "read_papers" in out
 
 
 def test_doctor_does_not_create_a_missing_sqlite_file(
