@@ -20,7 +20,13 @@ from dudamel.config import Settings, TierConfig
 from dudamel.contract.types import Tool
 from dudamel.convo import ConversationStore
 from dudamel.db import Database
-from dudamel.exceptions import DudamelError, LLMError, RegistryError, ToolValidationError
+from dudamel.exceptions import (
+    ActionArgumentError,
+    DudamelError,
+    LLMError,
+    RegistryError,
+    ToolValidationError,
+)
 from dudamel.llm.anthropic import AnthropicProvider
 from dudamel.llm.client import LLMClient, Tier
 from dudamel.llm.openai_compat import OpenAICompatProvider
@@ -353,6 +359,19 @@ class Runtime:
             )
         )
 
+    async def _log_action_error(
+        self, tool_name: str, args: dict[str, Any], detail: str, *, actor: str, source: str
+    ) -> None:
+        await log_activity(
+            self._db,
+            tool=tool_name,
+            args=args,
+            status="error",
+            result_preview=detail,
+            actor=actor,
+            source=source,
+        )
+
     async def run_action(
         self, tool_name: str, args: dict[str, Any], *, actor: str, source: str
     ) -> str:
@@ -364,37 +383,73 @@ class Runtime:
         decision the confirm machine exists to get.
 
         Raises KeyError if `tool_name` is not an action-labelled tool,
-        ValueError if `args` do not coerce, and whatever the tool raises
-        otherwise.
+        ActionArgumentError (a ValueError) if `args` do not coerce, and
+        whatever the tool raises otherwise -- except that OUR deadline
+        expiring raises a TimeoutError that says so.
+
+        Every outcome past the name lookup writes exactly one activity row,
+        the refused-arguments one included: this is an authenticated,
+        state-changing entry point reachable from more than one surface, so
+        argument probing against it must not be the one thing the audit log
+        cannot see.
         """
         tool = self._registry.tools.get(tool_name)
         if tool is None or tool.action is None:
             raise KeyError(tool_name)
         try:
-            # The registry's own coercion, not a bare model_validate/model_dump:
-            # it is what hands a tool Enum members and date objects (the
-            # documented tool-parameter contract), so a tool cannot receive a
-            # different shape of argument depending on who invoked it.
+            # The registry's own coercion, not a bare model_validate +
+            # model_dump: `validate` returns attribute values, so a nested
+            # model parameter reaches the tool as the model instance the tool
+            # annotated, where model_dump() would hand it a plain dict. Same
+            # coercion the model-facing path uses, so one tool cannot receive
+            # two different shapes of argument depending on who invoked it.
             kwargs = tool.schema.validate(args)
         except ToolValidationError as e:
-            raise ValueError(str(e)) from e
-        try:
-            result = await asyncio.wait_for(tool.fn(**kwargs), tool.timeout)
-        except Exception as e:
             await log_activity(
                 self._db,
+                # The raw args, not `kwargs`: coercion is exactly what failed,
+                # so what was actually submitted is the only thing to record.
                 tool=tool_name,
-                args=kwargs,
+                args=args,
                 status="error",
-                result_preview=str(e) or type(e).__name__,
+                result_preview=str(e),
                 actor=actor,
                 source=source,
+            )
+            raise ActionArgumentError(str(e)) from e
+        try:
+            # `asyncio.timeout`, not `wait_for`: `cm.expired()` is true only
+            # when OUR deadline fired, so a tool raising TimeoutError itself
+            # (an OS connect timeout IS TimeoutError since 3.10) keeps its own
+            # message instead of being reported as a fabricated deadline. The
+            # same idiom widgets.py and scheduler.py use.
+            async with asyncio.timeout(tool.timeout) as cm:
+                result = await tool.fn(**kwargs)
+        except TimeoutError as e:
+            if cm.expired():
+                detail = f"action {tool_name} timed out after {tool.timeout}s"
+                await self._log_action_error(tool_name, kwargs, detail, actor=actor, source=source)
+                raise TimeoutError(detail) from e
+            await self._log_action_error(
+                tool_name, kwargs, str(e) or type(e).__name__, actor=actor, source=source
+            )
+            raise
+        except Exception as e:
+            await self._log_action_error(
+                tool_name, kwargs, str(e) or type(e).__name__, actor=actor, source=source
             )
             raise
         # The same normalization the model-facing path uses, so one tool
         # cannot present two different shapes depending on who called it.
         text = result if isinstance(result, str) else json.dumps(json_safe(result))
-        text = text[: self._settings.router.tool_result_cap]
+        cap = self._settings.router.tool_result_cap
+        if len(text) > cap:
+            # Marker format copied verbatim from window.truncate_tool_result,
+            # which can't be reused here: it takes and returns a `Message`.
+            # Silent truncation would leave an operator reading output that
+            # ends mid-word with no way to tell that from the tool's own
+            # output.
+            text = text[:cap] + f"…[truncated {len(text) - cap} chars]"
         await log_activity(
             self._db,
             tool=tool_name,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import timedelta
 from pathlib import Path
@@ -9,7 +10,7 @@ import pytest
 from sqlalchemy import select
 
 from dudamel import App, Orchestrator, Runtime
-from dudamel.config import Settings, TierConfig, WebConfig
+from dudamel.config import RouterConfig, Settings, TierConfig, WebConfig
 from dudamel.llm.testing import Completion, FakeProvider, fake_text, fake_tool_call
 from dudamel.models_core import Activity, PendingConfirmation
 from dudamel.router import _utcnow
@@ -18,6 +19,10 @@ from dudamel.web.auth import CSRF_HEADER
 from dudamel.web.throttle import MAX_FAILURES
 
 TOKEN = "s3cr3t-token"  # noqa: S105 — test fixture, not a real credential
+# Read from the same config default `make_settings` leaves in place, so the
+# cap the tools below straddle can never drift away from the enforced one.
+RESULT_CAP = RouterConfig().tool_result_cap
+OVERSHOOT = 808
 
 
 def make_orc() -> Orchestrator:
@@ -46,6 +51,27 @@ def make_orc() -> Orchestrator:
     async def explode() -> str:
         """Always fails."""
         raise RuntimeError("kaboom")
+
+    @app.tool(action="Refuse")
+    async def refuse(id: int) -> str:
+        """Fails the way ordinary Python app code fails."""
+        raise ValueError("task 7 does not exist")
+
+    @app.tool(action="Spew")
+    async def spew() -> str:
+        """Returns more than the result cap allows."""
+        return "x" * (RESULT_CAP + OVERSHOOT)
+
+    @app.tool(action="Nap", timeout=0.01)
+    async def nap() -> str:
+        """Outlives its own deadline."""
+        await asyncio.sleep(5)
+        return "never"
+
+    @app.tool(action="Stall")
+    async def stall() -> str:
+        """Raises the timeout its own upstream hit, well inside its deadline."""
+        raise TimeoutError("upstream connect timed out")
 
     return Orchestrator(apps=[app])
 
@@ -702,5 +728,118 @@ async def test_action_writes_an_activity_row_naming_the_actor_and_surface(
         rows = (await s.execute(select(Activity))).scalars().all()
     assert [(r.tool, r.status, r.actor, r.source) for r in rows] == [
         ("complete", "ok", "web", "web")
+    ]
+    await rt.stop()
+
+
+async def test_a_tool_raising_valueerror_is_502_while_bad_arguments_stay_400(
+    tmp_path: Path, token_env: str
+) -> None:
+    """The pair is the point. ValueError is the most idiomatic failure in
+    Python app code, so a tool body raises it routinely -- and if that is
+    indistinguishable from arguments that would not coerce, the endpoint
+    hands back the tool's own message under a status telling the caller their
+    input was malformed."""
+    rt, transport = await build(tmp_path, [])
+    headers = {"Authorization": f"Bearer {token_env}"}
+    async with client(transport) as c:
+        coercion = await c.post("/api/action/refuse", json={"args": {"id": "abc"}}, headers=headers)
+        assert coercion.status_code == 400
+        assert "invalid arguments" in coercion.json()["detail"]
+
+        raised = await c.post("/api/action/refuse", json={"args": {"id": 7}}, headers=headers)
+        assert raised.status_code == 502
+        assert raised.json()["detail"] == "task 7 does not exist"
+    await rt.stop()
+
+
+async def test_a_failed_action_writes_an_error_row_naming_the_actor_and_surface(
+    tmp_path: Path, token_env: str
+) -> None:
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        await c.post(
+            "/api/action/explode",
+            json={"args": {}},
+            headers={"Authorization": f"Bearer {token_env}"},
+        )
+    async with rt._db.session() as s:
+        rows = (await s.execute(select(Activity))).scalars().all()
+    assert [(r.tool, r.status, r.actor, r.source) for r in rows] == [
+        ("explode", "error", "web", "web")
+    ]
+    assert rows[0].result_preview == "kaboom"
+    await rt.stop()
+
+
+async def test_refused_arguments_are_recorded_too(tmp_path: Path, token_env: str) -> None:
+    """An authenticated, state-changing endpoint reachable from more than one
+    surface: argument probing against it must not be the one thing the audit
+    log cannot see. The row keeps the arguments as submitted, since coercing
+    them is precisely what failed."""
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        res = await c.post(
+            "/api/action/complete",
+            json={"args": {"id": "abc"}},
+            headers={"Authorization": f"Bearer {token_env}"},
+        )
+        assert res.status_code == 400
+    async with rt._db.session() as s:
+        rows = (await s.execute(select(Activity))).scalars().all()
+    assert [(r.tool, r.status, r.actor, r.source) for r in rows] == [
+        ("complete", "error", "web", "web")
+    ]
+    assert rows[0].args == {"id": "abc"}
+    await rt.stop()
+
+
+async def test_an_oversized_result_is_capped_and_says_so(tmp_path: Path, token_env: str) -> None:
+    """Truncating silently leaves an operator reading output that stops
+    mid-word with no way to tell that from the tool's own output. The marker
+    is the one the model-facing plane already uses."""
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        res = await c.post(
+            "/api/action/spew",
+            json={"args": {}},
+            headers={"Authorization": f"Bearer {token_env}"},
+        )
+    assert res.status_code == 200
+    result = res.json()["result"]
+    assert result == "x" * RESULT_CAP + f"…[truncated {OVERSHOOT} chars]"
+    await rt.stop()
+
+
+async def test_an_expired_deadline_says_it_timed_out(tmp_path: Path, token_env: str) -> None:
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        res = await c.post(
+            "/api/action/nap",
+            json={"args": {}},
+            headers={"Authorization": f"Bearer {token_env}"},
+        )
+    assert res.status_code == 502
+    assert res.json()["detail"] == "action nap timed out after 0.01s"
+    await rt.stop()
+
+
+async def test_a_tool_raised_timeout_keeps_its_own_message(tmp_path: Path, token_env: str) -> None:
+    """A tool whose upstream connect times out raises TimeoutError from well
+    inside its own deadline. Reporting that as "timed out after 30.0s" would
+    fabricate a deadline that never fired and lose the real cause."""
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        res = await c.post(
+            "/api/action/stall",
+            json={"args": {}},
+            headers={"Authorization": f"Bearer {token_env}"},
+        )
+    assert res.status_code == 502
+    assert res.json()["detail"] == "upstream connect timed out"
+    async with rt._db.session() as s:
+        rows = (await s.execute(select(Activity))).scalars().all()
+    assert [(r.tool, r.status, r.result_preview) for r in rows] == [
+        ("stall", "error", "upstream connect timed out")
     ]
     await rt.stop()
