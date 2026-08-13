@@ -14,12 +14,13 @@ from typing import Any
 
 from sqlalchemy import select
 
+from dudamel.activity import json_safe, log_activity
 from dudamel.compaction import Compactor
 from dudamel.config import Settings, TierConfig
 from dudamel.contract.types import Tool
 from dudamel.convo import ConversationStore
 from dudamel.db import Database
-from dudamel.exceptions import DudamelError, LLMError, RegistryError
+from dudamel.exceptions import DudamelError, LLMError, RegistryError, ToolValidationError
 from dudamel.llm.anthropic import AnthropicProvider
 from dudamel.llm.client import LLMClient, Tier
 from dudamel.llm.openai_compat import OpenAICompatProvider
@@ -351,6 +352,59 @@ class Runtime:
                 )
             )
         )
+
+    async def run_action(
+        self, tool_name: str, args: dict[str, Any], *, actor: str, source: str
+    ) -> str:
+        """Execute one operator-invoked tool on the deterministic plane.
+
+        Deliberately NOT routed through `Router`: there is no model in this
+        path, so there is no window to build, no turn to taint, and no
+        confirmation to obtain -- the operator clicking a button IS the human
+        decision the confirm machine exists to get.
+
+        Raises KeyError if `tool_name` is not an action-labelled tool,
+        ValueError if `args` do not coerce, and whatever the tool raises
+        otherwise.
+        """
+        tool = self._registry.tools.get(tool_name)
+        if tool is None or tool.action is None:
+            raise KeyError(tool_name)
+        try:
+            # The registry's own coercion, not a bare model_validate/model_dump:
+            # it is what hands a tool Enum members and date objects (the
+            # documented tool-parameter contract), so a tool cannot receive a
+            # different shape of argument depending on who invoked it.
+            kwargs = tool.schema.validate(args)
+        except ToolValidationError as e:
+            raise ValueError(str(e)) from e
+        try:
+            result = await asyncio.wait_for(tool.fn(**kwargs), tool.timeout)
+        except Exception as e:
+            await log_activity(
+                self._db,
+                tool=tool_name,
+                args=kwargs,
+                status="error",
+                result_preview=str(e) or type(e).__name__,
+                actor=actor,
+                source=source,
+            )
+            raise
+        # The same normalization the model-facing path uses, so one tool
+        # cannot present two different shapes depending on who called it.
+        text = result if isinstance(result, str) else json.dumps(json_safe(result))
+        text = text[: self._settings.router.tool_result_cap]
+        await log_activity(
+            self._db,
+            tool=tool_name,
+            args=kwargs,
+            status="ok",
+            result_preview=text,
+            actor=actor,
+            source=source,
+        )
+        return text
 
     async def recent_messages(self, channel: str, limit: int = 200) -> list[dict[str, Any]]:
         """Chat history for `channel` — used by the dashboard's /chat page.

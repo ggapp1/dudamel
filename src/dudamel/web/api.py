@@ -55,6 +55,10 @@ class ConfirmRequest(BaseModel):
     approved: bool
 
 
+class ActionRequest(BaseModel):
+    args: dict[str, Any] = {}
+
+
 def is_loopback_host(host: str) -> bool:
     """Whether binding to `host` keeps the surface on this machine.
 
@@ -224,6 +228,32 @@ def create_api(runtime: Runtime, settings: Settings) -> FastAPI:
             confirmation_id, approved=payload.approved, user_id="web"
         )
         return {"text": reply.text, "pending_confirmation_id": reply.pending_confirmation_id}
+
+    @app.post("/api/action/{tool_name}")
+    async def api_action(
+        tool_name: str,
+        payload: ActionRequest,
+        auth: AuthVia = Depends(authenticate),
+    ) -> dict[str, Any]:
+        """Run one action-labelled tool directly, with no model in the path.
+
+        404 rather than 403 for a tool that exists but carries no action
+        label: the action namespace is the set of labelled tools, and a tool
+        outside it does not exist as far as this endpoint is concerned.
+        """
+        try:
+            result = await runtime.run_action(tool_name, payload.args, actor="web", source="web")
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"no action {tool_name!r}") from None
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except Exception as e:
+            # `str(e)` alone is empty for the exception types that carry no
+            # message -- a bare TimeoutError from the tool's own deadline
+            # being the one this path actually produces -- which would answer
+            # a failed action with a 502 that names nothing.
+            raise HTTPException(status_code=502, detail=str(e) or type(e).__name__) from e
+        return {"ok": True, "result": result}
 
     @app.get("/api/widgets")
     async def api_widgets(auth: AuthVia = Depends(authenticate)) -> list[dict[str, Any]]:

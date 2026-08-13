@@ -11,7 +11,7 @@ from sqlalchemy import select
 from dudamel import App, Orchestrator, Runtime
 from dudamel.config import Settings, TierConfig, WebConfig
 from dudamel.llm.testing import Completion, FakeProvider, fake_text, fake_tool_call
-from dudamel.models_core import PendingConfirmation
+from dudamel.models_core import Activity, PendingConfirmation
 from dudamel.router import _utcnow
 from dudamel.web.api import create_api
 from dudamel.web.auth import CSRF_HEADER
@@ -36,6 +36,16 @@ def make_orc() -> Orchestrator:
     @app.widget(title="Streak", renderer="markdown")
     async def streak() -> str:
         return "3 days"
+
+    @app.tool(action="Done")
+    async def complete(id: int) -> str:
+        """Complete a task."""
+        return f"done {id}"
+
+    @app.tool(action="Boom")
+    async def explode() -> str:
+        """Always fails."""
+        raise RuntimeError("kaboom")
 
     return Orchestrator(apps=[app])
 
@@ -568,3 +578,129 @@ async def test_localhost_bind_without_token_starts(
         create_api(rt, settings)  # must not raise
     finally:
         await rt.stop()
+
+
+# --- card actions: running one labelled tool, no model in the path -------------
+
+
+async def test_action_runs_with_bearer_auth(tmp_path: Path, token_env: str) -> None:
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        res = await c.post(
+            "/api/action/complete",
+            json={"args": {"id": 4}},
+            headers={"Authorization": f"Bearer {token_env}"},
+        )
+        assert res.status_code == 200
+        assert res.json() == {"ok": True, "result": "done 4"}
+    await rt.stop()
+
+
+async def test_action_coerces_string_arguments(tmp_path: Path, token_env: str) -> None:
+    """A "4" that comes back as "done 4" proves coercion ran; the browser
+    sends JSON, but nothing guarantees the type it sends."""
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        res = await c.post(
+            "/api/action/complete",
+            json={"args": {"id": "4"}},
+            headers={"Authorization": f"Bearer {token_env}"},
+        )
+        assert res.json()["result"] == "done 4"
+    await rt.stop()
+
+
+async def test_unlabelled_tool_is_not_an_action(tmp_path: Path, token_env: str) -> None:
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        res = await c.post(
+            "/api/action/log_workout",
+            json={"args": {"exercise": "squat"}},
+            headers={"Authorization": f"Bearer {token_env}"},
+        )
+        assert res.status_code == 404
+    await rt.stop()
+
+
+async def test_unknown_tool_is_404(tmp_path: Path, token_env: str) -> None:
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        res = await c.post(
+            "/api/action/nope",
+            json={"args": {}},
+            headers={"Authorization": f"Bearer {token_env}"},
+        )
+        assert res.status_code == 404
+    await rt.stop()
+
+
+async def test_bad_arguments_are_400(tmp_path: Path, token_env: str) -> None:
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        res = await c.post(
+            "/api/action/complete",
+            json={"args": {"id": "abc"}},
+            headers={"Authorization": f"Bearer {token_env}"},
+        )
+        assert res.status_code == 400
+    await rt.stop()
+
+
+async def test_a_raising_tool_is_502(tmp_path: Path, token_env: str) -> None:
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        res = await c.post(
+            "/api/action/explode",
+            json={"args": {}},
+            headers={"Authorization": f"Bearer {token_env}"},
+        )
+        assert res.status_code == 502
+        assert "kaboom" in res.text
+    await rt.stop()
+
+
+async def test_action_requires_authentication(tmp_path: Path, token_env: str) -> None:
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        res = await c.post("/api/action/complete", json={"args": {"id": 4}})
+        assert res.status_code == 401
+    await rt.stop()
+
+
+async def test_cookie_action_needs_csrf_and_succeeds_with_it(
+    tmp_path: Path, token_env: str
+) -> None:
+    """The end-to-end path the dashboard actually uses."""
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        login = await c.post("/login", json={"token": token_env})
+        csrf_token = login.json()["csrf_token"]
+
+        no_csrf = await c.post("/api/action/complete", json={"args": {"id": 4}})
+        assert no_csrf.status_code == 403
+
+        with_csrf = await c.post(
+            "/api/action/complete",
+            json={"args": {"id": 4}},
+            headers={CSRF_HEADER: csrf_token},
+        )
+        assert with_csrf.status_code == 200
+    await rt.stop()
+
+
+async def test_action_writes_an_activity_row_naming_the_actor_and_surface(
+    tmp_path: Path, token_env: str
+) -> None:
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        await c.post(
+            "/api/action/complete",
+            json={"args": {"id": 4}},
+            headers={"Authorization": f"Bearer {token_env}"},
+        )
+    async with rt._db.session() as s:
+        rows = (await s.execute(select(Activity))).scalars().all()
+    assert [(r.tool, r.status, r.actor, r.source) for r in rows] == [
+        ("complete", "ok", "web", "web")
+    ]
+    await rt.stop()

@@ -2,6 +2,7 @@
 {% block title %}dudamel — dashboard{% endblock %}
 {% block content %}
 <h1>Dashboard</h1>
+<input type="hidden" id="csrf-token" value="{{ csrf_token }}">
 <div id="widget-grid" class="grid"
      hx-get="/" hx-trigger="every 30s" hx-select="#widget-grid" hx-swap="outerHTML">
   {% for widget in widgets %}
