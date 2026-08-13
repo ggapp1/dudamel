@@ -521,7 +521,9 @@ def _render_tool_table(orchestrator: Orchestrator) -> str:
     return "\n".join(rows)
 
 
-def _load_orchestrator_for_diagnosis(project_dir: Path) -> tuple[Orchestrator, str | None]:
+def _load_orchestrator_for_diagnosis(
+    project_dir: Path, *, debug: bool = False
+) -> tuple[Orchestrator, str | None]:
     """The project's orchestrator, or an empty stand-in plus the message that
     explains why there isn't one.
 
@@ -530,12 +532,21 @@ def _load_orchestrator_for_diagnosis(project_dir: Path) -> tuple[Orchestrator, s
     an abort. `SystemExit` is named alongside `Exception` because it is not
     one: a module calling `sys.exit()` at import would otherwise take the whole
     diagnosis down. `KeyboardInterrupt` is deliberately still allowed through.
+
+    `--debug` opts back out of all of that. Swallowing the traceback is right
+    by default (the other checks still have to run) but it leaves an operator
+    debugging their own broken `assistant.py` with a single `repr` and no way
+    to ask for more; `debug` re-raises so `main` can print the real stack.
     """
     try:
         return _load_orchestrator(project_dir, _DEFAULT_MODULE), None
     except DudamelError as e:
+        if debug:
+            raise
         return Orchestrator(apps=[]), str(e)
     except (Exception, SystemExit) as e:
+        if debug:
+            raise
         # The project's own code raised; report it verbatim instead of dying
         # before the unrelated checks have had a chance to run.
         return Orchestrator(apps=[]), f"{_DEFAULT_MODULE}.py raised on import: {e!r}"
@@ -548,7 +559,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # Resolved up front, non-strict: the migration check below needs the
     # enabled suite apps' lanes, and a broken [apps.*] block must not stop
     # doctor reaching any of its other checks.
-    orchestrator, import_error = _load_orchestrator_for_diagnosis(project_dir)
+    orchestrator, import_error = _load_orchestrator_for_diagnosis(project_dir, debug=args.debug)
     resolution = resolve_apps(orchestrator, settings, strict=False)
 
     ok, detail = _check_db_connect(settings.database_url)
@@ -630,6 +641,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         try:
             table = _render_tool_table(Orchestrator(apps=resolution.apps, mcp=orchestrator.mcp))
         except Exception as e:
+            # Same escape hatch as the import above: the one-line collision
+            # message names the tool but not the apps' import sites.
+            if args.debug:
+                raise
             table = _line(False, "tool table", str(e))
         print(table)
         # `doctor` never starts the orchestrator, so MCP-mounted tools (only
@@ -701,7 +716,7 @@ def cmd_apps_list(args: argparse.Namespace) -> int:
     project_dir = Path.cwd()
     _load_dotenv_into_environ(project_dir)
     settings = Settings.load(project_dir)
-    orchestrator, import_error = _load_orchestrator_for_diagnosis(project_dir)
+    orchestrator, import_error = _load_orchestrator_for_diagnosis(project_dir, debug=args.debug)
     # Non-strict: listing a broken configuration is the whole point.
     resolution = resolve_apps(orchestrator, settings, strict=False)
     resolved = {app.name for app in resolution.apps}
