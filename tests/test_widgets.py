@@ -108,3 +108,46 @@ def test_duplicate_widget_id_rejected():
     fn2.__name__ = "w"
     with pytest.raises(RegistryError, match="already registered"):
         app.widget(title="B", renderer="stat")(fn2)
+
+
+def test_list_item_accepts_an_action() -> None:
+    items = validate_widget_payload(
+        "list",
+        [{"title": "Buy milk", "action": {"tool": "complete", "args": {"id": 4}}}],
+    )
+    assert items[0].action is not None
+    assert items[0].action.tool == "complete"
+    assert items[0].action.args == {"id": 4}
+    assert items[0].action.label is None
+
+
+def test_list_item_action_is_optional() -> None:
+    items = validate_widget_payload("list", [{"title": "Buy milk"}])
+    assert items[0].action is None
+
+
+@pytest.mark.parametrize("url", ["http://x.test/a", "https://x.test/a", "mailto:a@x.test"])
+def test_list_item_allows_safe_url_schemes(url: str) -> None:
+    items = validate_widget_payload("list", [{"title": "t", "url": url}])
+    assert items[0].url == url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "javascript:alert(1)",
+        "JavaScript:alert(1)",
+        "  javascript:alert(1)",
+        "java\tscript:alert(1)",
+        "data:text/html;base64,PHN2Zz4=",
+        "vbscript:msgbox(1)",
+        "/relative/path",
+    ],
+)
+def test_list_item_rejects_unsafe_url_schemes(url: str) -> None:
+    """Browsers strip ASCII control characters from a URL before parsing its
+    scheme, so `java\\tscript:` is a live bypass of any validator that does not
+    strip them first. Relative URLs are rejected too: a widget that links is
+    linking off-page, so allowing one would only widen the surface."""
+    with pytest.raises(ValueError, match="url"):
+        validate_widget_payload("list", [{"title": "t", "url": url}])

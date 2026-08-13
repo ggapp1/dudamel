@@ -158,3 +158,65 @@ def test_mcp_origin_is_untrusted_even_without_the_external_flag():
     tool.origin = "mcp"
     assert tool.untrusted is True
     assert tool.external is False  # the declared flag is untouched
+
+
+def test_tool_action_label_is_stored_and_stripped() -> None:
+    app = App("tasks", description="d")
+
+    @app.tool(action="  Done  ")
+    async def complete(id: int) -> str:
+        """Complete a task."""
+        return "ok"
+
+    assert app.tools["complete"].action == "Done"
+
+
+def test_tool_without_action_has_none() -> None:
+    app = App("tasks", description="d")
+
+    @app.tool
+    async def plain(id: int) -> str:
+        """Plain."""
+        return "ok"
+
+    assert app.tools["plain"].action is None
+
+
+def test_blank_action_label_is_rejected() -> None:
+    app = App("tasks", description="d")
+    with pytest.raises(RegistryError, match="must not be empty"):
+
+        @app.tool(action="   ")
+        async def complete(id: int) -> str:
+            """Complete a task."""
+            return "ok"
+
+
+def test_overlong_action_label_is_rejected() -> None:
+    app = App("tasks", description="d")
+    with pytest.raises(RegistryError, match="at most 32 characters"):
+
+        @app.tool(action="x" * 33)
+        async def complete(id: int) -> str:
+            """Complete a task."""
+            return "ok"
+
+
+def test_widget_actions_default_to_empty_tuple() -> None:
+    app = App("tasks", description="d")
+
+    @app.widget(title="T", renderer="markdown")
+    async def card() -> str:
+        return "hi"
+
+    assert app.widgets["card"].actions == ()
+
+
+def test_widget_qualified_id_is_app_dot_widget() -> None:
+    app = App("tasks", description="d")
+
+    @app.widget(title="T", renderer="markdown")
+    async def today() -> str:
+        return "hi"
+
+    assert app.widgets["today"].qualified_id == "tasks.today"
