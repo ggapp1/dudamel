@@ -327,6 +327,25 @@ def test_doctor_on_clean_scaffold_reports_zero_apps(
     assert "app resolution: 0 enabled, 0 error(s)" in capsys.readouterr().out
 
 
+def test_doctor_does_not_advise_migrate_for_a_suite_only_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An enabled suite app has models, but `db migrate` autogenerates against
+    LOCAL apps only -- a suite app's revisions ship in the wheel. So a project
+    whose only app comes from the suite has nothing to generate, and doctor
+    must not send it to a command that would print `no changes`."""
+    install_papers(tmp_path, monkeypatch, revision=True)
+    project = write_project(tmp_path, "[apps.papers]\nenabled = true\n")
+    ensure_app_migrations(project)  # migrations/ present, versions/ empty
+    monkeypatch.chdir(project)
+
+    assert main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "app resolution: 1 enabled, 0 error(s)" in out
+    assert "app migrations dir: present, no revisions yet — normal until an app defines" in out
+    assert "run `dudamel db migrate -m init`" not in out
+
+
 def test_doctor_sees_a_pending_suite_lane(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

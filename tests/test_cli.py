@@ -411,13 +411,31 @@ def test_doctor_on_a_fresh_project_does_not_advise_a_migrate_that_would_do_nothi
     assert "run `dudamel db migrate -m init`" not in out
 
 
-def test_app_migrations_hint_advises_migrate_only_when_an_app_could_generate_one(
+def test_doctor_advises_migrate_when_a_local_app_has_a_revision_to_generate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The other side of the branch above, driven through the real call site:
+    a local app defines models, no revision exists yet, so `db migrate` has
+    something to autogenerate and doctor must say so."""
+    target = scaffold_with_local_app(tmp_path)
+    monkeypatch.chdir(target)
+    capsys.readouterr()  # drain `new`'s output
+
+    assert cli.main(["doctor"]) == 0  # BEFORE migrating: versions/ is empty
+    out = capsys.readouterr().out
+    assert "✓ app migrations dir: present, no revisions yet — run `dudamel db migrate -m init`" in (
+        out
+    )
+    assert "normal until an app defines models" not in out
+
+
+def test_app_migrations_hint_advises_migrate_only_when_a_local_app_could_generate_one(
     tmp_path: Path,
 ) -> None:
     target = scaffold(tmp_path)
-    ok, without_apps = cli._check_app_migrations_dir(target, any_apps=False)
+    ok, without_apps = cli._check_app_migrations_dir(target, any_local_apps=False)
     assert ok and "normal until an app defines models" in without_apps
-    ok, with_apps = cli._check_app_migrations_dir(target, any_apps=True)
+    ok, with_apps = cli._check_app_migrations_dir(target, any_local_apps=True)
     assert ok and "run `dudamel db migrate -m init`" in with_apps
 
 
