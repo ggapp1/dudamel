@@ -281,17 +281,25 @@ migrations placed under `data_dir` are ignored.
   and returns a `pending_confirmation_id` before running, regardless of
   what the model asked for. The same user has to approve it explicitly.
 - **The taint rule**: tool output is treated as data, not instruction. Once
-  a turn has seen a result from a less-trusted source (an MCP tool), any
-  further mutating tool call in that turn — native or MCP — that isn't
-  marked `read_only=True` is forced through a confirm gate too, even if it
-  wasn't registered with `confirm=True`. A tool with no safety annotation
-  defaults to "mutating" until proven otherwise. Approving a gated MCP call
-  taints the rest of that turn as well — its output is untrusted whether it
-  arrived through the gate or not. Where taint is re-derived from history
+  a turn has seen a result from a less-trusted source, any further mutating
+  tool call in that turn that isn't marked `read_only=True` is forced through
+  a confirm gate too, even if it wasn't registered with `confirm=True`. A tool
+  with no safety annotation defaults to "mutating" until proven otherwise.
+  Two kinds of tool count as less-trusted: any MCP tool, and any tool
+  registered with `external=True`. Approving a gated call from either taints
+  the rest of that turn as well — its output is untrusted whether it arrived
+  through the gate or not. Where taint is re-derived from history
   (`taint_mode = "window"`, and a summary's stored taint flag), a call whose
   tool the registry can no longer resolve — an MCP server dropped from the
   config, a renamed tool, or a name the model invented — counts as
   untrusted: unknown provenance is not trusted provenance.
+- **`external=True`**: mark a tool whose return value may contain text an
+  attacker controls — anything that fetches a web page, an RSS feed, or a
+  calendar subscription. It is orthogonal to `read_only`: an external
+  read-only tool still runs without a prompt, but it taints the turn so the
+  model can't be talked into a write by the page it just read. Taint applies
+  to the turn that fetches, not to the data: if your app stores fetched
+  content and reads it back later, mark the reading tool `external=True` too.
 - **Token budgets**: `[llm.budget] daily_tokens` in `dudamel.toml` sets a
   hard per-day ceiling per tier, enforced before each call — a runaway
   loop or a misbehaving job can't spend past it.

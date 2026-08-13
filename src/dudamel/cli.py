@@ -513,10 +513,11 @@ def _render_tool_table(orchestrator: Orchestrator) -> str:
     tools = sorted(orchestrator.registry.tools.values(), key=lambda t: t.name)
     if not tools:
         return "no tools registered"
-    header = f"{'name':<28}{'read_only':<12}{'confirm':<10}{'origin':<8}"
+    header = f"{'name':<28}{'read_only':<12}{'confirm':<10}{'external':<10}{'origin':<8}"
     rows = [header, "-" * len(header)]
     rows.extend(
-        f"{t.name:<28}{str(t.read_only):<12}{str(t.confirm):<10}{t.origin:<8}" for t in tools
+        f"{t.name:<28}{str(t.read_only):<12}{str(t.confirm):<10}{str(t.external):<10}{t.origin:<8}"
+        for t in tools
     )
     return "\n".join(rows)
 
