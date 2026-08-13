@@ -55,6 +55,36 @@ def test_upgrade_from_0005_adds_them_and_keeps_existing_rows(tmp_path: Path) -> 
     assert rows == [("log_workout", "ok", None, None)]
 
 
+def test_downgrade_from_0006_drops_the_columns_and_keeps_the_rows(tmp_path: Path) -> None:
+    """`batch_alter_table` drop_column on SQLite is a full table rebuild --
+    every row is copied into a new table -- so the rows surviving it is the
+    part worth pinning, not just the columns going away."""
+    url = f"sqlite+aiosqlite:///{tmp_path}/d.db"
+    upgrade_core(url)
+    engine = create_engine(sync_url(url))
+    with engine.begin() as conn:
+        conn.execute(
+            text("INSERT INTO conversations (id, channel, created_at) VALUES (1,'t:1',:t)"),
+            {"t": "2026-01-01 00:00:00"},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO activity (conversation_id, tool, args, status, result_preview, "
+                "actor, source, created_at) VALUES (1, 'log_workout', '{}', 'ok', 'done', "
+                "'session', 'web', :t)"
+            ),
+            {"t": "2026-01-01 00:00:00"},
+        )
+
+    command.downgrade(_core_cfg(url), "0005")
+
+    insp = inspect(create_engine(sync_url(url)))
+    assert not (NEW_COLUMNS & {c["name"] for c in insp.get_columns("activity")})
+    with create_engine(sync_url(url)).begin() as conn:
+        rows = conn.execute(text("SELECT conversation_id, tool, status FROM activity")).all()
+    assert rows == [(1, "log_workout", "ok")]
+
+
 def test_model_matches_migration(tmp_path: Path) -> None:
     """No drift between the ORM model and the migrated schema."""
     from dudamel.models_core import Activity
