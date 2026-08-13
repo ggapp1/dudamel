@@ -213,6 +213,55 @@ def make_orc() -> Orchestrator:
     return Orchestrator(apps=[app])
 
 
+def make_hostile_orc() -> Orchestrator:
+    """An app whose widget text is as hostile as the contract permits.
+
+    Nothing bounds a list item's title, subtitle or url, none of the three is
+    checked for the characters a plain-text surface cares about, and a per-row
+    label may carry anything up to its length cap. Every value here is
+    reachable by an ordinary app author, deliberately or by accident.
+    """
+    app = App("edge", description="d")
+
+    @app.tool(action="Done")
+    async def complete(id: int) -> str:
+        """Complete a task."""
+        return "done"
+
+    @app.tool(action="Sweep")
+    async def sweep() -> str:
+        """Sweep up."""
+        return "swept"
+
+    @app.widget(title="Edge [cases]", renderer="list", actions=["sweep"])
+    async def rows() -> list[dict[str, object]]:
+        return [
+            {"title": "L" * 300, "action": {"tool": "complete", "args": {"id": 1}}},
+            {"title": "Decoy [1 · Done] row"},  # forges an anchor in its own text
+            {
+                "title": "Newline label",
+                "action": {"tool": "complete", "args": {"id": 3}, "label": "Do\nne"},
+            },
+            {
+                "title": "Bracket label",
+                "action": {"tool": "complete", "args": {"id": 4}, "label": "[x]"},
+            },
+            {
+                "title": "Separator url",
+                "url": "https://x.test/a\u2028b",  # the url check is ASCII-only
+                "action": {"tool": "complete", "args": {"id": 5}},
+            },
+            {
+                "title": "L" * 300,
+                "subtitle": "S" * 300,
+                "url": "https://x.test/" + "u" * 300,
+                "action": {"tool": "complete", "args": {"id": 6}},
+            },
+        ]
+
+    return Orchestrator(apps=[app])
+
+
 def make_settings(tmp_path: Path, *, telegram: TelegramConfig | None = None) -> Settings:
     return Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/tg.db",
@@ -228,8 +277,9 @@ async def build(
     *,
     telegram: TelegramConfig | None = None,
     bot: FakeBot | None = None,
+    orc: Orchestrator | None = None,
 ) -> tuple[Runtime, TelegramInterface]:
-    orc = make_orc()
+    orc = orc or make_orc()
     settings = make_settings(tmp_path, telegram=telegram)
     rt = Runtime(orc, settings, providers={"standard": FakeProvider(script)})
     await rt.start()
@@ -1097,13 +1147,15 @@ def test_packing_splits_on_length_with_buttons_attached() -> None:
     """The length-driven split, with action-bearing and plain lines
     interleaved: the message limit has to be enforced while a keyboard is
     being carried, and every button must still name a line of its own message.
+
+    The entries are handed over the way `_on_home` hands them over -- text
+    only, no anchor -- because `_pack` is what writes the anchor on.
     """
     entries: list[tuple[str, dict[str, Any] | None]] = []
     for n in range(40):
-        label = f"{n} · Go"
         entries.append((f"note {n} " + "x" * 240, None))
         entries.append(
-            (f"• item {n} [{label}] " + "y" * 200, {"tool": "t", "args": {}, "label": label})
+            (f"• item {n} " + "y" * 240, {"tool": "t", "args": {}, "label": f"{n} · Go"})
         )
     messages = _pack(entries, "Today")
     assert len(messages) > 1
@@ -1122,6 +1174,54 @@ def test_the_section_header_is_capped_like_any_other_line() -> None:
     messages = _pack(entries, "T" * 5000)
     assert messages
     assert all(len(text) <= _MAX_MESSAGE_LEN for text, _ in messages)
+
+
+async def test_every_button_is_anchored_whatever_the_app_writes(
+    tmp_path: Path, token_env: str
+) -> None:
+    """The property, against text as hostile as the contract allows: every
+    button's label is present, intact, exactly once, on the line it acts on --
+    for any app-supplied title, subtitle, url or label, of any length or
+    content. Driven through `_on_home` against a real app, so the lines have
+    the shape the code actually composes rather than one a fixture invented.
+    """
+    rt, interface = await build(
+        tmp_path, [], telegram=TelegramConfig(allowed_user_ids=[111]), orc=make_hostile_orc()
+    )
+    await _home(interface)
+    messages = _keyboard_messages(interface._app.bot)
+    assert messages
+    for text, buttons in messages:
+        labels = [button.text for button in buttons]
+        assert len(set(labels)) == len(labels)
+        for label in labels:
+            assert "\n" not in label
+            assert text.count(f"[{label}]") == 1
+            anchored = [line for line in text.splitlines() if line.endswith(f"[{label}]")]
+            assert len(anchored) == 1
+        assert len(text) <= _MAX_MESSAGE_LEN
+    await rt.stop()
+
+
+async def test_no_app_text_can_forge_or_break_an_anchor(tmp_path: Path, token_env: str) -> None:
+    """The three ways app text reaches the anchor syntax: brackets in a title
+    (a decoy row that reads as actionable), brackets in a label (which would
+    split its own anchor), and a Unicode line separator, which the url check
+    does not catch and a client renders as a line break."""
+    rt, interface = await build(
+        tmp_path, [], telegram=TelegramConfig(allowed_user_ids=[111]), orc=make_hostile_orc()
+    )
+    await _home(interface)
+    text = "\n".join(sent["text"] for sent in interface._app.bot.sent)
+
+    decoy = next(line for line in text.splitlines() if "Decoy" in line)
+    assert "[" not in decoy and "(1 · Done)" in decoy  # folded, so it cannot pose as an anchor
+    assert "\u2028" not in text and "\u2029" not in text
+    assert not any(ord(ch) < 32 for line in text.splitlines() for ch in line)
+    # the long title is truncated, but its own anchor survives the truncation
+    long_line = next(line for line in text.splitlines() if line.startswith("• LLL"))
+    assert long_line.endswith("]") and " · Done]" in long_line
+    await rt.stop()
 
 
 def test_a_confirm_action_button_label_is_marked() -> None:

@@ -310,3 +310,38 @@ async def test_a_widget_with_no_actions_has_an_empty_action_list() -> None:
 
     card = await run_widget(app.widgets["today"], _actions_of(app))
     assert card["actions"] == []
+
+
+async def test_an_over_long_item_label_is_a_visible_error_not_a_button() -> None:
+    """A per-row label override reaches the same place a registered `action=`
+    label does -- a button -- so it is held to the same length rule. Exceeding
+    it degrades to an error card, the way any other bad payload does, rather
+    than shipping a label no surface can render intact."""
+    app = _tasks_app()
+
+    @app.widget(title="T", renderer="list")
+    async def today() -> list[dict[str, object]]:
+        return [
+            {
+                "title": "Buy milk",
+                "action": {"tool": "complete", "args": {"id": 4}, "label": "U" * 33},
+            }
+        ]
+
+    card = await run_widget(app.widgets["today"], _actions_of(app))
+    assert "error" in card
+    assert "32 characters" in card["error"]
+
+
+async def test_a_blank_item_label_is_rejected_like_a_blank_registered_one() -> None:
+    app = _tasks_app()
+
+    @app.widget(title="T", renderer="list")
+    async def today() -> list[dict[str, object]]:
+        return [
+            {"title": "Buy milk", "action": {"tool": "complete", "args": {"id": 4}, "label": "  "}}
+        ]
+
+    card = await run_widget(app.widgets["today"], _actions_of(app))
+    assert "error" in card
+    assert "must not be empty" in card["error"]
