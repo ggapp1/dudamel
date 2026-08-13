@@ -513,10 +513,13 @@ def _render_tool_table(orchestrator: Orchestrator) -> str:
     tools = sorted(orchestrator.registry.tools.values(), key=lambda t: t.name)
     if not tools:
         return "no tools registered"
-    header = f"{'name':<28}{'read_only':<12}{'confirm':<10}{'external':<10}{'origin':<8}"
+    header = (
+        f"{'name':<28}{'read_only':<12}{'confirm':<10}{'external':<10}{'action':<12}{'origin':<8}"
+    )
     rows = [header, "-" * len(header)]
     rows.extend(
-        f"{t.name:<28}{str(t.read_only):<12}{str(t.confirm):<10}{str(t.external):<10}{t.origin:<8}"
+        f"{t.name:<28}{str(t.read_only):<12}{str(t.confirm):<10}{str(t.external):<10}"
+        f"{(t.action or '-'):<12}{t.origin:<8}"
         for t in tools
     )
     return "\n".join(rows)
@@ -658,6 +661,29 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 f"ℹ {n} MCP server(s) configured — tools mount at run time; "
                 "safety flags visible then"
             )
+
+    # Homescreen layout. Both conditions degrade silently at render time (an
+    # unknown id is skipped, a repeat renders once at its first mention), which
+    # is the right runtime behaviour and exactly why they need a voice here:
+    # otherwise a typo in `[[home.section]]` is indistinguishable from a widget
+    # that never ran. Reported, never fatal -- doctor's exit code says nothing
+    # about a layout, the same as every other ✗ line it prints.
+    configured = [wid for section in settings.home.section for wid in section.widgets]
+    # Read off the RESOLVED apps, for the same reason the tool table above is:
+    # a suite app enabled purely in dudamel.toml is in `resolution.apps` and
+    # not in the project's own registry, and judging its widget ids against the
+    # latter would call every one of them dead. Read from each app directly
+    # rather than through a reconstructed Registry, which can raise on a
+    # cross-app collision the table above already reports.
+    registered = {w.qualified_id for app in resolution.apps for w in app.widgets.values()}
+    for wid in configured:
+        if wid not in registered:
+            print(_line(False, "home layout", f"{wid} is not a registered widget"))
+    seen: set[str] = set()
+    for wid in configured:
+        if wid in seen:
+            print(_line(False, "home layout", f"{wid} is listed in more than one section"))
+        seen.add(wid)
     return 0
 
 

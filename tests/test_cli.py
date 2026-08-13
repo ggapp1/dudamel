@@ -54,6 +54,32 @@ async def add_note(title: str) -> str:
     return f"Noted: {title}"
 '''
 
+LOCAL_APP_WITH_ACTION = '''from dudamel import App
+
+app = App("notebook", description="Keep short notes")
+
+
+class Entry(app.Model, table="entries"):
+    title: str
+
+
+@app.tool
+async def add_note(title: str) -> str:
+    """Write down a note."""
+    return f"Noted: {title}"
+
+
+@app.tool(action="Done")
+async def archive_note(id: int) -> str:
+    """Archive a note."""
+    return "archived"
+
+
+@app.widget(title="Notes", renderer="markdown")
+async def recent() -> str:
+    return "nothing yet"
+'''
+
 LOCAL_ASSISTANT = """from apps.notebook import app as notebook_app
 
 from dudamel import Orchestrator
@@ -71,6 +97,15 @@ def scaffold_with_local_app(tmp_path: Path, name: str = "proj") -> Path:
     developer following the project README does."""
     target = scaffold(tmp_path, name)
     (target / "apps" / "notebook.py").write_text(LOCAL_APP)
+    (target / "assistant.py").write_text(LOCAL_ASSISTANT)
+    return target
+
+
+def scaffold_with_action_app(tmp_path: Path, name: str = "proj") -> Path:
+    """The same project, whose app also declares a button-labelled tool and a
+    widget -- what the homescreen diagnostics have anything to say about."""
+    target = scaffold(tmp_path, name)
+    (target / "apps" / "notebook.py").write_text(LOCAL_APP_WITH_ACTION)
     (target / "assistant.py").write_text(LOCAL_ASSISTANT)
     return target
 
@@ -396,6 +431,69 @@ def test_doctor_runs_green_on_scaffolded_project_even_fully_offline(
     assert "no revisions yet" not in out
 
 
+def test_doctor_tool_table_shows_the_action_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The table an operator reads to decide what runs unconfirmed must also
+    say which tools carry a button, since a labelled tool is invocable with no
+    model in the path."""
+    target = scaffold_with_action_app(tmp_path)
+    monkeypatch.chdir(target)
+    assert cli.main(["db", "migrate", "-m", "init"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "action" in out
+    archive_row = next(line for line in out.splitlines() if line.startswith("archive_note"))
+    assert "Done" in archive_row
+    add_row = next(line for line in out.splitlines() if line.startswith("add_note"))
+    assert "Done" not in add_row
+
+
+def test_doctor_reports_a_layout_id_that_is_not_a_registered_widget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A dead layout id renders nothing and says nothing on the dashboard --
+    by design, so that disabling an app degrades rather than breaks. Doctor is
+    where it becomes visible, as a reported line and not a failure exit."""
+    target = scaffold_with_action_app(tmp_path)
+    config = target / "dudamel.toml"
+    config.write_text(
+        config.read_text()
+        + '\n[[home.section]]\ntitle = "Today"\nwidgets = ["notebook.recent", "gone.away"]\n'
+    )
+    monkeypatch.chdir(target)
+    assert cli.main(["db", "migrate", "-m", "init"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "gone.away" in out
+    assert "notebook.recent is not a registered widget" not in out
+
+
+def test_doctor_reports_a_widget_listed_in_two_sections(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A widget named twice renders once, at its first mention; the later
+    mention is silently dropped, so doctor names it."""
+    target = scaffold_with_action_app(tmp_path)
+    config = target / "dudamel.toml"
+    config.write_text(
+        config.read_text()
+        + '\n[[home.section]]\ntitle = "A"\nwidgets = ["notebook.recent"]\n'
+        + '\n[[home.section]]\ntitle = "B"\nwidgets = ["notebook.recent"]\n'
+    )
+    monkeypatch.chdir(target)
+    assert cli.main(["db", "migrate", "-m", "init"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "more than one section" in out
+
+
 def test_doctor_on_a_fresh_project_does_not_advise_a_migrate_that_would_do_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -676,11 +774,11 @@ def test_doctor_tool_table_reports_the_external_flag(
     assert cli.main(["doctor"]) == 0
     out = capsys.readouterr().out
     rows = {line.split()[0]: line.split() for line in out.splitlines() if line.split()}
-    # Columns: name, read_only, confirm, external, origin.
-    assert rows["read_feed"] == ["read_feed", "True", "False", "True", "native"]
+    # Columns: name, read_only, confirm, external, action, origin.
+    assert rows["read_feed"] == ["read_feed", "True", "False", "True", "-", "native"]
     # An ordinary tool still gets the column, reading False -- absence of the
     # word is not the same as a reported False.
-    assert rows["add_note"] == ["add_note", "False", "False", "False", "native"]
+    assert rows["add_note"] == ["add_note", "False", "False", "False", "-", "native"]
 
 
 # --- token rotate --------------------------------------------------------
