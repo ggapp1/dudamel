@@ -3,7 +3,8 @@ timeout enforcement."""
 
 import asyncio
 
-from dudamel.contract.types import Widget
+from dudamel.app import App
+from dudamel.contract.types import Tool, Widget
 from dudamel.widgets import run_widget
 
 
@@ -20,9 +21,11 @@ async def test_run_widget_stat_success() -> None:
     out = await run_widget(make_widget(fn))
     assert out == {
         "id": "w1",
+        "qualified_id": "app.w1",
         "title": "W",
         "renderer": "stat",
         "data": {"label": "Vol", "value": 12, "unit": "kg", "delta": None},
+        "actions": [],
     }
 
 
@@ -124,3 +127,146 @@ async def test_run_widget_preserves_identity_on_error() -> None:
     assert out["title"] == "My Widget"
     assert out["renderer"] == "markdown"
     assert out["error"] == "nope"
+
+
+# --- action resolution -------------------------------------------------------
+
+
+def _tasks_app() -> App:
+    app = App("tasks", description="d")
+
+    @app.tool(action="Done")
+    async def complete(id: int) -> str:
+        """Complete a task."""
+        return f"done {id}"
+
+    @app.tool(action="Refresh")
+    async def refresh() -> str:
+        """Refresh."""
+        return "ok"
+
+    @app.tool(confirm=True, action="Delete")
+    async def wipe(id: int) -> str:
+        """Delete a task."""
+        return "gone"
+
+    return app
+
+
+def _actions_of(app: App) -> dict[str, Tool]:
+    return {name: tool for name, tool in app.tools.items() if tool.action is not None}
+
+
+async def test_card_carries_its_qualified_id() -> None:
+    app = _tasks_app()
+
+    @app.widget(title="T", renderer="markdown")
+    async def today() -> str:
+        return "hi"
+
+    card = await run_widget(app.widgets["today"], _actions_of(app))
+    assert card["qualified_id"] == "tasks.today"
+    assert card["id"] == "today"
+
+
+async def test_item_action_resolves_label_confirm_and_coerced_args() -> None:
+    app = _tasks_app()
+
+    @app.widget(title="T", renderer="list")
+    async def today() -> list[dict[str, object]]:
+        # The "4" is deliberate: it proves coercion actually ran rather than
+        # the raw payload being copied through.
+        return [{"title": "Buy milk", "action": {"tool": "complete", "args": {"id": "4"}}}]
+
+    card = await run_widget(app.widgets["today"], _actions_of(app))
+    action = card["data"][0]["action"]
+    assert action == {"tool": "complete", "args": {"id": 4}, "label": "Done", "confirm": False}
+
+
+async def test_item_label_overrides_the_tools_label() -> None:
+    app = _tasks_app()
+
+    @app.widget(title="T", renderer="list")
+    async def today() -> list[dict[str, object]]:
+        return [
+            {
+                "title": "Buy milk",
+                "action": {"tool": "complete", "args": {"id": 4}, "label": "Undo"},
+            }
+        ]
+
+    card = await run_widget(app.widgets["today"], _actions_of(app))
+    assert card["data"][0]["action"]["label"] == "Undo"
+
+
+async def test_item_action_inherits_the_tools_confirm_flag() -> None:
+    app = _tasks_app()
+
+    @app.widget(title="T", renderer="list")
+    async def today() -> list[dict[str, object]]:
+        return [{"title": "Buy milk", "action": {"tool": "wipe", "args": {"id": 4}}}]
+
+    card = await run_widget(app.widgets["today"], _actions_of(app))
+    assert card["data"][0]["action"]["confirm"] is True
+
+
+async def test_item_action_naming_an_unknown_tool_degrades_to_an_error_card() -> None:
+    app = _tasks_app()
+
+    @app.widget(title="T", renderer="list")
+    async def today() -> list[dict[str, object]]:
+        return [{"title": "Buy milk", "action": {"tool": "nope", "args": {}}}]
+
+    card = await run_widget(app.widgets["today"], _actions_of(app))
+    assert "error" in card
+    assert "nope" in card["error"]
+    assert card["qualified_id"] == "tasks.today"
+
+
+async def test_item_action_naming_another_apps_tool_degrades_to_an_error_card() -> None:
+    """The mapping handed to run_widget holds only this app's labelled tools,
+    so a foreign tool is absent by construction rather than by a check."""
+    _tasks_app()
+    notes = App("notes", description="d")
+
+    @notes.widget(title="T", renderer="list")
+    async def recent() -> list[dict[str, object]]:
+        return [{"title": "n", "action": {"tool": "complete", "args": {"id": 1}}}]
+
+    card = await run_widget(notes.widgets["recent"], _actions_of(notes))
+    assert "error" in card
+
+
+async def test_item_action_with_uncoercible_args_degrades_to_an_error_card() -> None:
+    app = _tasks_app()
+
+    @app.widget(title="T", renderer="list")
+    async def today() -> list[dict[str, object]]:
+        return [{"title": "Buy milk", "action": {"tool": "complete", "args": {"id": "abc"}}}]
+
+    card = await run_widget(app.widgets["today"], _actions_of(app))
+    assert "error" in card
+
+
+async def test_card_level_actions_resolve() -> None:
+    app = _tasks_app()
+
+    @app.widget(title="T", renderer="markdown", actions=["refresh"])
+    async def today() -> str:
+        return "hi"
+
+    card = await run_widget(app.widgets["today"], _actions_of(app))
+    assert card["actions"] == [
+        {"tool": "refresh", "args": {}, "label": "Refresh", "confirm": False}
+    ]
+
+
+async def test_a_widget_with_no_actions_has_an_empty_action_list() -> None:
+    app = _tasks_app()
+
+    @app.widget(title="T", renderer="markdown")
+    async def today() -> str:
+        return "hi"
+
+    card = await run_widget(app.widgets["today"], _actions_of(app))
+    assert card["actions"] == []
