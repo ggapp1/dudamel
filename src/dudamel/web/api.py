@@ -17,7 +17,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from dudamel._version import __version__
 from dudamel.config import Settings
-from dudamel.exceptions import ActionArgumentError
+from dudamel.exceptions import ActionArgumentError, UnknownActionError
 from dudamel.runtime import Runtime
 from dudamel.web.auth import (
     SESSION_TTL,
@@ -242,16 +242,17 @@ def create_api(runtime: Runtime, settings: Settings) -> FastAPI:
         label: the action namespace is the set of labelled tools, and a tool
         outside it does not exist as far as this endpoint is concerned.
 
-        400 is reserved for `ActionArgumentError` specifically, never for
-        `ValueError` at large: a tool body raising a plain ValueError -- the
-        most idiomatic failure in Python app code -- is a tool failure, and
-        answering it 400 would put the tool's own message under a status
-        telling the caller their input was malformed.
+        Both non-502 outcomes key off a typed exception, never off the bare
+        `KeyError`/`ValueError` the same conditions would naturally raise. A
+        tool body raising either is ordinary Python app code failing, and it
+        must reach 502 with its own message: answering it 404 would claim the
+        action does not exist right after it ran, and answering it 400 would
+        put the tool's message under a status blaming the caller's input.
         """
         try:
             result = await runtime.run_action(tool_name, payload.args, actor="web", source="web")
-        except KeyError:
-            raise HTTPException(status_code=404, detail=f"no action {tool_name!r}") from None
+        except UnknownActionError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from None
         except ActionArgumentError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
         except Exception as e:

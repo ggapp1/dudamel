@@ -26,6 +26,7 @@ from dudamel.exceptions import (
     LLMError,
     RegistryError,
     ToolValidationError,
+    UnknownActionError,
 )
 from dudamel.llm.anthropic import AnthropicProvider
 from dudamel.llm.client import LLMClient, Tier
@@ -382,10 +383,16 @@ class Runtime:
         confirmation to obtain -- the operator clicking a button IS the human
         decision the confirm machine exists to get.
 
-        Raises KeyError if `tool_name` is not an action-labelled tool,
-        ActionArgumentError (a ValueError) if `args` do not coerce, and
+        Raises UnknownActionError if `tool_name` is not an action-labelled
+        tool, ActionArgumentError (a ValueError) if `args` do not coerce, and
         whatever the tool raises otherwise -- except that OUR deadline
         expiring raises a TimeoutError that says so.
+
+        Both of those are typed rather than the bare `KeyError`/`ValueError`
+        the two conditions would naturally produce, and for the same reason:
+        a tool body raising either one is a tool failure, and a caller that
+        could not tell it apart from a lookup or coercion failure would
+        misreport a tool that actually ran.
 
         Every outcome past the name lookup writes exactly one activity row,
         the refused-arguments one included: this is an authenticated,
@@ -395,7 +402,7 @@ class Runtime:
         """
         tool = self._registry.tools.get(tool_name)
         if tool is None or tool.action is None:
-            raise KeyError(tool_name)
+            raise UnknownActionError(f"no action {tool_name!r}")
         try:
             # The registry's own coercion, not a bare model_validate +
             # model_dump: `validate` returns attribute values, so a nested

@@ -6,6 +6,18 @@ class ToolValidationError(DudamelError):
     """Tool arguments failed validation/coercion. Message is written for the model."""
 
 
+class UnknownActionError(DudamelError):
+    """`Runtime.run_action` was given a name that is not an action-labelled tool.
+
+    Deliberately NOT a `KeyError`, though what it reports is a dict miss: a
+    tool body doing an ordinary dict access on absent data raises `KeyError`
+    too, and a surface that could not tell the two apart would answer a tool
+    that ran and failed with "no such action" -- a flat contradiction of what
+    just happened, and a status a client is entitled to stop retrying on.
+    Raised before any tool runs, so the two are exactly separable.
+    """
+
+
 class ActionArgumentError(DudamelError, ValueError):
     """The arguments of an operator-invoked action failed coercion.
 

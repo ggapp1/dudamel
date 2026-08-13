@@ -57,6 +57,11 @@ def make_orc() -> Orchestrator:
         """Fails the way ordinary Python app code fails."""
         raise ValueError("task 7 does not exist")
 
+    @app.tool(action="Ransack")
+    async def ransack(id: int) -> str:
+        """Fails on an ordinary dict access, the way app code does."""
+        return {"a": 1}[str(id)]
+
     @app.tool(action="Spew")
     async def spew() -> str:
         """Returns more than the result cap allows."""
@@ -842,4 +847,32 @@ async def test_a_tool_raised_timeout_keeps_its_own_message(tmp_path: Path, token
     assert [(r.tool, r.status, r.result_preview) for r in rows] == [
         ("stall", "error", "upstream connect timed out")
     ]
+    await rt.stop()
+
+
+async def test_a_tool_raising_keyerror_is_502_while_an_unknown_name_stays_404(
+    tmp_path: Path, token_env: str
+) -> None:
+    """The same pair as the ValueError one, for the other exception the
+    endpoint reads as a verdict about the request. A dict access on absent
+    data is everyday app code; answering it 404 would claim the action does
+    not exist immediately after it ran and wrote an error row, and 404 is a
+    status a client is entitled to stop retrying on."""
+    rt, transport = await build(tmp_path, [])
+    headers = {"Authorization": f"Bearer {token_env}"}
+    async with client(transport) as c:
+        unknown = await c.post("/api/action/nope", json={"args": {}}, headers=headers)
+        assert unknown.status_code == 404
+        assert unknown.json()["detail"] == "no action 'nope'"
+
+        raised = await c.post("/api/action/ransack", json={"args": {"id": 7}}, headers=headers)
+        assert raised.status_code == 502
+        # KeyError's str() is the repr of the missing key -- the tool's own
+        # detail either way, not a claim about the action's existence.
+        assert raised.json()["detail"] == "'7'"
+    async with rt._db.session() as s:
+        rows = (await s.execute(select(Activity))).scalars().all()
+    # Only the tool that actually ran leaves a row; the unknown name never
+    # reached one.
+    assert [(r.tool, r.status) for r in rows] == [("ransack", "error")]
     await rt.stop()
