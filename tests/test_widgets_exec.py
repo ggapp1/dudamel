@@ -333,6 +333,44 @@ async def test_an_over_long_item_label_is_a_visible_error_not_a_button() -> None
     assert "32 characters" in card["error"]
 
 
+async def test_bidi_characters_are_stripped_from_an_item_label() -> None:
+    """A per-row override is the label most likely to be composed from
+    synced-in text, so it is the likeliest carrier of a direction override.
+    Stripped rather than refused: a hostile feed should cost a button its
+    trick, not cost the card its data."""
+    app = _tasks_app()
+
+    @app.widget(title="T", renderer="list")
+    async def today() -> list[dict[str, object]]:
+        return [
+            {
+                "title": "Buy milk",
+                "action": {"tool": "complete", "args": {"id": 4}, "label": "\u202eevihcrA"},
+            }
+        ]
+
+    card = await run_widget(app.widgets["today"], _actions_of(app))
+    assert "error" not in card
+    assert card["data"][0]["action"]["label"] == "evihcrA"
+
+
+async def test_an_item_label_of_only_overrides_is_empty_not_a_button() -> None:
+    app = _tasks_app()
+
+    @app.widget(title="T", renderer="list")
+    async def today() -> list[dict[str, object]]:
+        return [
+            {
+                "title": "Buy milk",
+                "action": {"tool": "complete", "args": {"id": 4}, "label": "\u202e\u2069"},
+            }
+        ]
+
+    card = await run_widget(app.widgets["today"], _actions_of(app))
+    assert "error" in card
+    assert "must not be empty" in card["error"]
+
+
 async def test_a_blank_item_label_is_rejected_like_a_blank_registered_one() -> None:
     app = _tasks_app()
 

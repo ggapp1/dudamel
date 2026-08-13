@@ -45,6 +45,42 @@ _URL_CONTROL_CHARS = re.compile(r"[\x00-\x20\x7f]")
 
 ACTION_LABEL_MAX = 32
 
+# Characters removed from every action label, wherever a label is accepted.
+#
+# C0/C1, DEL, the line separators U+2028/U+2029 and the bidi overrides
+# U+202A-U+202E / U+2066-U+2069 -- the same class a plain-text surface already
+# strips, held here instead so every surface inherits it. Jinja's autoescape
+# stops a label breaking OUT of its attribute and does nothing about the
+# direction the remaining characters are drawn in: a label spelled
+# `"Nuke"` + U+202E + `" evihcrA"` renders in a browser as "Nuke Archive",
+# and the same string reaches
+# `data-label`, which feeds both the confirm dialog and the aria-live
+# announcement -- so the one mis-tap protection a `confirm=True` action has on
+# the web would carry the spoofed reading too. Same reasoning that put the url
+# allowlist here: a per-surface fix is one surface's fix.
+#
+# Stripped, not rejected, unlike `url` above. That rule rejects because it
+# cannot clean without approving one string and storing another; this one
+# stores exactly what it approved, so that objection does not apply. Labels
+# are also the field most likely to be composed from synced-in text
+# (`f"Archive {row.title}"`), where rejecting would turn a hostile feed into a
+# dead widget rather than a readable button.
+#
+# Sanitizing happens BEFORE the non-empty and length checks, so a label cannot
+# pass the cap and then shrink, and one spelled entirely out of overrides is
+# reported as empty rather than stored as "".
+_UNSAFE_LABEL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+
+
+def clean_action_label(value: str) -> str:
+    """An action label with unrenderable characters and outer whitespace gone.
+
+    The one normalization every action label goes through, whether it arrives
+    from `@app.tool(action=...)` or from a list item's per-row override. May
+    return "" -- each caller raises its own error type for that.
+    """
+    return _UNSAFE_LABEL_CHARS.sub("", value).strip()
+
 
 class ItemAction(BaseModel):
     """An action an app attaches to one list item. Written by the app."""
@@ -57,7 +93,7 @@ class ItemAction(BaseModel):
     @classmethod
     def _check_label(cls, value: str | None) -> str | None:
         """Hold a per-row override to the same rule as a registered `action=`
-        label (`App._register_tool`): stripped, non-empty, at most
+        label (`App._register_tool`): sanitized, stripped, non-empty, at most
         ACTION_LABEL_MAX characters.
 
         Without this, the override is simply a hole in that rule -- it lands in
@@ -68,7 +104,7 @@ class ItemAction(BaseModel):
         """
         if value is None:
             return None
-        label = value.strip()
+        label = clean_action_label(value)
         if not label:
             raise ValueError("action label must not be empty")
         if len(label) > ACTION_LABEL_MAX:
