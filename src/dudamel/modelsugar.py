@@ -196,7 +196,17 @@ def _rewrite_annotations(cls: type, app_name: str, table: str | None) -> None:
         # __annotate__ and never appear in the class __dict__ eagerly — a
         # raw __dict__ lookup returns nothing there and every bare
         # annotation would silently be dropped.
-        bare.update(inspect.get_annotations(ancestor))
+        #
+        # eval_str=True because `from __future__ import annotations` turns
+        # every annotation into a plain string, and a string is not a key in
+        # _COLUMN_TYPES -- without it, ANY module carrying that import (the
+        # habit throughout this package) gets "unsupported column type 'str'"
+        # for a perfectly supported type. No explicit namespace is passed:
+        # get_annotations resolves a class against ITS OWN defining module's
+        # globals, which is what each ancestor's annotations were written
+        # against; a shared namespace taken from the concrete subclass would
+        # be wrong for any mixin imported from elsewhere.
+        bare.update(inspect.get_annotations(ancestor, eval_str=True))
 
     new_annotations: dict[str, object] = {}
     has_pk = "id" in bare
