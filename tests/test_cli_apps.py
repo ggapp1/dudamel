@@ -17,6 +17,7 @@ import pytest
 
 from dudamel.apps import SuiteApp
 from dudamel.cli import main
+from dudamel.exceptions import RegistryError
 from dudamel.migrate import ensure_app_migrations, upgrade_all, upgrade_apps, upgrade_core
 
 SUITE_MODULE = """
@@ -300,6 +301,31 @@ def test_apps_list_survives_a_missing_project_module(
     assert "arXiv digests" in capsys.readouterr().out
 
 
+def test_apps_list_reports_a_registry_name_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An entry whose module defines a differently-named app is a reported
+    error. Left unchecked it is invisible here in the worst way: the row is
+    keyed on the registry name and the resolved set on the app's, so the app
+    would run under one name while its row claimed `error` under the other."""
+    versions = install_papers(tmp_path, monkeypatch, revision=False)
+    (tmp_path / "fake_suite" / "papers.py").write_text(
+        textwrap.dedent(SUITE_MODULE).replace('App("papers"', 'App("notes"')
+    )
+    register(
+        monkeypatch,
+        SuiteApp(name="papers", module="fake_suite.papers", summary="s", versions_dir=versions),
+    )
+    project = write_project(tmp_path, "[apps.papers]\nenabled = true\n")
+    monkeypatch.chdir(project)
+    assert main(["apps", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "must agree" in out
+    assert "notes" in out
+    row = next(line for line in out.splitlines() if line.startswith("papers"))
+    assert "error" in row
+
+
 # --- doctor ------------------------------------------------------------------
 
 
@@ -367,6 +393,20 @@ def test_doctor_sees_a_pending_suite_lane(
     out = capsys.readouterr().out
     assert "papers' schema is behind head" not in out
     assert "✓ pending migrations" in out
+
+
+def test_doctor_debug_reraises_the_assistant_import_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reporting the import failure as a line is right by default, but it
+    leaves the operator with a single repr of their own exception. `--debug`
+    is the escape hatch every other command has: the exception propagates so
+    the real traceback reaches the terminal."""
+    register(monkeypatch)
+    project = write_project(tmp_path, "", assistant="raise ValueError('boom')\n")
+    monkeypatch.chdir(project)
+    with pytest.raises(ValueError, match="boom"):
+        main(["doctor", "--debug"])
 
 
 def test_doctor_survives_an_assistant_that_raises(
@@ -464,6 +504,22 @@ def test_doctor_tool_table_covers_apps_enabled_only_in_config(
     assert "read_papers" in out
 
 
+COLLIDING_ASSISTANT = '''
+from dudamel import App, Orchestrator
+
+blog = App("blog", description="d")
+
+
+@blog.tool
+async def read_papers() -> str:
+    """Collides with the suite app's tool."""
+    return "no"
+
+
+orchestrator = Orchestrator(apps=[blog])
+'''
+
+
 def test_doctor_reports_a_cross_app_tool_collision_instead_of_dying(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -473,22 +529,7 @@ def test_doctor_reports_a_cross_app_tool_collision_instead_of_dying(
     the collision has to be a reported line and not the end of the report."""
     install_papers(tmp_path, monkeypatch, revision=False)
     project = write_project(
-        tmp_path,
-        "[apps.papers]\nenabled = true\n",
-        assistant="""
-        from dudamel import App, Orchestrator
-
-        blog = App("blog", description="d")
-
-
-        @blog.tool
-        async def read_papers() -> str:
-            \"\"\"Collides with the suite app's tool.\"\"\"
-            return "no"
-
-
-        orchestrator = Orchestrator(apps=[blog])
-        """,
+        tmp_path, "[apps.papers]\nenabled = true\n", assistant=COLLIDING_ASSISTANT
     )
     monkeypatch.chdir(project)
     assert main(["doctor"]) == 0
@@ -497,6 +538,20 @@ def test_doctor_reports_a_cross_app_tool_collision_instead_of_dying(
     assert "✗ tool table" in out
     assert "read_papers" in out
     assert "cookie_secure" in out  # the rest of the report still printed
+
+
+def test_doctor_debug_reraises_the_tool_table_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The collision line names the tool but not where the two declarations
+    are; `--debug` gives the operator the traceback that does."""
+    install_papers(tmp_path, monkeypatch, revision=False)
+    project = write_project(
+        tmp_path, "[apps.papers]\nenabled = true\n", assistant=COLLIDING_ASSISTANT
+    )
+    monkeypatch.chdir(project)
+    with pytest.raises(RegistryError, match="read_papers"):
+        main(["doctor", "--debug"])
 
 
 def test_doctor_does_not_create_a_missing_sqlite_file(
