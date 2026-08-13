@@ -125,6 +125,88 @@ picks the model up automatically — no separate schema file. Save a file
 like this under your project's `apps/` and add it to the list in
 `assistant.py` to run it.
 
+### Buttons: running a tool without the model
+
+Give a tool an `action=` label and it gains a second invocation path with no
+model in it — a button on the dashboard, a tap in Telegram:
+
+```python
+@app.tool(action="Done")
+async def archive_note(id: int) -> str:
+    """Archive a note."""
+    ...
+```
+
+It is still one tool, not two. The model can call `archive_note` exactly as
+before, and both paths coerce arguments against the same signature-derived
+schema. The label is the whole opt-in: a tool without one has no UI surface
+at all, and the action endpoint answers `404` for it rather than running it.
+`uv run dudamel doctor` prints an `action` column in its tool table, so which
+tools carry a button is visible right next to their safety flags.
+
+There are two ways to put one on a card. A `list` widget can attach an action
+to an individual item, with that row's arguments already filled in:
+
+```python
+@app.widget(title="Open notes", renderer="list")
+async def open_notes() -> list[dict]:
+    return [
+        {
+            "title": "Buy milk",
+            "action": {"tool": "archive_note", "args": {"id": 7}, "label": "Done"},
+        },
+    ]
+```
+
+`label` is optional and overrides the tool's own label for that one row. A
+card-level button, by contrast, collects no input, so it may only name a tool
+with no required parameters:
+
+```python
+@app.widget(title="Notes", renderer="markdown", actions=["archive_all"])
+async def recent() -> str: ...
+```
+
+Either form may only name an action-labelled tool of the widget's **own**
+app; anything else is a registration error raised at startup, not something
+that renders and fails on click.
+
+Two rules about widget payloads tightened alongside this. A list item's `url`
+now accepts only `http://`, `https://` and `mailto:`, and rejects whitespace
+and ASCII control characters — a widget returning anything else degrades to
+an error card. And a per-item action `label` is capped at 32 characters, the
+same limit a registered `action=` label has, because both render inside a
+button.
+
+### Grouping the dashboard: `[[home.section]]`
+
+By default the dashboard renders every widget in one flat grid, in
+registration order. `[[home.section]]` in `dudamel.toml` groups them into
+titled sections instead, addressing each widget as `<app>.<widget>`:
+
+```toml
+[[home.section]]
+title = "Today"
+widgets = ["workouts.week_volume", "notebook.recent"]
+
+[[home.section]]
+title = "Later"
+widgets = ["notebook.someday"]
+```
+
+Three rules, each chosen so a configuration mistake degrades rather than
+breaks:
+
+- an id naming no registered widget is **ignored** — a widget legitimately
+  disappears when its app is switched off, and that must not blank the page;
+- a registered widget named in **no** section still renders, in a trailing
+  untitled section, so enabling an app can never make its cards invisible;
+- **no `[home]` block at all** means the previous flat grid, unchanged.
+
+A widget named twice renders once, at its first mention. Neither of the quiet
+cases is left unexplained: `dudamel doctor` reports a layout id that matches
+no widget and a widget listed in more than one section.
+
 ## Backends without native tool calling
 
 Some local models — especially smaller ones served through an
@@ -301,6 +383,15 @@ migrations placed under `data_dir` are ignored.
   approve or refuse (unless you have turned taint off). Taint applies
   to the turn that fetches, not to the data: if your app stores fetched
   content and reads it back later, mark the reading tool `external=True` too.
+- **Card actions run without the model**: a button click is the human
+  decision the confirmation gate exists to obtain, so an action is never
+  queued for confirmation. A tool marked `confirm=True` still asks first, on
+  the surface the click came from: the dashboard raises a browser dialog
+  before it posts, and Telegram — where one tap is the whole decision and
+  there is no dialog to raise — marks the button's label with a `⚠️ ` prefix
+  instead. Nothing on this path can be reached by prompt injection: the model
+  cannot click. An app must construct a typed action explicitly; no external
+  text is ever parsed into one.
 - **Token budgets**: `[llm.budget] daily_tokens` in `dudamel.toml` sets a
   hard per-day ceiling per tier, enforced before each call — a runaway
   loop or a misbehaving job can't spend past it.
