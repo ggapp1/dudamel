@@ -133,6 +133,25 @@ def test_card_action_with_a_required_parameter_is_rejected() -> None:
         Registry([app])
 
 
+def test_card_action_with_only_optional_parameters_is_accepted() -> None:
+    """The rule is "nothing the button would have to collect", not "no
+    parameters at all". A parameter with a default is supplied by the tool
+    itself, so a card button can still invoke it with no input."""
+    app = App("tasks", description="d")
+
+    @app.tool(action="Refresh")
+    async def refresh(limit: int = 10) -> str:
+        """Refresh."""
+        return str(limit)
+
+    @app.widget(title="T", renderer="markdown", actions=["refresh"])
+    async def card() -> str:
+        return "hi"
+
+    registry = Registry([app])
+    assert registry.widgets[0].actions == ("refresh",)
+
+
 def test_card_action_naming_another_apps_tool_is_rejected() -> None:
     other = _labelled_app()
     mine = App("notes", description="d")

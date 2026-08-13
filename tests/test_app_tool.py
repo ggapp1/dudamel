@@ -202,6 +202,34 @@ def test_overlong_action_label_is_rejected() -> None:
             return "ok"
 
 
+def test_action_label_of_exactly_the_limit_is_accepted() -> None:
+    """32 characters is the longest label that fits, not the first that does
+    not -- pinned from the accepting side so the comparison cannot quietly
+    tighten to `>=`."""
+    app = App("tasks", description="d")
+    label = "x" * 32
+
+    @app.tool(action=label)
+    async def complete(id: int) -> str:
+        """Complete a task."""
+        return "ok"
+
+    assert app.tools["complete"].action == label
+
+
+def test_action_label_is_stripped_before_the_length_check() -> None:
+    """Padding is not length: a label that only exceeds the limit because of
+    surrounding whitespace is accepted, and stored stripped."""
+    app = App("tasks", description="d")
+
+    @app.tool(action="  " + "x" * 32)
+    async def complete(id: int) -> str:
+        """Complete a task."""
+        return "ok"
+
+    assert app.tools["complete"].action == "x" * 32
+
+
 def test_widget_actions_default_to_empty_tuple() -> None:
     app = App("tasks", description="d")
 
