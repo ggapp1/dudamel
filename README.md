@@ -202,8 +202,8 @@ title = "Later"
 widgets = ["notebook.someday"]
 ```
 
-Three rules, each chosen so a configuration mistake degrades rather than
-breaks:
+Three rules about *which widgets go where*, each chosen so a configuration
+mistake degrades rather than breaks:
 
 - an id naming no registered widget is **ignored** — a widget legitimately
   disappears when its app is switched off, and that must not blank the page;
@@ -214,6 +214,14 @@ breaks:
 A widget named twice renders once, at its first mention. Neither of the quiet
 cases is left unexplained: `dudamel doctor` reports a layout id that matches
 no widget and a widget listed in more than one section.
+
+The *spelling of the keys themselves* is the one thing here that is not
+degraded, deliberately. A key these blocks do not define — `widget` for
+`widgets`, or `[[home.sections]]` for `[[home.section]]` — is refused when
+`dudamel.toml` is read, naming the key path, and the assistant does not
+start. There is nothing useful to degrade to: such a section would hold no
+widgets, be dropped as empty, and take a whole group off the page with no id
+to report and nothing left to notice it by.
 
 ## Backends without native tool calling
 
