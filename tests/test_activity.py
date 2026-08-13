@@ -66,3 +66,17 @@ def test_enum_with_nonprimitive_value_recurses() -> None:
     out = json_safe({"h": Holiday.XMAS})
     json.dumps(out)  # must not raise
     assert out["h"] == "2026-12-25"
+
+
+async def test_a_row_defaults_to_the_router_with_no_actor(db: Database) -> None:
+    await log_activity(db, tool="paint", args={}, status="ok")
+    async with db.session() as s:
+        row = (await s.execute(select(Activity))).scalar_one()
+    assert (row.actor, row.source) == (None, "router")
+
+
+async def test_actor_and_source_round_trip(db: Database) -> None:
+    await log_activity(db, tool="paint", args={}, status="ok", actor="web", source="web")
+    async with db.session() as s:
+        row = (await s.execute(select(Activity))).scalar_one()
+    assert (row.actor, row.source) == ("web", "web")

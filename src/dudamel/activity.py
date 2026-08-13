@@ -34,7 +34,15 @@ async def log_activity(
     status: str,
     result_preview: str | None = None,
     conversation_id: int | None = None,
+    actor: str | None = None,
+    source: str = "router",
 ) -> None:
+    """Record one tool execution.
+
+    `source` defaults to "router" because that is the only caller that
+    predates the deterministic plane and it is, definitionally, the router.
+    Surfaces that invoke a tool directly pass their own value.
+    """
     async with db.session() as s:
         s.add(
             Activity(
@@ -43,5 +51,7 @@ async def log_activity(
                 args=json_safe(args),
                 status=status,
                 result_preview=(result_preview or "")[:_PREVIEW_CAP] or None,
+                actor=actor,
+                source=source,
             )
         )

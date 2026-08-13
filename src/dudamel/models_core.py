@@ -50,6 +50,11 @@ class Activity(CoreBase):
     tool: Mapped[str] = mapped_column(String(128))
     args: Mapped[dict] = mapped_column(JSON)
     status: Mapped[str] = mapped_column(String(32))  # ok|error|declined|confirmed
+    # Who invoked this and through which surface. Nullable because rows
+    # written before these columns existed cannot be attributed, and
+    # inventing a value for them would be a lie in an audit log.
+    actor: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source: Mapped[str | None] = mapped_column(String(16), nullable=True)  # router|web|telegram
     result_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Token/cost accounting lives in llm_calls (per call, with a
     # conversation_id), never here -- 0001's reserved tokens_in/tokens_out/
