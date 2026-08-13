@@ -38,16 +38,43 @@ def scaffold(tmp_path: Path, name: str = "proj") -> Path:
     return target
 
 
+LOCAL_APP = '''from dudamel import App
+
+app = App("notebook", description="Keep short notes")
+
+
+class Entry(app.Model, table="entries"):
+    title: str
+
+
+@app.tool
+async def add_note(title: str) -> str:
+    """Write down a note."""
+    return f"Noted: {title}"
+'''
+
+LOCAL_ASSISTANT = """from apps.notebook import app as notebook_app
+
+from dudamel import Orchestrator
+
+orchestrator = Orchestrator(apps=[notebook_app])
+"""
+
+
+def scaffold_with_local_app(tmp_path: Path, name: str = "proj") -> Path:
+    """A scaffolded project plus one app of the developer's own.
+
+    `dudamel new` generates an empty app list -- suite apps are opt-in via
+    `dudamel.toml` and local apps are written by hand -- so anything that
+    needs a registered model or tool has to add one first, exactly as a
+    developer following the project README does."""
+    target = scaffold(tmp_path, name)
+    (target / "apps" / "notebook.py").write_text(LOCAL_APP)
+    (target / "assistant.py").write_text(LOCAL_ASSISTANT)
+    return target
+
+
 # --- new -----------------------------------------------------------------
-
-
-def test_scaffold_workouts_byte_identical_to_examples() -> None:
-    """The scaffold's bundled app must be byte-identical to the documented
-    hero example -- README.md's quickstart shows this file verbatim and
-    promises readers "this is the whole file"."""
-    scaffold_copy = REPO_ROOT / "src" / "dudamel" / "scaffold_template" / "apps" / "workouts.py"
-    hero = REPO_ROOT / "examples" / "workouts.py"
-    assert scaffold_copy.read_bytes() == hero.read_bytes()
 
 
 def test_new_creates_expected_tree(tmp_path: Path) -> None:
@@ -55,7 +82,6 @@ def test_new_creates_expected_tree(tmp_path: Path) -> None:
     for rel in (
         "assistant.py",
         "apps/__init__.py",
-        "apps/workouts.py",
         "dudamel.toml",
         "pyproject.toml",
         ".env",
@@ -148,16 +174,29 @@ def test_new_creates_env_with_restricted_permissions(tmp_path: Path) -> None:
 # --- project module discovery / import ---------------------------------------
 
 
-def test_scaffolded_project_imports_and_registers_workouts(
+def test_scaffolded_project_imports_and_registers_no_apps(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A fresh project starts empty: first-party apps are switched on in
+    dudamel.toml and local apps are the developer's to add."""
     target = scaffold(tmp_path)
     monkeypatch.chdir(target)
     orchestrator = cli._load_orchestrator(Path.cwd(), "assistant")
     assert isinstance(orchestrator, Orchestrator)
-    assert set(orchestrator.registry.tools) == {"log_workout"}
-    assert [w.id for w in orchestrator.registry.widgets] == ["week_volume"]
-    assert [j.id for j in orchestrator.registry.jobs] == ["workouts.evening_summary"]
+    assert orchestrator.registry.apps == {}
+    assert orchestrator.registry.tools == {}
+    assert orchestrator.registry.widgets == []
+    assert orchestrator.registry.jobs == []
+
+
+def test_local_app_added_to_a_scaffolded_project_registers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = scaffold_with_local_app(tmp_path)
+    monkeypatch.chdir(target)
+    orchestrator = cli._load_orchestrator(Path.cwd(), "assistant")
+    assert set(orchestrator.registry.apps) == {"notebook"}
+    assert set(orchestrator.registry.tools) == {"add_note"}
 
 
 def test_run_missing_module_gives_actionable_error_not_traceback(
@@ -224,7 +263,7 @@ def test_run_wires_orchestrator_and_settings_into_serve(
     """Without actually starting a server: `run` must load the scaffold's
     .env into the environment, build Settings from its dudamel.toml, import
     assistant.py, and hand both to `serve()`."""
-    target = scaffold(tmp_path)
+    target = scaffold_with_local_app(tmp_path)
     monkeypatch.chdir(target)
     captured = {}
 
@@ -234,7 +273,7 @@ def test_run_wires_orchestrator_and_settings_into_serve(
 
     monkeypatch.setattr(cli, "serve", fake_serve)
     assert cli.main(["run"]) == 0
-    assert set(captured["orchestrator"].registry.tools) == {"log_workout"}
+    assert set(captured["orchestrator"].registry.tools) == {"add_note"}
     assert captured["settings"].llm_tiers["standard"].provider == "openai-compatible"
     assert captured["settings"].web.port == 8787
 
@@ -245,7 +284,10 @@ def test_run_wires_orchestrator_and_settings_into_serve(
 def test_db_migrate_then_no_changes_cycle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    target = scaffold(tmp_path)
+    """A fresh project has no models at all, so this drives the cycle from a
+    project with one local app: first migrate writes its table, second has
+    nothing left to do."""
+    target = scaffold_with_local_app(tmp_path)
     monkeypatch.chdir(target)
     capsys.readouterr()  # drain `new`'s "created .../ next steps: ..." output
 
@@ -253,11 +295,25 @@ def test_db_migrate_then_no_changes_cycle(
     out = capsys.readouterr().out.strip()
     generated = Path(out)
     assert generated.is_file()
-    assert "workouts_sets" in generated.read_text()
+    assert "notebook_entries" in generated.read_text()
     assert generated.parent == target / "migrations" / "versions"
 
     assert cli.main(["db", "migrate", "-m", "again"]) == 0
     assert capsys.readouterr().out.strip() == "no changes"
+
+
+def test_db_migrate_on_a_fresh_project_has_nothing_to_generate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`dudamel new` no longer ships an app, so the very first `db migrate`
+    in an untouched project reports `no changes` instead of failing."""
+    target = scaffold(tmp_path)
+    monkeypatch.chdir(target)
+    capsys.readouterr()  # drain `new`'s output
+
+    assert cli.main(["db", "migrate", "-m", "init"]) == 0
+    assert capsys.readouterr().out.strip() == "no changes"
+    assert not list((target / "migrations" / "versions").glob("*.py"))
 
 
 def test_db_migrate_applies_core_migrations(
@@ -312,7 +368,7 @@ def test_doctor_runs_green_on_scaffolded_project_even_fully_offline(
 ) -> None:
     """`doctor` must never crash regardless of network/service state --
     endpoint checks degrade to a ✗ line, never an exception."""
-    target = scaffold(tmp_path)
+    target = scaffold_with_local_app(tmp_path)
     monkeypatch.chdir(target)
     # Create the database so doctor can connect to it
     assert cli.main(["db", "migrate", "-m", "init"]) == 0
@@ -330,7 +386,7 @@ def test_doctor_runs_green_on_scaffolded_project_even_fully_offline(
     assert "telegram" in out
     assert "tailscale" in out
     # tool-safety table
-    assert "log_workout" in out
+    assert "add_note" in out
     assert "read_only" in out and "confirm" in out and "origin" in out
     # no MCP servers configured in the bundled scaffold -- no note printed
     assert "MCP server(s) configured" not in out
@@ -348,8 +404,8 @@ def test_doctor_notes_mcp_servers_configured_without_mounting_them(
     assistant = target / "assistant.py"
     assistant.write_text(
         assistant.read_text().replace(
-            "Orchestrator(apps=[workouts_app])",
-            'Orchestrator(apps=[workouts_app], mcp=["true", "false"])',
+            "Orchestrator(apps=[])",
+            'Orchestrator(apps=[], mcp=["true", "false"])',
         )
     )
     capsys.readouterr()  # drain `new`'s output

@@ -31,3 +31,16 @@ port = 8787
 # same host, so it trusts that proxy's X-Forwarded-For instead of treating
 # every request as coming from the proxy itself:
 # trusted_proxies = ["127.0.0.1"]
+
+# First-party apps that ship with dudamel are switched on here, one block per
+# app. Run `dudamel apps list` to see what is available. Each block starts with
+# an explicit `enabled`, and settings stay put when you switch an app off:
+#
+# [apps.weather]
+# enabled = true
+# latitude = 52.52
+# longitude = 13.40
+#
+# [apps.papers]
+# enabled = false
+# categories = ["cs.AI"]

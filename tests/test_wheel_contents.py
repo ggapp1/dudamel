@@ -1,6 +1,7 @@
 """`uv build` sanity: the shipped wheel must actually contain the scaffold
 template, the deploy (launchd/systemd) templates, web templates/static
-assets, and both migrations trees -- a future pyproject.toml packaging
+assets, and every migrations tree (core, the app template, and the suite
+lane) -- a future pyproject.toml packaging
 regression (e.g. an errant `packages =` edit) would otherwise ship a broken
 `dudamel new`/`dudamel run` silently, since the test suite itself runs
 against the editable install, not a built wheel."""
@@ -32,11 +33,12 @@ def test_wheel_contains_scaffold_template_and_web_assets(tmp_path: Path) -> None
         return any(n.startswith(prefix) for n in names)
 
     assert has_prefix("dudamel/scaffold_template/"), names
-    assert "dudamel/scaffold_template/apps/workouts.py" in names
+    assert "dudamel/scaffold_template/apps/__init__.py" in names
     assert "dudamel/scaffold_template/pyproject.toml" in names
     assert has_prefix("dudamel/web/templates/"), names
     assert "dudamel/web/static/htmx.min.js" in names
     assert has_prefix("dudamel/migrations/versions/"), names
     assert has_prefix("dudamel/migrations_app_template/"), names
+    assert has_prefix("dudamel/migrations_suite_lane/"), names
     assert "dudamel/deploy_templates/dudamel.plist" in names
     assert "dudamel/deploy_templates/dudamel.service" in names

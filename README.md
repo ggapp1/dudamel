@@ -38,15 +38,20 @@ limit.
 ```
 uvx dudamel new my-assistant
 cd my-assistant
-uv run dudamel db migrate -m init
+uv run dudamel apps list
 uv run dudamel run
 ```
 
-`dudamel new` scaffolds a project with one example app already wired up
-(`workouts`, shown in full below), a `dudamel.toml`, and a generated web
-token in `.env`. The scaffold is local-first by default — both LLM tiers
-point at a local Ollama server, so the whole thing runs offline once
-you've pulled a model:
+`dudamel new` scaffolds a project with an `apps/` directory for your own
+apps, a `dudamel.toml`, and a generated web token in `.env`. It starts with
+no apps enabled: first-party apps that ship with dudamel are switched on in
+`dudamel.toml` under `[apps.<name>]` (`dudamel apps list` shows what is
+available), and apps you write yourself go in `apps/` and are registered in
+`assistant.py`. Once one of your own apps defines models, `uv run dudamel
+db migrate -m init` generates the revision for them.
+
+The scaffold is local-first by default — both LLM tiers point at a local
+Ollama server, so the whole thing runs offline once you've pulled a model:
 
 ```toml
 [llm.tiers.standard]
@@ -71,8 +76,8 @@ with `uv run dudamel token rotate`, which rewrites only that one line.
 
 ### The whole example app
 
-This is the complete `workouts` app the scaffold ships — a database model,
-a tool, a widget, and a scheduled job:
+This is the complete `workouts` example from `examples/workouts.py` — a
+database model, a tool, a widget, and a scheduled job:
 
 ```python
 from datetime import datetime
@@ -116,7 +121,9 @@ async def evening_summary() -> None:
 That's the entire app: a typed model, a tool the LLM can call, a widget the
 dashboard renders without touching the model at all, and a nightly job
 that summarizes the day and sends a notification. `dudamel db migrate`
-picks the model up automatically — no separate schema file.
+picks the model up automatically — no separate schema file. Save a file
+like this under your project's `apps/` and add it to the list in
+`assistant.py` to run it.
 
 ## Backends without native tool calling
 
