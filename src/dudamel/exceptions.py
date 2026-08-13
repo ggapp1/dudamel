@@ -6,6 +6,19 @@ class ToolValidationError(DudamelError):
     """Tool arguments failed validation/coercion. Message is written for the model."""
 
 
+class ActionArgumentError(DudamelError, ValueError):
+    """The arguments of an operator-invoked action failed coercion.
+
+    Raised only by `Runtime.run_action`'s coercion step, never by a tool body.
+    Also a `ValueError`, which is the contract every caller of `run_action`
+    codes against -- but a distinct type, because a tool raising a plain
+    `ValueError` (the most idiomatic failure in Python app code) is a tool
+    failure, not a bad request, and a surface that could not tell the two
+    apart would report the tool's own message under a status blaming the
+    caller's input.
+    """
+
+
 class UnknownToolOutcome(DudamelError, RuntimeError):
     """A tool call whose side effect may or may not have taken effect.
 

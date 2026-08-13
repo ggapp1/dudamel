@@ -14,13 +14,14 @@ own session store or duplicates login logic; sessions stay strictly
 ``web/api.py``'s concern.
 
 State changes (sending a chat message, approving/declining a pending
-confirmation, running a card action) are NOT re-implemented here. Each page
-ships a few lines of vanilla JS that call the JSON API's existing,
-already-CSRF-protected ``/api/chat``, ``/api/confirm/{id}`` and
-``/api/action/{tool}`` endpoints directly from the browser,
-using the session cookie already on the page and a CSRF token embedded in a
-hidden form field (``#csrf-token``) — the standard "CSRF token embedded in
-forms for cookie POSTs" mitigation for cookie-authenticated state changes.
+confirmation, running a card action) are NOT re-implemented here. Each one
+belongs to an existing, already-CSRF-protected JSON API endpoint —
+``/api/chat``, ``/api/confirm/{id}``, ``/api/action/{tool}`` — that the
+browser calls directly, using the session cookie already on the page and a
+CSRF token embedded in a hidden form field (``#csrf-token``), the standard
+"CSRF token embedded in forms for cookie POSTs" mitigation for
+cookie-authenticated state changes. What a page ships toward that is the
+token plus, where the interaction exists yet, a few lines of vanilla JS.
 ui.py's own routes are therefore all plain ``GET``s; it never proxies a POST
 through Python.
 
