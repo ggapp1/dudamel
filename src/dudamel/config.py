@@ -4,7 +4,7 @@ import tomllib
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -133,6 +133,14 @@ class McpConfig(BaseModel):
 
 
 class HomeSection(BaseModel):
+    # The one layout mistake nothing else could see. Every other quiet case
+    # has a voice -- `dudamel doctor` reports an id matching no widget and a
+    # widget listed twice -- but `widget = [...]` for `widgets` left a section
+    # holding no widgets, which `compose_home` drops as empty: the section
+    # never appeared and nothing said why. Refused at load instead, where the
+    # message names the key and the file it came from.
+    model_config = ConfigDict(extra="forbid")
+
     title: str
     widgets: list[str] = []
 
@@ -143,6 +151,8 @@ class HomeConfig(BaseModel):
     Absent entirely, the dashboard renders exactly as it did before this
     existed: every widget, in registration order, in one grid.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     section: list[HomeSection] = []
 
