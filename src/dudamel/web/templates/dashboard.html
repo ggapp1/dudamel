@@ -65,7 +65,18 @@
 </div>
 
 <script>
+  // How many actions are outstanding, and whether one of them has succeeded
+  // since the last refresh. This script lives outside #widget-grid, which is
+  // the only thing the poll ever swaps, so both survive every swap.
   let inFlight = 0;
+  let refreshPending = false;
+
+  // Comfortably longer than the server's own deadline (a tool's default
+  // timeout is 30s, an MCP call's likewise), so this fires only when the
+  // connection has genuinely stalled and never races a slow-but-alive tool
+  // into a false failure. Without any limit a dead connection would pin
+  // inFlight above zero and freeze the grid until a reload.
+  const ACTION_TIMEOUT_MS = 60000;
 
   function csrfToken() {
     return document.getElementById('csrf-token').value;
@@ -75,15 +86,45 @@
     document.getElementById('action-status').textContent = message;
   }
 
-  // Suspend the polling refresh while an action is running. Without this the
-  // poll can swap #widget-grid mid-request, destroying the disabled button
-  // and leaving a re-enabled one over stale data — which is exactly the state
-  // that invites a duplicate click.
+  function isGrid(element) {
+    return Boolean(element) && element.id === 'widget-grid';
+  }
+
+  // The invariant is "#widget-grid is never swapped while an action is
+  // outstanding", not merely "no new poll starts". A swap mid-action destroys
+  // the disabled button and puts an enabled one over data that predates the
+  // action — exactly the state that invites a duplicate mutation. Suppressing
+  // only the request would still let a poll that was ALREADY in flight when
+  // the button was clicked land its stale HTML, so the swap itself is where
+  // the invariant has to be enforced; the request guard just avoids the
+  // pointless round trip.
   document.body.addEventListener('htmx:beforeRequest', function (event) {
-    if (inFlight > 0 && event.detail.elt.id === 'widget-grid') {
+    if (inFlight > 0 && isGrid(event.detail.elt)) {
       event.preventDefault();
     }
   });
+
+  document.body.addEventListener('htmx:beforeSwap', function (event) {
+    if (inFlight > 0 && (isGrid(event.detail.target) || isGrid(event.detail.elt))) {
+      event.detail.shouldSwap = false;
+    }
+  });
+
+  // The single exit every action path takes, so inFlight is decremented
+  // exactly once per increment. A refresh is deferred until the LAST
+  // outstanding action finishes: triggering it earlier would only have it
+  // cancelled by the guard above, silently dropping the refresh that a
+  // committed mutation needs.
+  function finishAction(succeeded) {
+    inFlight -= 1;
+    refreshPending = refreshPending || succeeded;
+    if (inFlight > 0 || !refreshPending) return;
+    // inFlight is 0 here, so this refresh passes its own guard. The flag is
+    // cleared only after the trigger returns: if htmx is missing or throws,
+    // the refresh stays owed and the next completed action makes it again.
+    htmx.trigger('#widget-grid', 'refresh');
+    refreshPending = false;
+  }
 
   async function runAction(button) {
     const label = button.dataset.label;
@@ -92,29 +133,33 @@
     button.setAttribute('aria-busy', 'true');
     inFlight += 1;
     announce(label + ': running');
+    let succeeded = false;
     try {
       const response = await fetch('/api/action/' + encodeURIComponent(button.dataset.tool), {
         method: 'POST',
         headers: {'Content-Type': 'application/json', 'x-csrf-token': csrfToken()},
         body: JSON.stringify({args: JSON.parse(button.dataset.args)}),
+        signal: AbortSignal.timeout(ACTION_TIMEOUT_MS),
       });
-      if (!response.ok) {
+      if (response.ok) {
+        succeeded = true;
+        announce(label + ': done');
+      } else {
         announce(label + ' failed: ' + (await response.text()));
-        button.disabled = false;
-        button.removeAttribute('aria-busy');
-        inFlight -= 1;
-        return;
       }
-      announce(label + ': done');
-      inFlight -= 1;
-      htmx.trigger('#widget-grid', 'refresh');
-      return;
     } catch (error) {
+      // Includes the abort above: a stall is reported and recovered from like
+      // any other failure rather than wedging the counter.
       announce(label + ' failed: ' + error);
+    }
+    if (!succeeded) {
       button.disabled = false;
       button.removeAttribute('aria-busy');
     }
-    inFlight -= 1;
+    // Outside the try/catch on purpose: htmx.trigger must not be able to route
+    // control back into catch and reach a second decrement. A successful
+    // action's button stays disabled until the refresh replaces it.
+    finishAction(succeeded);
   }
 </script>
 {% endblock %}
