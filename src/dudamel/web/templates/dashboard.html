@@ -65,9 +65,11 @@
 </div>
 
 <script>
-  // How many actions are outstanding, and whether one of them has succeeded
-  // since the last refresh. This script lives outside #widget-grid, which is
-  // the only thing the poll ever swaps, so both survive every swap.
+  // How many actions are outstanding, and whether the grid still owes a
+  // refresh for one that succeeded. `refreshPending` means "a refresh is owed
+  // until one demonstrably happened" -- it is cleared by an observed swap of
+  // the grid, never by having asked for one. This script lives outside
+  // #widget-grid, the only thing ever swapped here, so both survive a swap.
   let inFlight = 0;
   let refreshPending = false;
 
@@ -110,20 +112,32 @@
     }
   });
 
+  // A refresh counts as delivered only when a swap of the grid is actually
+  // observed. htmx.trigger returning proves nothing: a request made while
+  // another is in flight on the same element is queued and replayed after the
+  // swap, and the replay is dropped without a throw if the element it captured
+  // was detached by the outerHTML swap. The grid's own poll clears the flag
+  // too -- its swap delivers the same fresh data an action was waiting for.
+  document.body.addEventListener('htmx:afterSwap', function (event) {
+    if (isGrid(event.detail.elt) || isGrid(event.target)) {
+      refreshPending = false;
+    }
+  });
+
   // The single exit every action path takes, so inFlight is decremented
   // exactly once per increment. A refresh is deferred until the LAST
   // outstanding action finishes: triggering it earlier would only have it
-  // cancelled by the guard above, silently dropping the refresh that a
-  // committed mutation needs.
+  // suppressed by the swap guard above, and the flag would then keep it owed
+  // anyway.
   function finishAction(succeeded) {
     inFlight -= 1;
     refreshPending = refreshPending || succeeded;
     if (inFlight > 0 || !refreshPending) return;
-    // inFlight is 0 here, so this refresh passes its own guard. The flag is
-    // cleared only after the trigger returns: if htmx is missing or throws,
-    // the refresh stays owed and the next completed action makes it again.
+    // inFlight is 0 here, so this refresh passes its own guard. Nothing is
+    // cleared here: if the trigger throws, is queued away or has its swap
+    // suppressed, the refresh stays owed and the next completed action -- or
+    // the 30s poll -- makes good on it.
     htmx.trigger('#widget-grid', 'refresh');
-    refreshPending = false;
   }
 
   async function runAction(button) {
@@ -151,15 +165,19 @@
       // Includes the abort above: a stall is reported and recovered from like
       // any other failure rather than wedging the counter.
       announce(label + ' failed: ' + error);
+    } finally {
+      // `finally` runs exactly once on every path, including one where the
+      // catch block itself throws, and a throw from here cannot re-enter
+      // catch — so there is no second-decrement hazard to avoid. The one cost
+      // weighed: a throw from finishAction would mask the original error.
+      // A successful action's button stays disabled until the refresh
+      // replaces it.
+      if (!succeeded) {
+        button.disabled = false;
+        button.removeAttribute('aria-busy');
+      }
+      finishAction(succeeded);
     }
-    if (!succeeded) {
-      button.disabled = false;
-      button.removeAttribute('aria-busy');
-    }
-    // Outside the try/catch on purpose: htmx.trigger must not be able to route
-    // control back into catch and reach a second decrement. A successful
-    // action's button stays disabled until the refresh replaces it.
-    finishAction(succeeded);
   }
 </script>
 {% endblock %}
