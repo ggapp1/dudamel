@@ -536,7 +536,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     ok, detail = _check_core_migrations(settings.database_url)
     lines.append(_line(ok, "core migrations", detail))
 
-    ok, detail = _check_app_migrations_dir(project_dir)
+    # `settings.project_dir`, not the cwd: an explicit `project_dir` in
+    # dudamel.toml wins, and the runtime resolves the project's own migration
+    # lane from exactly that. Reading the cwd here would report on a different
+    # directory than the one the startup gate gates on.
+    ok, detail = _check_app_migrations_dir(settings.project_dir)
     lines.append(_line(ok, "app migrations dir", detail))
 
     lines.append(
@@ -550,7 +554,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         lines.append(_line(False, f"  app {err.app}", err.message))
 
     ok, detail = _check_pending_migrations(
-        settings.database_url, project_dir, resolution.suite_lanes
+        settings.database_url, settings.project_dir, resolution.suite_lanes
     )
     lines.append(_line(ok, "pending migrations", detail))
 
@@ -584,7 +588,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if import_error is not None:
         print(_line(False, f"app import ({_DEFAULT_MODULE})", import_error))
     else:
-        print(_render_tool_table(orchestrator))
+        # Rendered from the RESOLVED apps, not from the project's own object:
+        # doctor announces `app resolution: N enabled` two lines above, and an
+        # operator reads this table to decide what can run unconfirmed. A suite
+        # app enabled purely in dudamel.toml is in `resolution.apps` and not in
+        # the project's registry, so rendering the latter would announce the
+        # app and then omit its tools from the one table that lists their
+        # safety flags. `mcp` is carried over because it belongs to the
+        # project's orchestrator, not to any app -- same reconstruction
+        # `cmd_run` hands to `serve`.
+        print(_render_tool_table(Orchestrator(apps=resolution.apps, mcp=orchestrator.mcp)))
         # `doctor` never starts the orchestrator, so MCP-mounted tools (only
         # discovered by actually connecting to each server -- see
         # mcp_mount.py) aren't in the table above yet; this makes that gap
@@ -600,12 +613,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 # --- apps list ---------------------------------------------------------------
 
-# The lane column for a row whose lane was never consulted. A disabled or
-# uninstallable app is described from registry metadata alone -- it is never
-# imported and its lane is never compared against the database -- so anything
-# other than a dash here would be a claim the command did not check. Local apps
-# share the project's own migrations/ lane, which `doctor` reports as one line.
+# The lane column for a row whose lane was never consulted: a disabled,
+# uninstallable or errored app is described from registry metadata alone --
+# never imported, never compared against the database -- so anything other than
+# a dash would be a claim the command did not check.
 _NO_LANE = "—"
+
+# A local app has no lane of its own; its tables live in the project's shared
+# migrations/ lane, which `doctor` reports as one line. Distinct from _NO_LANE,
+# which means "not consulted" -- the same glyph for both would say the wrong
+# thing about one of them.
+_PROJECT_LANE = "project"
 
 _APPS_LIST_HEADERS = ("name", "origin", "state", "lane", "notes")
 
@@ -639,8 +657,11 @@ def _render_apps_table(rows: Sequence[tuple[str, str, str, str, str]]) -> str:
     # Every column but the last (free-text notes) is padded to its widest cell.
     widths = [max(len(row[i]) for row in (_APPS_LIST_HEADERS, *rows)) for i in range(4)]
     fmt = "  ".join(f"{{:<{w}}}" for w in widths) + "  {}"
-    header = fmt.format(*_APPS_LIST_HEADERS)
-    return "\n".join([header, "-" * len(header), *(fmt.format(*row) for row in rows)])
+    rendered = [fmt.format(*row) for row in (_APPS_LIST_HEADERS, *rows)]
+    # Measured across every rendered line: the notes column is unpadded, so a
+    # rule sized from the header alone under-runs the rows it sits above.
+    rule = "-" * max(len(line) for line in rendered)
+    return "\n".join([rendered[0], rule, *rendered[1:]])
 
 
 def cmd_apps_list(args: argparse.Namespace) -> int:
@@ -686,7 +707,7 @@ def cmd_apps_list(args: argparse.Namespace) -> int:
         # is registered in Python, so it runs unless config switches it off.
         enabled = bool(settings.apps.get(name, {}).get("enabled", True))
         state = _app_state(name, enabled=enabled, resolved=resolved, errored=errored)
-        rows.append((name, "local", state, _NO_LANE, app.description))
+        rows.append((name, "local", state, _PROJECT_LANE, app.description))
 
     if rows:
         print(_render_apps_table(rows))
