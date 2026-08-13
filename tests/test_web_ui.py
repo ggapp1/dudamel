@@ -219,6 +219,9 @@ async def test_activity_page_shows_tool_name(tmp_path: Path, token_env: str) -> 
     assert resp.status_code == 200
     assert "log_workout" in resp.text
     assert "ok" in resp.text
+    # The row carries the surface it came from, and this one came from the
+    # router acting for the model -- rendered as its own cell.
+    assert "<td>router</td>" in resp.text
     await rt.stop()
 
 
