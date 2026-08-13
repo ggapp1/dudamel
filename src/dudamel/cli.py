@@ -215,7 +215,11 @@ def cmd_new(args: argparse.Namespace) -> int:
     print(f"created {target}/")
     print("next steps:")
     print(f"  cd {args.name}")
-    print("  uv run dudamel db migrate -m init")
+    # Not `db migrate`: a fresh project registers no apps, so it has no models
+    # and that command would only print `no changes`. `apps list` is what a new
+    # project needs -- it shows the first-party apps that can be switched on in
+    # dudamel.toml.
+    print("  uv run dudamel apps list")
     print("  uv run dudamel run")
     return 0
 

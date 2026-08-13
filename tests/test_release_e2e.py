@@ -86,10 +86,21 @@ async def test_new_user_path_scaffold_migrate_serve_health_and_widgets(
 ) -> None:
     target = tmp_path / "my-assistant"
 
-    # Exactly the documented quickstart (README.md), minus `dudamel run` --
-    # replaced below with an in-process serve() call so a FakeProvider can
-    # stand in for the model and the web port can be OS-assigned.
+    # The documented quickstart (README.md), minus `dudamel run` -- replaced
+    # below with an in-process serve() call so a FakeProvider can stand in for
+    # the model and the web port can be OS-assigned. `dudamel new` scaffolds
+    # an empty app list, so the documented `workouts` example is dropped in as
+    # a local app first: without one there is no model to migrate and no
+    # widget to serve, and this test would prove nothing about either.
     assert cli.main(["new", str(target)]) == 0
+    (target / "apps" / "workouts.py").write_bytes(
+        (REPO_ROOT / "examples" / "workouts.py").read_bytes()
+    )
+    (target / "assistant.py").write_text(
+        "from apps.workouts import app as workouts_app\n\n"
+        "from dudamel import Orchestrator\n\n"
+        "orchestrator = Orchestrator(apps=[workouts_app])\n"
+    )
     monkeypatch.chdir(target)
     assert cli.main(["db", "migrate", "-m", "init"]) == 0
 
@@ -193,6 +204,17 @@ def test_quickstart_runs_via_real_uv_run_subprocess_in_scaffolded_project(
     target = tmp_path / "my-assistant"
     assert cli.main(["new", str(target)]) == 0
     assert (target / "pyproject.toml").is_file()
+    # A scaffolded project has no models of its own, so `db migrate` below
+    # would have nothing to autogenerate; the documented example app gives it
+    # a real revision to write.
+    (target / "apps" / "workouts.py").write_bytes(
+        (REPO_ROOT / "examples" / "workouts.py").read_bytes()
+    )
+    (target / "assistant.py").write_text(
+        "from apps.workouts import app as workouts_app\n\n"
+        "from dudamel import Orchestrator\n\n"
+        "orchestrator = Orchestrator(apps=[workouts_app])\n"
+    )
 
     help_proc = subprocess.run(
         ["uv", "run", "--find-links", str(dist_dir), "dudamel", "--help"],
