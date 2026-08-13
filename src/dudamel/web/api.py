@@ -248,9 +248,15 @@ def create_api(runtime: Runtime, settings: Settings) -> FastAPI:
         must reach 502 with its own message: answering it 404 would claim the
         action does not exist right after it ran, and answering it 400 would
         put the tool's message under a status blaming the caller's input.
+
+        The actor is how the caller authenticated, not "web" again -- the
+        surface is already the `source` column, and a duplicate of it says
+        nothing. This installation has one operator identity, so the useful
+        distinction on a state-changing endpoint is a script holding the
+        bearer token versus a browser session someone logged into.
         """
         try:
-            result = await runtime.run_action(tool_name, payload.args, actor="web", source="web")
+            result = await runtime.run_action(tool_name, payload.args, actor=auth, source="web")
         except UnknownActionError as e:
             raise HTTPException(status_code=404, detail=str(e)) from None
         except ActionArgumentError as e:

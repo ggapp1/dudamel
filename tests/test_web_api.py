@@ -743,8 +743,29 @@ async def test_action_writes_an_activity_row_naming_the_actor_and_surface(
     async with rt._db.session() as s:
         rows = (await s.execute(select(Activity))).scalars().all()
     assert [(r.tool, r.status, r.actor, r.source) for r in rows] == [
-        ("complete", "ok", "web", "web")
+        ("complete", "ok", "bearer", "web")
     ]
+    await rt.stop()
+
+
+async def test_a_browser_session_and_an_api_client_are_distinguishable(
+    tmp_path: Path, token_env: str
+) -> None:
+    """`source` already says the request arrived over the web, so repeating
+    that as the actor recorded nothing. How the caller authenticated is the
+    one distinction this endpoint actually has: a script holding the token
+    against a browser someone logged into."""
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        login = await c.post("/login", json={"token": token_env})
+        await c.post(
+            "/api/action/complete",
+            json={"args": {"id": 4}},
+            headers={CSRF_HEADER: login.json()["csrf_token"]},
+        )
+    async with rt._db.session() as s:
+        rows = (await s.execute(select(Activity))).scalars().all()
+    assert [(r.actor, r.source) for r in rows] == [("session", "web")]
     await rt.stop()
 
 
@@ -829,7 +850,7 @@ async def test_a_failed_action_writes_an_error_row_naming_the_actor_and_surface(
     async with rt._db.session() as s:
         rows = (await s.execute(select(Activity))).scalars().all()
     assert [(r.tool, r.status, r.actor, r.source) for r in rows] == [
-        ("explode", "error", "web", "web")
+        ("explode", "error", "bearer", "web")
     ]
     assert rows[0].result_preview == "kaboom"
     await rt.stop()
@@ -851,7 +872,7 @@ async def test_refused_arguments_are_recorded_too(tmp_path: Path, token_env: str
     async with rt._db.session() as s:
         rows = (await s.execute(select(Activity))).scalars().all()
     assert [(r.tool, r.status, r.actor, r.source) for r in rows] == [
-        ("complete", "error", "web", "web")
+        ("complete", "error", "bearer", "web")
     ]
     assert rows[0].args == {"id": "abc"}
     await rt.stop()
