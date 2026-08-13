@@ -296,8 +296,9 @@ migrations placed under `data_dir` are ignored.
 - **`external=True`**: mark a tool whose return value may contain text an
   attacker controls — anything that fetches a web page, an RSS feed, or a
   calendar subscription. It is orthogonal to `read_only`: an external
-  read-only tool still runs without a prompt, but it taints the turn so the
-  model can't be talked into a write by the page it just read. Taint applies
+  read-only tool still runs without a prompt, but it taints the turn, so a
+  write the page talks the model into is held at the confirm gate for you to
+  approve or refuse (unless you have turned taint off). Taint applies
   to the turn that fetches, not to the data: if your app stores fetched
   content and reads it back later, mark the reading tool `external=True` too.
 - **Token budgets**: `[llm.budget] daily_tokens` in `dudamel.toml` sets a

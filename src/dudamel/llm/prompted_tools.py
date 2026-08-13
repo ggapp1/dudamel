@@ -19,11 +19,12 @@ Tool selection and execution stay exactly as gated as the native path --
 `Router` resolves every parsed call name against the registry, and a tool's
 `origin` (native vs. mcp) is a `Tool` attribute the registry assigns at
 mount time, not something a call site can set. A forged call to an
-mcp-origin tool name therefore still taints the turn via `Tool.origin`
-exactly as a real one would. Likewise, nothing here can approve a pending
-confirmation: `Router.resolve_confirmation` is a separate, out-of-band
-method the interfaces call from a user's explicit yes/no, never something
-reachable from parsed model output. The five properties enforced below
+mcp-origin tool name therefore still taints the turn via `Tool.untrusted`
+(`external or origin == "mcp"`) exactly as a real one would. Likewise,
+nothing here can approve a pending confirmation:
+`Router.resolve_confirmation` is a separate, out-of-band method the
+interfaces call from a user's explicit yes/no, never something reachable
+from parsed model output. The five properties enforced below
 (nonce+JSON-encoded fences, fresh-completion-only parsing, a strict
 envelope, server-generated ids, and a call-count cap) exist to keep a
 malicious or merely confused small model from corrupting the router's
