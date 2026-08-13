@@ -34,7 +34,12 @@ port = 8787
 
 # First-party apps that ship with dudamel are switched on here, one block per
 # app. Run `dudamel apps list` to see what is available. Each block starts with
-# an explicit `enabled`, and settings stay put when you switch an app off:
+# an explicit `enabled`, and settings stay put when you switch an app off.
+#
+# The two names below are ILLUSTRATIVE — they show the shape, not the roster.
+# An [apps.<name>] block naming an app that `dudamel apps list` does not show
+# is an error and stops `dudamel run`, and `enabled = false` does not excuse
+# it: an unknown name is unknown either way.
 #
 # [apps.weather]
 # enabled = true

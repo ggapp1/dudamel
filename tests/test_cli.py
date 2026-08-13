@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -388,8 +389,46 @@ def test_doctor_runs_green_on_scaffolded_project_even_fully_offline(
     # tool-safety table
     assert "add_note" in out
     assert "read_only" in out and "confirm" in out and "origin" in out
-    # no MCP servers configured in the bundled scaffold -- no note printed
+    # neither the scaffold nor the local app configures an MCP server -- no
+    # note printed
     assert "MCP server(s) configured" not in out
+    # the migrations hint reflects a project that HAS models to autogenerate
+    assert "no revisions yet" not in out
+
+
+def test_doctor_on_a_fresh_project_does_not_advise_a_migrate_that_would_do_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With no apps resolved there are no models, so `db migrate` would only
+    print `no changes` -- doctor must not send the user there."""
+    target = scaffold(tmp_path)
+    monkeypatch.chdir(target)
+    capsys.readouterr()  # drain `new`'s output
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "✓ app migrations dir: present, no revisions yet — normal until an app defines" in out
+    assert "run `dudamel db migrate -m init`" not in out
+
+
+def test_app_migrations_hint_advises_migrate_only_when_an_app_could_generate_one(
+    tmp_path: Path,
+) -> None:
+    target = scaffold(tmp_path)
+    ok, without_apps = cli._check_app_migrations_dir(target, any_apps=False)
+    assert ok and "normal until an app defines models" in without_apps
+    ok, with_apps = cli._check_app_migrations_dir(target, any_apps=True)
+    assert ok and "run `dudamel db migrate -m init`" in with_apps
+
+
+def test_scaffold_config_enables_no_apps(tmp_path: Path) -> None:
+    """The `[apps.*]` examples in the scaffold's dudamel.toml stay COMMENTED:
+    they name illustrative apps, and a block naming an app the suite does not
+    ship is a resolution error that stops `dudamel run` -- `enabled = false`
+    included, since an unknown name is unknown either way."""
+    target = scaffold(tmp_path)
+    config = tomllib.loads((target / "dudamel.toml").read_text())
+    assert "apps" not in config
 
 
 def test_doctor_notes_mcp_servers_configured_without_mounting_them(

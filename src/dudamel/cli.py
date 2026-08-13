@@ -357,12 +357,17 @@ def _check_core_migrations(db_url: str) -> tuple[bool, str]:
     return False, f"behind head ({sorted(current)} != {sorted(heads)})"
 
 
-def _check_app_migrations_dir(project_dir: Path) -> tuple[bool, str]:
+def _check_app_migrations_dir(project_dir: Path, *, any_apps: bool) -> tuple[bool, str]:
     mig_dir = project_dir / "migrations"
     if not mig_dir.exists():
         return False, "migrations/ not found — run `dudamel db migrate -m init` to create it"
     revisions = list((mig_dir / "versions").glob("*.py")) if (mig_dir / "versions").exists() else []
     if not revisions:
+        # Only advise `db migrate` when there is something to autogenerate: a
+        # project with no apps resolved has no models either, so that command
+        # would print `no changes` and the advice would be a dead end.
+        if not any_apps:
+            return True, "present, no revisions yet — normal until an app defines models"
         return True, "present, no revisions yet — run `dudamel db migrate -m init`"
     return True, f"present ({len(revisions)} revision{'s' if len(revisions) != 1 else ''})"
 
@@ -553,7 +558,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # dudamel.toml wins, and the runtime resolves the project's own migration
     # lane from exactly that. Reading the cwd here would report on a different
     # directory than the one the startup gate gates on.
-    ok, detail = _check_app_migrations_dir(settings.project_dir)
+    ok, detail = _check_app_migrations_dir(settings.project_dir, any_apps=bool(resolution.apps))
     lines.append(_line(ok, "app migrations dir", detail))
 
     lines.append(
