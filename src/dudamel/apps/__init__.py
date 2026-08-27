@@ -55,6 +55,11 @@ SUITE_APPS: dict[str, SuiteApp] = {
         module="dudamel.apps.tasks",
         summary="A to-do list with due dates",
     ),
+    "notes": SuiteApp(
+        name="notes",
+        module="dudamel.apps.notes",
+        summary="Short notes, searchable by substring",
+    ),
 }
 
 

@@ -42,3 +42,9 @@ async def bound_app(module_name: str, tmp_path: Any, settings: dict | None = Non
 async def tasks_app(tmp_path):
     async with bound_app("dudamel.apps.tasks", tmp_path) as app:
         yield app
+
+
+@pytest.fixture
+async def notes_app(tmp_path):
+    async with bound_app("dudamel.apps.notes", tmp_path) as app:
+        yield app
