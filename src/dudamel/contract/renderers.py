@@ -14,10 +14,33 @@ class StatPayload(BaseModel):
     unit: str | None = None
     delta: float | None = None
 
+    @field_validator("label", "unit", "value")
+    @classmethod
+    def _clean_text(cls, value: Any) -> Any:
+        """A stat card takes card-level buttons like any other widget, so its
+        text stands in the same relationship to a live control that a list
+        item's title does. Numeric values pass through untouched -- there is
+        nothing to reorder in an int."""
+        if not isinstance(value, str):
+            return value
+        return clean_display_text(value)
+
 
 class TablePayload(BaseModel):
     columns: list[str]
     rows: list[list[Any]]
+
+    @field_validator("columns")
+    @classmethod
+    def _clean_columns(cls, value: list[str]) -> list[str]:
+        return [clean_display_text(c) for c in value]
+
+    @field_validator("rows")
+    @classmethod
+    def _clean_rows(cls, value: list[list[Any]]) -> list[list[Any]]:
+        """Only string cells. A number has nothing to reorder, and coercing a
+        cell to text here would silently change the payload's shape."""
+        return [[clean_display_text(c) if isinstance(c, str) else c for c in row] for row in value]
 
 
 # An explicit allowlist of URL prefixes, matched case-insensitively against
@@ -79,7 +102,20 @@ ACTION_LABEL_MAX = 32
 # one commit, or the disagreement this exists to remove comes straight back.
 # Confusables (Cyrillic "А" in "Аrchive") are out of reach of any blacklist,
 # the same unwinnable-list note the digest carries about bracket lookalikes.
-_UNSAFE_LABEL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+# THE definition. Telegram imports this rather than keeping its own copy: the
+# two were byte-identical duplicates held in sync by a comment, and a comment is
+# exactly what let the *fields* they guard drift apart (labels were cleaned on
+# both surfaces; the titles beside them were cleaned on one). Widening the class
+# is now a one-line change in one place, which was the whole argument for the
+# comment in the first place.
+UNSAFE_DISPLAY_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+_UNSAFE_LABEL_CHARS = UNSAFE_DISPLAY_CHARS  # retained: read by tests and by app.py
+
+
+# A title is not a label: it holds a sentence, not a button caption. Aligned
+# with telegram's `_MAX_DIGEST_LINE`, which is where the other surface already
+# stops reading, so neither surface silently shows more than the other.
+DISPLAY_TEXT_MAX = 256
 
 
 def clean_action_label(value: str) -> str:
@@ -90,6 +126,23 @@ def clean_action_label(value: str) -> str:
     return "" -- each caller raises its own error type for that.
     """
     return _UNSAFE_LABEL_CHARS.sub("", value).strip()
+
+
+def clean_display_text(value: str) -> str:
+    """The same normalization, plus a length bound, for app-authored prose.
+
+    Deliberately NOT the same function as `clean_action_label`, though it
+    shares the character class. The length rules are opposites and both are
+    right: an over-long *label* raises, because an app author typed it and a
+    button caption that does not fit is a bug worth failing on; an over-long
+    *title* truncates, because it is ordinary data a user or a model supplied
+    and dropping the whole card over it is a worse outcome than an ellipsis.
+    Same reasoning as `activity.result_preview` truncating at its boundary.
+    """
+    text = clean_action_label(value)
+    if len(text) > DISPLAY_TEXT_MAX:
+        text = text[: DISPLAY_TEXT_MAX - 1] + "\u2026"
+    return text
 
 
 class ItemAction(BaseModel):
@@ -145,6 +198,32 @@ class ListItem(BaseModel):
     url: str | None = None
     action: ItemAction | None = None
 
+    @field_validator("title")
+    @classmethod
+    def _clean_title(cls, value: str) -> str:
+        """Reject a title that cleans away to nothing.
+
+        Unlike a subtitle, a title is the row. An empty one on a card carrying
+        a button is an unlabelled affordance, so this fails loudly rather than
+        rendering a blank line next to a live control.
+        """
+        title = clean_display_text(value)
+        if not title:
+            raise ValueError("title must not be empty after removing unrenderable characters")
+        return title
+
+    @field_validator("subtitle")
+    @classmethod
+    def _clean_subtitle(cls, value: str | None) -> str | None:
+        """A subtitle that cleans away becomes absent, not empty.
+
+        It is optional, so dropping it is the honest degrade -- failing the
+        whole card over an ornamental field would cost the row it describes.
+        """
+        if value is None:
+            return None
+        return clean_display_text(value) or None
+
     @field_validator("url")
     @classmethod
     def _reject_unsafe_url(cls, value: str | None) -> str | None:
@@ -172,6 +251,14 @@ def validate_widget_payload(renderer: str, data: Any) -> Any:
             return TablePayload.model_validate(data)
         if renderer == "list":
             return _LIST_ADAPTER.validate_python(data)
+        # NOT sanitized, deliberately -- recorded rather than left ambiguous.
+        # UNSAFE_DISPLAY_CHARS spans \x00-\x1f, which includes newline and tab.
+        # Removing those from a title is the point (it stops a one-line field
+        # forging a second line); removing them from a markdown document would
+        # destroy the document. A markdown card also carries no per-row action,
+        # so its text does not sit beside a one-tap control the way a list
+        # item's title does. Sanitizing it needs a different character class --
+        # a separate decision, not this plan's.
         if renderer == "markdown":
             if not isinstance(data, str):
                 raise ValueError("markdown renderer expects a str")

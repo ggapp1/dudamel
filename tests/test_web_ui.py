@@ -301,6 +301,10 @@ HOSTILE_ARG = "</script><img src=x onerror=alert(1)>"
 # A right-to-left override in front of reversed text: a browser draws this as
 # "Archive", on a button wired to a tool that deletes.
 SPOOFED_LABEL = "\u202eegruP"
+# The same trick one field to the left: the text a button sits next to. Until
+# plan 6b-0 this was unsanitized on the web and stripped on Telegram, so the two
+# surfaces drew the same row differently.
+SPOOFED_TITLE = "\u202eehcraM"
 
 
 def make_tasks_orc() -> Orchestrator:
@@ -340,6 +344,7 @@ def make_tasks_orc() -> Orchestrator:
             {"title": "Old task", "action": {"tool": "wipe", "args": {"id": 2}}},
             {"title": "Feed item", "action": {"tool": "note", "args": {"text": HOSTILE_ARG}}},
             {"title": "Everything", "action": {"tool": "purge", "args": {"id": 3}}},
+            {"title": SPOOFED_TITLE, "subtitle": SPOOFED_TITLE},
         ]
 
     @app.widget(title="Notes", renderer="markdown")
