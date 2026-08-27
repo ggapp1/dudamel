@@ -2,13 +2,40 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from dudamel import App
 
-app = App("tasks", description="A to-do list with due dates")
+
+class TasksSettings(BaseModel):
+    # How far ahead the Today card looks. 1 = today and tomorrow.
+    horizon_days: int = 1
+    # The framework has no timezone of its own -- the scheduler runs on naive
+    # UTC and nothing else mentions one -- so a date-sensitive app carries its
+    # own until it does. See the 6b-1 design doc 7.1: without this, a task due
+    # "today" is off by one for most of the world for part of every day.
+    timezone: str = "UTC"
+
+    @field_validator("timezone")
+    @classmethod
+    def _known_zone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"unknown timezone {value!r}") from exc
+        return value
+
+
+app = App("tasks", description="A to-do list with due dates", settings=TasksSettings)
+
+
+def _local_today(tz: str) -> date:
+    """Today in `tz`. Not `date.today()`: the server's clock is not the user's."""
+    return datetime.now(UTC).astimezone(ZoneInfo(tz)).date()
 
 
 class Task(app.Model, table="items"):
@@ -73,3 +100,34 @@ async def delete_task(task_id: int, title: str) -> str:
             return f"Refused: task {task_id} is {row.title!r}, not {title!r}."
         await session.delete(row)
         return f"Deleted: {row.title}"
+
+
+@app.widget(title="Today", renderer="list")
+async def today() -> list[dict]:
+    settings = app.settings
+    horizon = _local_today(settings.timezone) + timedelta(days=settings.horizon_days)
+    async with app.db() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(Task)
+                    .where(Task.done.is_(False))
+                    .where((Task.due.is_(None)) | (Task.due <= horizon))
+                    # Dated before undated, soonest first; an undated task is not
+                    # urgent but is still owed.
+                    .order_by(Task.due.is_(None), Task.due, Task.created_at, Task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    if not rows:
+        return [{"title": "Nothing due.", "subtitle": "Ask to add one."}]
+    return [
+        {
+            "title": row.title,
+            "subtitle": f"due {row.due}" if row.due else None,
+            "action": {"tool": "complete_task", "args": {"task_id": row.id}},
+        }
+        for row in rows
+    ]
