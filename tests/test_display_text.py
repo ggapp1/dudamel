@@ -1,9 +1,9 @@
 """App-authored display text is sanitized at the contract, on every surface.
 
-`ItemAction.label` has been cleaned since 6a-2b; the text sitting next to the
+`ItemAction.label` has long been cleaned; the text sitting next to the
 button was not. Telegram stripped it (`telegram._plain`) and the web did not
 (`dashboard.html` renders `{{ item.title }}` in the same `<li>` as the button),
-which is the same surface disagreement 6a-2b fixed one field to the left.
+which is the same surface disagreement already fixed one field to the left.
 """
 
 from dudamel.contract.renderers import validate_widget_payload

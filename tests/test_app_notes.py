@@ -68,7 +68,7 @@ def test_the_note_readers_taint_the_turn(notes_app):
 
     What a note *contains* may be attacker text: the model composes add_note's
     arguments after reading its window, which can hold MCP results, and a user
-    can paste an email in directly. 6a-2a's design named this exact case --
+    can paste an email in directly. This is the known limitation that
     stored external content is untainted "unless the reader tool is marked too".
     Asserted through `untrusted`, the single taint predicate, so it still holds
     if that predicate widens.

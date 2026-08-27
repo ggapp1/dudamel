@@ -47,7 +47,7 @@ class SuiteApp:
             )
 
 
-# Opened by plan 6b-1. Every entry's `summary` must match its App's
+# Every entry's `summary` must match its App's
 # `description` -- test_suite_registry.py pins that, so the two cannot drift.
 SUITE_APPS: dict[str, SuiteApp] = {
     "tasks": SuiteApp(

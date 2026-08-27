@@ -585,6 +585,74 @@ attempt and doubles for each one after it, and
 fail fast after a burst is exhausted, before the next call earns a fresh
 burst. All three must be positive; anything else is rejected at startup.
 
+## The built-in apps
+
+dudamel ships a small suite of first-party apps. They are off by default; add a
+`[apps.<name>]` block to `dudamel.toml` to enable one. The block's presence is
+what enables it — there is no separate list to keep in sync.
+
+```toml
+[apps.tasks]
+enabled = true
+horizon_days = 1          # how far ahead the Today card looks; 1 = today and tomorrow
+timezone = "Europe/Lisbon"
+
+[apps.notes]
+enabled = true
+recent_limit = 5          # how many notes the Recent card shows
+
+[apps.habits]
+enabled = true
+timezone = "Europe/Lisbon"
+```
+
+| App | What it gives you |
+|---|---|
+| `tasks` | Add tasks with optional due dates; a **Today** card with a Done button on each row |
+| `notes` | Save and search notes by substring; a read-only **Recent notes** card |
+| `habits` | Track daily habits; a **Habits** card whose button is Tick or Undo depending on today |
+
+Run `dudamel apps list` to see what is available and what you have enabled, and
+`dudamel db migrate` after enabling one — each app owns its own migration lane,
+so enabling `notes` creates only the notes table.
+
+### Why `timezone` is set per app
+
+The framework has no timezone of its own: the scheduler runs on UTC. But a
+habit streak and a "due today" both depend on *your* day, and a habit ticked at
+21:00 in UTC−5 would otherwise be recorded on the next UTC day — making a
+perfect streak read as broken. Until dudamel grows a single timezone setting,
+the two date-sensitive apps carry their own. Set them to the same value.
+
+### Laying out your homescreen
+
+Both the web dashboard and Telegram's `/home` render the same cards in the same
+order, driven by `[[home.section]]`:
+
+```toml
+[[home.section]]
+title = "Today"
+widgets = ["tasks.today", "habits.today"]
+
+[[home.section]]
+title = "Archive"
+widgets = ["notes.recent"]
+```
+
+A widget you do not list still appears, in a trailing untitled section — so
+enabling an app can never make its card silently invisible. A widget id naming
+an app you have not enabled is skipped rather than fatal, because that is
+exactly what happens when you turn an app off. `dudamel doctor` reports ids that
+match no widget.
+
+### Searching notes
+
+`search_notes` is plain case-insensitive substring matching over a note's title
+and body. There is no ranking and no stemming, and a multi-word query matches
+the whole phrase rather than the individual words. For one person's notes this
+is enough; if it stops being enough, that is a signal for a real index rather
+than a bigger `LIKE`.
+
 ## Breaking changes for next release
 
 - `[llm.budget] daily_usd` has been removed and is no longer accepted.

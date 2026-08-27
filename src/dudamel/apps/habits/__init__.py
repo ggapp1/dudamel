@@ -14,7 +14,7 @@ from dudamel import App
 
 class HabitsSettings(BaseModel):
     # The framework has no timezone of its own; a streak is meaningless without
-    # one. See the 6b-1 design doc 7.1 -- a tick at 21:00 in UTC-5 recorded on
+    # one -- a tick at 21:00 in UTC-5 recorded on
     # the next UTC day makes a perfect streak read as broken.
     timezone: str = "UTC"
 

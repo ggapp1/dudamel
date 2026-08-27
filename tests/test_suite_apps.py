@@ -1,6 +1,6 @@
 """Cross-app properties of the shipped suite.
 
-These grow for free with every app added in 6b-2 and 6c, which is why they are
+These grow for free with every app added later, which is why they are
 parametrised over `SUITE_APPS` rather than written per app.
 """
 
@@ -111,7 +111,7 @@ def _order_of(haystack: str, needles: list[str]) -> list[str]:
 
 
 async def test_the_web_and_telegram_render_the_same_home_in_the_same_order(tmp_path, monkeypatch):
-    """Acceptance criterion 5, driven through BOTH surfaces.
+    """The two surfaces agree, driven through BOTH of them.
 
     `compose_home` is shared, but sharing it is not what this pins -- asserting
     on `compose_home` alone would only re-test `tests/test_home.py` and would

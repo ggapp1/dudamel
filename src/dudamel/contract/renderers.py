@@ -258,7 +258,7 @@ def validate_widget_payload(renderer: str, data: Any) -> Any:
         # destroy the document. A markdown card also carries no per-row action,
         # so its text does not sit beside a one-tap control the way a list
         # item's title does. Sanitizing it needs a different character class --
-        # a separate decision, not this plan's.
+        # a separate decision.
         if renderer == "markdown":
             if not isinstance(data, str):
                 raise ValueError("markdown renderer expects a str")
