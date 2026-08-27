@@ -47,8 +47,15 @@ class SuiteApp:
             )
 
 
-# Deliberately empty: the machinery ships before the apps do.
-SUITE_APPS: dict[str, SuiteApp] = {}
+# Opened by plan 6b-1. Every entry's `summary` must match its App's
+# `description` -- test_suite_registry.py pins that, so the two cannot drift.
+SUITE_APPS: dict[str, SuiteApp] = {
+    "tasks": SuiteApp(
+        name="tasks",
+        module="dudamel.apps.tasks",
+        summary="A to-do list with due dates",
+    ),
+}
 
 
 def suite_versions_dir(entry: SuiteApp) -> Path:
