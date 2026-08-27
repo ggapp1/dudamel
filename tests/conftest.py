@@ -48,3 +48,9 @@ async def tasks_app(tmp_path):
 async def notes_app(tmp_path):
     async with bound_app("dudamel.apps.notes", tmp_path) as app:
         yield app
+
+
+@pytest.fixture
+async def habits_app(tmp_path):
+    async with bound_app("dudamel.apps.habits", tmp_path) as app:
+        yield app
