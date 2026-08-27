@@ -285,7 +285,7 @@ def test_an_unknown_timezone_is_refused_at_config_load_naming_the_app(tasks_app)
 
 
 def test_an_unknown_settings_key_is_refused(tasks_app):
-    """6a-1's alias-aware rejection, exercised against a real app for the first
+    """Alias-aware rejection, exercised against a real app for the first
     time: pydantic ignores extras by default, so this lives in bind_settings."""
     import pytest
 

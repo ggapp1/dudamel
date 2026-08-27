@@ -151,8 +151,8 @@ def _fit_single_message(text: str, limit: int = _MAX_MESSAGE_LEN) -> str:
 # the bidi overrides, which can reorder a line into something it does not say.
 # Imported, not redefined -- see the note on UNSAFE_DISPLAY_CHARS in
 # contract/renderers.py. The digest and the contract must strip the same set or
-# the two surfaces draw the same row differently, which is the defect plan 6b-0
-# closed one field to the left of the action label.
+# the two surfaces draw the same row differently -- the defect this closed, one
+# field to the left of the action label.
 _UNSAFE_DIGEST_CHARS = UNSAFE_DISPLAY_CHARS
 # Square brackets delimit a button's anchor, so app text containing them could
 # forge one: a row reading "Buy milk [1 · Done]" in its own title would make an

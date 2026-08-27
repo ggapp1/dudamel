@@ -302,7 +302,7 @@ HOSTILE_ARG = "</script><img src=x onerror=alert(1)>"
 # "Archive", on a button wired to a tool that deletes.
 SPOOFED_LABEL = "\u202eegruP"
 # The same trick one field to the left: the text a button sits next to. Until
-# plan 6b-0 this was unsanitized on the web and stripped on Telegram, so the two
+# this was fixed it was unsanitized on the web and stripped on Telegram, so the two
 # surfaces drew the same row differently.
 SPOOFED_TITLE = "\u202eehcraM"
 

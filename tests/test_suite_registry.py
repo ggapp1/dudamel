@@ -15,17 +15,17 @@ PRESENT = "wave"
 
 
 def test_registry_is_open_only_to_apps_that_ship_in_the_wheel() -> None:
-    """The registry was deliberately opened by plan 6b-1; this is the successor
-    to the emptiness assertion it replaces.
+    """The registry has been deliberately opened; this is the successor to the
+    emptiness assertion it replaces.
 
     What mattered about "empty" was never the emptiness -- it was that
     `[apps.*]` in a user's config can never name an arbitrary import path. That
-    property is what is asserted here, and it keeps holding as 6b-2 and 6c add
+    property is what is asserted here, and it keeps holding as later apps add
     entries: every module must live under `dudamel.apps.`, and every key must
     equal its own entry's name, since the key is what config addresses and the
     name is what prefixes the app's tables.
     """
-    assert SUITE_APPS, "the suite is empty; plan 6b-1 was supposed to open it"
+    assert SUITE_APPS, "the suite registry is unexpectedly empty"
     for key, entry in SUITE_APPS.items():
         assert key == entry.name
         assert entry.module.startswith("dudamel.apps.")

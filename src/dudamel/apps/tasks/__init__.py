@@ -16,7 +16,7 @@ class TasksSettings(BaseModel):
     horizon_days: int = 1
     # The framework has no timezone of its own -- the scheduler runs on naive
     # UTC and nothing else mentions one -- so a date-sensitive app carries its
-    # own until it does. See the 6b-1 design doc 7.1: without this, a task due
+    # own until it does. Without this, a task due
     # "today" is off by one for most of the world for part of every day.
     timezone: str = "UTC"
 
