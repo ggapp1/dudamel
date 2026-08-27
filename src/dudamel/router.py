@@ -879,7 +879,12 @@ class Router:
                     expires_at=_utcnow() + timedelta(seconds=self._config.confirm_ttl_seconds),
                 )
             )
-        summary = ", ".join(f"{k}={v!r}" for k, v in call.args.items())
+        # Both halves are repr'd. The value always was; the NAME was not, and
+        # argument names arrive as model-authored JSON keys that are formatted
+        # here *before* `tool.schema.validate` runs below -- so an unvalidated
+        # key carrying a newline could write its own line into the prompt, on
+        # the one message whose button is a real consent decision.
+        summary = ", ".join(f"{k!r}={v!r}" for k, v in call.args.items())
         return ChatReply(
             text=f"Confirm: run {call.name}({summary})? This action requires approval.",
             pending_confirmation_id=confirmation_id,
