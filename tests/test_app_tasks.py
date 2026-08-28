@@ -1,6 +1,11 @@
-from datetime import UTC, date, datetime
+from datetime import date
+from zoneinfo import ZoneInfo
 
+import pytest
+from conftest import _freeze_app_clock
 from sqlalchemy import select
+
+from dudamel import App
 
 
 async def test_add_task_persists_it_and_says_so(tasks_app):
@@ -189,49 +194,50 @@ async def test_today_card_has_an_empty_state(tasks_app):
 # same calendar date, so a naive datetime.now(UTC).date() passes it. Auckland is
 # UTC+12 April-September and UTC+13 otherwise, so the property is DST-dependent.
 #
-#   instant              UTC     America/New_York   Pacific/Auckland
-#   2026-01-16T02:00Z    01-16   01-15  <-- differs  01-16
-#   2026-08-27T13:00Z    08-27   08-27              08-28  <-- differs
-NY_EVENING = datetime(2026, 1, 16, 2, 0, tzinfo=UTC)  # 21:00 on 01-15 in UTC-5
-AUCKLAND_TOMORROW = datetime(2026, 8, 27, 13, 0, tzinfo=UTC)
+#   instant              UTC     Pacific/Auckland
+#   2026-08-27T13:00Z    08-27   08-28  <-- differs
+AUCKLAND_TOMORROW = "2026-08-27T13:00:00Z"
 
 
-def _freeze(monkeypatch, module, instant: datetime) -> None:
-    """Pin `datetime.now(UTC)` inside one app module."""
-
-    class _Frozen(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return instant.astimezone(tz) if tz else instant.replace(tzinfo=None)
-
-    monkeypatch.setattr(module, "datetime", _Frozen)
+TIGHT_ROWS = [
+    ("2026-01-16T04:30:00Z", "America/New_York", "2026-01-15"),  # 23:30 EST
+    ("2026-07-04T04:30:00Z", "America/New_York", "2026-07-04"),  # 00:30 EDT
+    ("2026-08-27T11:30:00Z", "Pacific/Auckland", "2026-08-27"),  # 23:30 NZST
+    ("2026-01-16T11:30:00Z", "Pacific/Auckland", "2026-01-17"),  # 00:30 NZDT
+    ("2026-03-10T18:20:00Z", "Asia/Kathmandu", "2026-03-11"),  # 00:05 at +05:45
+]
 
 
-def test_local_today_is_the_users_day_not_the_servers(monkeypatch):
-    """The 7.1 scenario verbatim: a habit or task acted on at 21:00 in UTC-5
-    belongs to that evening, not to the UTC day that has already started."""
-    from dudamel.apps import tasks
+@pytest.mark.parametrize(("instant", "zone", "expected"), TIGHT_ROWS)
+def test_the_local_date_is_right_across_dst_and_fractional_zones(
+    monkeypatch, instant: str, zone: str, expected: str
+) -> None:
+    """Two standard-time rows and two DST rows for the same pair of zones, so an
+    offset resolved once and reused fails whichever season it was resolved in.
+    Kathmandu is +05:45 and is the row that rules out truncating to whole hours.
 
-    _freeze(monkeypatch, tasks, NY_EVENING)
-    assert tasks._local_today("America/New_York") == date(2026, 1, 15)  # naive UTC: 01-16
-    assert tasks._local_today("UTC") == date(2026, 1, 16)
-
-    _freeze(monkeypatch, tasks, AUCKLAND_TOMORROW)
-    assert tasks._local_today("Pacific/Auckland") == date(2026, 8, 28)  # naive UTC: 08-27
+    Note this drives `app.today()`. An assertion written as
+    `moment.astimezone(ZoneInfo(zone)).date() == expected` is a property of the
+    standard library and passes with dudamel uninstalled.
+    """
+    _freeze_app_clock(monkeypatch, instant)
+    app = App("t", description="d")
+    app.bind_timezone(ZoneInfo(zone))
+    assert app.today() == date.fromisoformat(expected)
 
 
 async def test_the_card_routes_through_the_configured_timezone(tasks_app, monkeypatch):
     """A passing helper test says nothing about whether the widget calls it.
 
-    Swap `_local_today(settings.timezone)` for `date.today()` in the widget body
-    and the test above still passes; this one does not.
+    Swap `app.today()` for `date.today()` in the widget body and the table above
+    still passes; this one does not.
     """
-    from dudamel.apps import tasks
     from dudamel.apps.tasks import add_task
     from dudamel.widgets import run_widget
 
-    tasks_app.bind_settings({"horizon_days": 0, "timezone": "Pacific/Auckland"})
-    _freeze(monkeypatch, tasks, AUCKLAND_TOMORROW)
+    tasks_app.bind_settings({"horizon_days": 0})
+    tasks_app.bind_timezone(ZoneInfo("Pacific/Auckland"))
+    _freeze_app_clock(monkeypatch, AUCKLAND_TOMORROW)
     # Due on the Auckland day, which is NOT the UTC day at this instant.
     await add_task("local-day task", due=date(2026, 8, 28))
 
@@ -247,12 +253,17 @@ async def test_horizon_days_is_a_boundary_not_a_vague_fence(tasks_app, monkeypat
 
     Fencing at "today" versus "today + 400 days" cannot detect an off-by-one, so
     the boundary is tested at the boundary.
+
+    The clock is frozen at `dudamel.app`, where the date is computed. Freezing an
+    app module instead SUCCEEDS and does nothing -- the module still imports
+    `datetime` for its column annotations -- leaving this reading the wall clock,
+    which passes or fails depending on the day it is run.
     """
-    from dudamel.apps import tasks
     from dudamel.apps.tasks import add_task
     from dudamel.widgets import run_widget
 
-    _freeze(monkeypatch, tasks, AUCKLAND_TOMORROW)  # UTC day is 2026-08-27
+    # The bound zone is UTC, so the local day at this instant is 2026-08-27.
+    _freeze_app_clock(monkeypatch, AUCKLAND_TOMORROW)
     await add_task("tomorrow", due=date(2026, 8, 28))
     actions = {"complete_task": tasks_app.tools["complete_task"]}
 
@@ -269,8 +280,13 @@ def test_settings_defaults_and_overrides():
     from dudamel.apps.tasks import TasksSettings
 
     assert TasksSettings().horizon_days == 1
-    assert TasksSettings().timezone == "UTC"
-    assert TasksSettings(timezone="Europe/Lisbon").horizon_days == 1
+    assert TasksSettings(horizon_days=3).horizon_days == 3
+
+
+def test_tasks_settings_no_longer_carries_a_timezone() -> None:
+    from dudamel.apps.tasks import TasksSettings
+
+    assert "timezone" not in TasksSettings.model_fields
 
 
 def test_an_unknown_timezone_is_refused_at_config_load_naming_the_app(tasks_app):

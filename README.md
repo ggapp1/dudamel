@@ -595,7 +595,6 @@ what enables it — there is no separate list to keep in sync.
 [apps.tasks]
 enabled = true
 horizon_days = 1          # how far ahead the Today card looks; 1 = today and tomorrow
-timezone = "Europe/Lisbon"
 
 [apps.notes]
 enabled = true
@@ -603,7 +602,6 @@ recent_limit = 5          # how many notes the Recent card shows
 
 [apps.habits]
 enabled = true
-timezone = "Europe/Lisbon"
 ```
 
 | App | What it gives you |
