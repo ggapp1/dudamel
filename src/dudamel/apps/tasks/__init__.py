@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, timedelta
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from datetime import date, datetime, timedelta
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel
 from sqlalchemy import select
 
 from dudamel import App
@@ -13,29 +12,15 @@ from dudamel import App
 
 class TasksSettings(BaseModel):
     # How far ahead the Today card looks. 1 = today and tomorrow.
+    #
+    # There is no timezone here. The framework has one, set once at the top
+    # level of dudamel.toml, and `app.today()` answers in it -- so a task due
+    # "today" means today where the operator lives without this app having an
+    # opinion about it.
     horizon_days: int = 1
-    # The framework has no timezone of its own -- the scheduler runs on naive
-    # UTC and nothing else mentions one -- so a date-sensitive app carries its
-    # own until it does. Without this, a task due
-    # "today" is off by one for most of the world for part of every day.
-    timezone: str = "UTC"
-
-    @field_validator("timezone")
-    @classmethod
-    def _known_zone(cls, value: str) -> str:
-        try:
-            ZoneInfo(value)
-        except (ZoneInfoNotFoundError, ValueError) as exc:
-            raise ValueError(f"unknown timezone {value!r}") from exc
-        return value
 
 
 app = App("tasks", description="A to-do list with due dates", settings=TasksSettings)
-
-
-def _local_today(tz: str) -> date:
-    """Today in `tz`. Not `date.today()`: the server's clock is not the user's."""
-    return datetime.now(UTC).astimezone(ZoneInfo(tz)).date()
 
 
 class Task(app.Model, table="items"):
@@ -105,7 +90,7 @@ async def delete_task(task_id: int, title: str) -> str:
 @app.widget(title="Today", renderer="list")
 async def today() -> list[dict]:
     settings = app.settings
-    horizon = _local_today(settings.timezone) + timedelta(days=settings.horizon_days)
+    horizon = app.today() + timedelta(days=settings.horizon_days)
     async with app.db() as session:
         rows = (
             (

@@ -2,33 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, timedelta
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from datetime import date, datetime, timedelta
 
-from pydantic import BaseModel, field_validator
 from sqlalchemy import UniqueConstraint, select
 from sqlalchemy.exc import IntegrityError
 
 from dudamel import App
 
-
-class HabitsSettings(BaseModel):
-    # The framework has no timezone of its own; a streak is meaningless without
-    # one -- a tick at 21:00 in UTC-5 recorded on
-    # the next UTC day makes a perfect streak read as broken.
-    timezone: str = "UTC"
-
-    @field_validator("timezone")
-    @classmethod
-    def _known_zone(cls, value: str) -> str:
-        try:
-            ZoneInfo(value)
-        except (ZoneInfoNotFoundError, ValueError) as exc:
-            raise ValueError(f"unknown timezone {value!r}") from exc
-        return value
-
-
-app = App("habits", description="Daily habits and streaks", settings=HabitsSettings)
+app = App("habits", description="Daily habits and streaks")
 
 
 class Habit(app.Model, table="habits"):
@@ -47,11 +28,6 @@ class Tick(app.Model, table="ticks"):
     day: date
 
     __table_args__ = (UniqueConstraint("habit_id", "day", name="uq_habits_ticks_habit_day"),)
-
-
-def _local_today(tz: str) -> date:
-    """Today in `tz`. Not `date.today()`: the server's clock is not the user's."""
-    return datetime.now(UTC).astimezone(ZoneInfo(tz)).date()
 
 
 def _streak(days: set[date], today: date) -> int:
@@ -93,7 +69,7 @@ async def tick_habit(habit_id: int) -> str:
         habit = await session.get(Habit, habit_id)
         if habit is None:
             return f"No habit with id {habit_id}."
-        day = _local_today(app.settings.timezone)
+        day = app.today()
         if await _tick_for(session, habit_id, day) is not None:
             return f"Already ticked today: {habit.name}"
         session.add(Tick(habit_id=habit_id, day=day))
@@ -119,7 +95,7 @@ async def untick_habit(habit_id: int) -> str:
             return f"No habit with id {habit_id}."
         # Scoped to today deliberately: this is a one-tap button, and a delete
         # that ignored the day would take the whole history with it.
-        tick = await _tick_for(session, habit_id, _local_today(app.settings.timezone))
+        tick = await _tick_for(session, habit_id, app.today())
         if tick is None:
             return f"Not ticked today: {habit.name}"
         await session.delete(tick)
@@ -129,7 +105,7 @@ async def untick_habit(habit_id: int) -> str:
 @app.tool(read_only=True)
 async def list_habits() -> str:
     """List habits with their current streaks."""
-    today = _local_today(app.settings.timezone)
+    today = app.today()
     async with app.db() as session:
         habits = (
             (await session.execute(select(Habit).order_by(Habit.created_at, Habit.id)))
@@ -150,7 +126,7 @@ async def list_habits() -> str:
 
 @app.widget(title="Habits", renderer="list")
 async def today() -> list[dict]:
-    day = _local_today(app.settings.timezone)
+    day = app.today()
     async with app.db() as session:
         habits = (
             (await session.execute(select(Habit).order_by(Habit.created_at, Habit.id)))

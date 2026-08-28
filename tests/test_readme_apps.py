@@ -31,18 +31,24 @@ def _block_containing(*needles: str) -> dict:
 
 
 def test_the_apps_block_validates_against_the_real_settings_models():
-    from dudamel.apps.habits import HabitsSettings
     from dudamel.apps.notes import NotesSettings
     from dudamel.apps.tasks import TasksSettings
     from dudamel.resolve import _settings_values
 
     parsed = _block_containing("[apps.tasks]")["apps"]
-    models = {"tasks": TasksSettings, "notes": NotesSettings, "habits": HabitsSettings}
+    models = {"tasks": TasksSettings, "notes": NotesSettings}
+    # `habits` has no settings model at all -- the local date comes from the
+    # framework -- so its block is activation and nothing else. Asserting that
+    # here rather than dropping it from `models` keeps the set comparison below
+    # able to notice a README that documents an app the suite does not ship.
+    settingless = {"habits"}
 
-    assert set(parsed) == set(models), "the README documents a different set of apps"
+    assert set(parsed) == set(models) | settingless, "the README documents a different set of apps"
     for name, model in models.items():
         # `enabled` is consumed by activation, not by the app's own settings.
         model(**_settings_values(parsed[name]))
+    for name in settingless:
+        assert set(parsed[name]) == {"enabled"}
 
 
 def test_the_home_layout_block_names_widgets_that_exist():

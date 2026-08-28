@@ -1,11 +1,18 @@
 """`habits_app` comes from tests/conftest.py: bound database AND bound settings."""
 
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
+from conftest import _freeze_app_clock
 from sqlalchemy import func, select
 
+from dudamel.exceptions import AppSettingsError
+
 TODAY = date(2026, 8, 27)
+# The same day, as the instant the clock is pinned to. `habits_app` binds UTC,
+# so midday UTC reads as TODAY with hours of margin on either side.
+TODAY_AT_MIDDAY = "2026-08-27T12:00:00Z"
 
 
 # _streak is a pure function over a set of dates on purpose: streak logic is
@@ -105,11 +112,10 @@ async def test_the_schema_itself_rejects_a_duplicate_tick(habits_app):
 async def test_tick_reports_already_for_a_row_it_did_not_write(habits_app, monkeypatch):
     """The path a concurrent request actually hits: the row is there, but this
     call did not put it there."""
-    from dudamel.apps import habits
     from dudamel.apps.habits import Tick, tick_habit
 
     habit_id = await _habit_id(habits_app, "floss")
-    monkeypatch.setattr(habits, "_local_today", lambda tz: TODAY)
+    _freeze_app_clock(monkeypatch, TODAY_AT_MIDDAY)
     async with habits_app.db() as session:
         session.add(Tick(habit_id=habit_id, day=TODAY))
 
@@ -126,11 +132,10 @@ async def test_ticking_a_missing_habit_reports_instead_of_raising(habits_app):
 async def test_undo_removes_only_todays_tick(habits_app, monkeypatch):
     """Drop the day filter from the delete and this habit's entire history goes
     with one tap of Undo -- unrecoverably, since the streak IS those rows."""
-    from dudamel.apps import habits
     from dudamel.apps.habits import Tick, untick_habit
 
     habit_id = await _habit_id(habits_app, "read")
-    monkeypatch.setattr(habits, "_local_today", lambda tz: TODAY)
+    _freeze_app_clock(monkeypatch, TODAY_AT_MIDDAY)
     async with habits_app.db() as session:
         session.add(Tick(habit_id=habit_id, day=TODAY))
         session.add(Tick(habit_id=habit_id, day=TODAY - timedelta(days=1)))
@@ -143,11 +148,10 @@ async def test_undo_removes_only_todays_tick(habits_app, monkeypatch):
 
 
 async def test_undo_when_not_ticked_reports_and_deletes_nothing(habits_app, monkeypatch):
-    from dudamel.apps import habits
     from dudamel.apps.habits import Tick, untick_habit
 
     habit_id = await _habit_id(habits_app, "read")
-    monkeypatch.setattr(habits, "_local_today", lambda tz: TODAY)
+    _freeze_app_clock(monkeypatch, TODAY_AT_MIDDAY)
     async with habits_app.db() as session:
         session.add(Tick(habit_id=habit_id, day=TODAY - timedelta(days=1)))
 
@@ -175,12 +179,11 @@ async def test_tick_undo_tick_returns_to_one_row(habits_app):
 
 async def test_list_habits_reports_each_streak_independently(habits_app, monkeypatch):
     """Group the ticks by the wrong key and every habit shares one set."""
-    from dudamel.apps import habits
     from dudamel.apps.habits import Tick, list_habits
 
     long_run = await _habit_id(habits_app, "meditate")
     await _habit_id(habits_app, "untouched")
-    monkeypatch.setattr(habits, "_local_today", lambda tz: TODAY)
+    _freeze_app_clock(monkeypatch, TODAY_AT_MIDDAY)
     async with habits_app.db() as session:
         for delta in (0, 1, 2):
             session.add(Tick(habit_id=long_run, day=TODAY - timedelta(days=delta)))
@@ -199,19 +202,16 @@ async def test_list_habits_says_so_when_there_are_none(habits_app):
 
 async def test_the_tick_day_is_the_users_day(habits_app, monkeypatch):
     """A tick at 21:00 in UTC-5 belongs to that evening, not to the UTC day that
-    has already begun. 2026-01-16T02:00Z is exactly that instant."""
-    from dudamel.apps import habits
+    has already begun. 2026-01-16T02:00Z is exactly that instant.
+
+    A passing test of the framework's own date says nothing about whether the
+    tool calls it. Swap `app.today()` for `date.today()` in `tick_habit` and
+    this is the test that notices.
+    """
     from dudamel.apps.habits import Tick, tick_habit
 
-    habits_app.bind_settings({"timezone": "America/New_York"})
-    frozen = datetime(2026, 1, 16, 2, 0, tzinfo=UTC)
-
-    class _Frozen(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return frozen.astimezone(tz) if tz else frozen.replace(tzinfo=None)
-
-    monkeypatch.setattr(habits, "datetime", _Frozen)
+    habits_app.bind_timezone(ZoneInfo("America/New_York"))
+    _freeze_app_clock(monkeypatch, "2026-01-16T02:00:00Z")
     habit_id = await _habit_id(habits_app, "journal")
     await tick_habit(habit_id)
 
@@ -230,13 +230,12 @@ def _actions(habits_app) -> dict:
 async def test_today_card_offers_tick_then_undo_per_habit(habits_app, monkeypatch):
     """Two habits in opposite states: computing `done` globally rather than per
     row would pass with one habit and fails here."""
-    from dudamel.apps import habits
     from dudamel.apps.habits import Tick
     from dudamel.widgets import run_widget
 
     ticked = await _habit_id(habits_app, "ticked one")
     await _habit_id(habits_app, "untouched one")
-    monkeypatch.setattr(habits, "_local_today", lambda tz: TODAY)
+    _freeze_app_clock(monkeypatch, TODAY_AT_MIDDAY)
     async with habits_app.db() as session:
         session.add(Tick(habit_id=ticked, day=TODAY))
 
@@ -252,12 +251,11 @@ async def test_today_card_offers_tick_then_undo_per_habit(habits_app, monkeypatc
 async def test_today_card_states_the_streak_exactly(habits_app, monkeypatch):
     """`"1" in subtitle` would pass for 1, 10, 11, 21, a hardcoded streak, and a
     date containing a 1. Assert the whole string."""
-    from dudamel.apps import habits
     from dudamel.apps.habits import Tick
     from dudamel.widgets import run_widget
 
     habit_id = await _habit_id(habits_app, "walk")
-    monkeypatch.setattr(habits, "_local_today", lambda tz: TODAY)
+    _freeze_app_clock(monkeypatch, TODAY_AT_MIDDAY)
     async with habits_app.db() as session:
         for delta in (0, 1, 2):
             session.add(Tick(habit_id=habit_id, day=TODAY - timedelta(days=delta)))
@@ -268,12 +266,11 @@ async def test_today_card_states_the_streak_exactly(habits_app, monkeypatch):
 
 
 async def test_today_card_marks_an_untimely_habit_as_not_done(habits_app, monkeypatch):
-    from dudamel.apps import habits
     from dudamel.apps.habits import Tick
     from dudamel.widgets import run_widget
 
     habit_id = await _habit_id(habits_app, "walk")
-    monkeypatch.setattr(habits, "_local_today", lambda tz: TODAY)
+    _freeze_app_clock(monkeypatch, TODAY_AT_MIDDAY)
     async with habits_app.db() as session:
         session.add(Tick(habit_id=habit_id, day=TODAY - timedelta(days=1)))
 
@@ -289,3 +286,13 @@ async def test_today_card_empty_state(habits_app):
 
     assert [item["title"] for item in card["data"]] == ["No habits yet."]
     assert card["data"][0]["action"] is None
+
+
+def test_a_stale_habits_timezone_is_rejected_by_binding():
+    """The behaviour, not its spelling. `settings_model is None` is satisfied by
+    an empty settings model too, and both reject the key -- so that assertion
+    cannot tell which outcome it pinned."""
+    from dudamel.apps.habits import app as habits_app
+
+    with pytest.raises(AppSettingsError, match="timezone"):
+        habits_app.bind_settings({"timezone": "UTC"})
