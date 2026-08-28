@@ -226,26 +226,44 @@ def test_the_local_date_is_right_across_dst_and_fractional_zones(
     assert app.today() == date.fromisoformat(expected)
 
 
+# The mirror image of AUCKLAND_TOMORROW: a zone WEST of UTC, where the local
+# day is the EARLIER one. That direction is what makes the assertion below
+# date-proof -- see its docstring.
+#
+#   instant              UTC     America/New_York
+#   2026-01-16T02:00Z    01-16   01-15  <-- differs
+NEW_YORK_YESTERDAY = "2026-01-16T02:00:00Z"
+
+
 async def test_the_card_routes_through_the_configured_timezone(tasks_app, monkeypatch):
     """A passing helper test says nothing about whether the widget calls it.
 
     Swap `app.today()` for `date.today()` in the widget body and the table above
     still passes; this one does not.
+
+    The load-bearing assertion is the EXCLUDED one, and the instant is in the
+    past on purpose. `date.today()` is not frozen by the clock pin -- it reads
+    the machine -- so a body using it fences at a day that is at or after
+    2026-01-16 no matter when this runs, and lets the excluded task through.
+    Asserting only the included direction would go quietly green the moment the
+    wall clock passed the due date, which is what happened here.
     """
     from dudamel.apps.tasks import add_task
     from dudamel.widgets import run_widget
 
     tasks_app.bind_settings({"horizon_days": 0})
-    tasks_app.bind_timezone(ZoneInfo("Pacific/Auckland"))
-    _freeze_app_clock(monkeypatch, AUCKLAND_TOMORROW)
-    # Due on the Auckland day, which is NOT the UTC day at this instant.
-    await add_task("local-day task", due=date(2026, 8, 28))
+    tasks_app.bind_timezone(ZoneInfo("America/New_York"))
+    _freeze_app_clock(monkeypatch, NEW_YORK_YESTERDAY)
+    await add_task("local-day task", due=date(2026, 1, 15))
+    await add_task("utc-day task", due=date(2026, 1, 16))
 
     card = await run_widget(
         tasks_app.widgets["today"], {"complete_task": tasks_app.tools["complete_task"]}
     )
 
-    assert "local-day task" in [item["title"] for item in card["data"]]
+    titles = [item["title"] for item in card["data"]]
+    assert "local-day task" in titles
+    assert "utc-day task" not in titles, "the UTC day has begun; the user's has not"
 
 
 async def test_horizon_days_is_a_boundary_not_a_vague_fence(tasks_app, monkeypatch):
