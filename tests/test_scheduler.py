@@ -13,9 +13,10 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import select
 
-from dudamel import App, Orchestrator
-from dudamel.config import Settings, resolve_timezone
+from dudamel import App, Orchestrator, Runtime
+from dudamel.config import Settings, TierConfig, resolve_timezone
 from dudamel.db import Database
+from dudamel.llm.testing import FakeProvider
 from dudamel.migrate import upgrade_core
 from dudamel.models_core import JobRun
 from dudamel.scheduler import JobScheduler
@@ -443,6 +444,27 @@ def _next_fire(scheduler: JobScheduler, job_id: str, after: datetime) -> datetim
     return scheduler._aps_jobs[job_id].trigger.get_next_fire_time(None, after)
 
 
+# A zone nothing in this file ever expects an answer in, and not the machine's.
+APSCHEDULER_FALLBACK = ZoneInfo("Asia/Kolkata")
+
+
+def pin_apscheduler_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point apscheduler's own host lookup somewhere the assertions never go.
+
+    A trigger constructed without an explicit `timezone=` reads this lookup,
+    which normally returns the machine's zone. On a machine already sitting in
+    the zone under test, that fallback produces the expected answer -- so a
+    trigger that never received the framework's zone still reads correct and
+    the assertion is green for the wrong reason. Pinned to a fixed third zone,
+    the fallback is wrong on every host instead of on most of them.
+
+    Both trigger modules are patched: each imports the lookup by value, so
+    patching one leaves the other reading the machine.
+    """
+    for module in ("apscheduler.triggers.cron", "apscheduler.triggers.interval"):
+        monkeypatch.setattr(f"{module}.get_localzone", lambda: APSCHEDULER_FALLBACK)
+
+
 async def test_cron_fires_in_the_configured_zone(tmp_path: Path) -> None:
     app = App("stats", description="d")
 
@@ -470,10 +492,16 @@ async def test_an_unset_timezone_keeps_firing_where_it_used_to(
     test picked. The promise is 'an existing install's jobs do not move', and
     that promise lives in the DEFAULT, so the default is what this exercises.
 
-    The host zone is PINNED. Without that, this passes against the unfixed code
-    on any UTC+12 machine -- measured -- so the red would depend on who ran it.
+    TWO host lookups are pinned, to two DIFFERENT zones: the one
+    `resolve_timezone` reads, and apscheduler's own, which is where a trigger
+    built without an explicit `timezone=` gets its zone instead. Pinning only
+    the first guarantees nothing -- the fallback would still read the real
+    machine, and on a host already sitting in the expected zone it agrees with
+    the right answer by accident. Split, this can only pass if the trigger
+    received the framework's zone, on every host.
     """
     monkeypatch.setattr("dudamel.config.get_localzone", lambda: ZoneInfo("America/Sao_Paulo"))
+    pin_apscheduler_fallback(monkeypatch)
     app = App("stats", description="d")
 
     @app.job(cron="0 20 * * *")
@@ -491,3 +519,62 @@ async def test_an_unset_timezone_keeps_firing_where_it_used_to(
         )
     finally:
         await db.dispose()
+
+
+async def test_interval_fires_in_the_configured_zone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cron half of this is covered above. An interval trigger takes its
+    zone at a different call site, and losing it there is invisible in the
+    interval length, the fire spacing, and everything else already asserted
+    about interval jobs.
+    """
+    pin_apscheduler_fallback(monkeypatch)
+    app = App("stats", description="d")
+
+    @app.job(interval_seconds=45)
+    async def poll() -> None:
+        return None
+
+    orc = Orchestrator(apps=[app])
+    db = await make_db(tmp_path)
+    sched = JobScheduler(orc.registry, db, timezone=ZoneInfo("Pacific/Auckland"))
+    try:
+        trigger = sched._aps_jobs["stats.poll"].trigger
+        assert trigger.timezone == ZoneInfo("Pacific/Auckland")
+        after = datetime(2026, 8, 27, 0, 0, tzinfo=UTC)
+        assert trigger.get_next_fire_time(None, after).tzinfo == ZoneInfo("Pacific/Auckland")
+    finally:
+        await db.dispose()
+
+
+async def test_the_runtime_hands_its_scheduler_the_framework_zone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Through a real `Runtime`, which is the only thing that builds a
+    scheduler in production. Every other test here constructs one by hand and
+    passes the zone in itself, so none of them can see that wiring.
+    """
+    pin_apscheduler_fallback(monkeypatch)
+    app = App("stats", description="d")
+
+    @app.job(cron="0 20 * * *")
+    async def nightly() -> None:
+        return None
+
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/rt.db",
+        data_dir=tmp_path,
+        project_dir=tmp_path,
+        llm_tiers={"standard": TierConfig(provider="fake", model="f")},
+        timezone="Pacific/Auckland",
+    )
+    rt = Runtime(Orchestrator(apps=[app]), settings, providers={"standard": FakeProvider([])})
+    try:
+        assert rt.scheduler._timezone is rt.timezone
+        after = datetime(2026, 8, 27, 0, 0, tzinfo=UTC)
+        assert _next_fire(rt.scheduler, "stats.nightly", after) == datetime(
+            2026, 8, 27, 20, 0, tzinfo=ZoneInfo("Pacific/Auckland")
+        )
+    finally:
+        await rt.stop()
