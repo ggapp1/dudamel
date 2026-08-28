@@ -1,7 +1,14 @@
 """`notes_app` comes from tests/conftest.py: bound database AND bound settings."""
 
+from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
+
 import pytest
+from conftest import _freeze_app_clock
 from sqlalchemy import func, select
+
+from dudamel import App
+from dudamel.exceptions import RuntimeNotBoundError
 
 
 async def _note_id(notes_app, title: str, body: str = "body") -> int:
@@ -164,3 +171,61 @@ async def test_a_note_count_sanity(notes_app):
     await _note_id(notes_app, "one")
     async with notes_app.db() as session:
         assert (await session.execute(select(func.count()).select_from(Note))).scalar_one() == 1
+
+
+# 11:30 UTC on this date is 00:30 the NEXT day in Auckland (NZDT, +13:00), so a
+# date rendered from the stored naive-UTC value differs from the operator's.
+WRITTEN_AT_UTC = "2026-01-16T11:30:00Z"
+NAIVE_UTC_STAMP = datetime(2026, 1, 16, 11, 30)
+AUCKLAND_LOCAL_DATE = "2026-01-17"
+
+
+async def test_recent_card_dates_a_note_in_the_operators_zone(notes_app, monkeypatch):
+    """The note you just wrote must not read as yesterday's.
+
+    `created_at` is stored naive UTC, so rendering it straight puts the card a
+    day behind every other surface for an operator east of UTC -- the homescreen
+    would show a habit ticked for one date and a note written the same minute
+    dated the day before.
+    """
+    from dudamel.apps.notes import Note
+    from dudamel.widgets import run_widget
+
+    notes_app.bind_timezone(ZoneInfo("Pacific/Auckland"))
+    _freeze_app_clock(monkeypatch, WRITTEN_AT_UTC)
+    async with notes_app.db() as session:
+        session.add(Note(title="just written", body="body", created_at=NAIVE_UTC_STAMP))
+
+    card = await run_widget(notes_app.widgets["recent"], {})
+
+    assert [item["subtitle"] for item in card["data"]] == [AUCKLAND_LOCAL_DATE]
+    # The same date the rest of the homescreen is showing at this instant.
+    assert card["data"][0]["subtitle"] == notes_app.today().isoformat()
+
+
+def test_a_stored_timestamp_reads_as_an_aware_local_time() -> None:
+    """The wall clock is asserted alongside the instant on purpose.
+
+    Comparing two aware datetimes compares instants, and the naive-value bug
+    this seam exists to prevent preserves the instant on a UTC host -- so an
+    equality check alone passes there and proves nothing.
+    """
+    app = App("n", description="d")
+    app.bind_timezone(ZoneInfo("Pacific/Auckland"))
+
+    converted = app.in_timezone(NAIVE_UTC_STAMP)
+
+    assert converted.replace(tzinfo=None) == datetime(2026, 1, 17, 0, 30)
+    assert converted.utcoffset() == timedelta(hours=13)
+    assert converted == NAIVE_UTC_STAMP.replace(tzinfo=UTC)
+
+
+def test_the_timezone_seams_refuse_to_answer_before_a_zone_is_bound() -> None:
+    """Same failure `today()` and `db()` give: loud at the line that forgot to
+    bind, rather than a plausible wrong date computed from the host."""
+    app = App("n", description="d")
+
+    with pytest.raises(RuntimeNotBoundError):
+        _ = app.timezone
+    with pytest.raises(RuntimeNotBoundError):
+        app.in_timezone(NAIVE_UTC_STAMP)

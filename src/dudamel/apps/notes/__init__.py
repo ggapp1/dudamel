@@ -113,4 +113,9 @@ async def recent() -> list[dict]:
         )
     if not rows:
         return [{"title": "No notes yet.", "subtitle": "Ask to save one."}]
-    return [{"title": row.title, "subtitle": row.created_at.date().isoformat()} for row in rows]
+    # `created_at` is stored naive UTC; the date shown is the operator's, so a
+    # note written a moment ago is not dated yesterday beside the other cards.
+    return [
+        {"title": row.title, "subtitle": app.in_timezone(row.created_at).date().isoformat()}
+        for row in rows
+    ]
