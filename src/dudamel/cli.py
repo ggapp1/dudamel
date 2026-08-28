@@ -39,7 +39,7 @@ from sqlalchemy import create_engine, text
 
 from dudamel import apps as suite
 from dudamel.apps import missing_requirements
-from dudamel.config import Settings, TierConfig
+from dudamel.config import Settings, TierConfig, resolve_timezone, timezone_source
 from dudamel.contract.renderers import ACTION_LABEL_MAX
 from dudamel.exceptions import DudamelError
 from dudamel.interfaces.telegram import resolve_token as resolve_telegram_token
@@ -449,6 +449,51 @@ def _check_web_token(settings: Settings) -> tuple[bool, str]:
     return True, f"{settings.web.token_env} is set"
 
 
+def _check_timezone(settings: Settings) -> tuple[bool, str]:
+    """Report the RESOLVED framework zone and where it came from.
+
+    Always OK -- an unusable zone is rejected by validation long before this
+    runs. It is printed because unset means the host's zone, so the answer
+    depends on /etc/localtime, and because a misspelled top-level key is dropped
+    in silence: this line is where an operator sees that `timezome` did nothing.
+    """
+    zone = resolve_timezone(settings)
+    if timezone_source(settings) == "config":
+        return True, f"{zone} (from `timezone` in dudamel.toml)"
+    return True, f"{zone} (from the host; set a top-level `timezone` to pin it)"
+
+
+def _check_day_boundary(settings: Settings) -> tuple[bool, str] | None:
+    """Warn once when an upgrade has moved a day boundary that existing rows use.
+
+    `tasks` and `habits` used to carry their own timezone, defaulting to UTC.
+    That setting is gone and the framework zone replaces it -- so an operator who
+    never set it, on a host that is not UTC, has just had the boundary move
+    under rows that were written against the old one. A habit's `day` column is
+    a date, which has lost the instant, so nothing can re-derive it: the streak
+    simply reads against a boundary it was not written for.
+
+    Config-only, with no database query: `doctor` runs before migrations and
+    against projects that have no database yet, and the warning is actionable
+    without a row count. So it can fire for an operator who has no rows at all
+    -- cheaper than staying silent for one with a 300-day streak.
+
+    Returns None when there is nothing to say -- the zone is pinned, or the host
+    is UTC and nothing moved.
+    """
+    if timezone_source(settings) == "config":
+        return None
+    zone = resolve_timezone(settings)
+    if str(zone) == "UTC":
+        return None
+    return False, (
+        f"the day boundary for tasks and habits is now {zone}, not UTC. Rows "
+        "written before this upgrade keep the old boundary, so a streak may "
+        'read short. Set a top-level timezone = "UTC" to restore it \u2014 but note '
+        "that also becomes the scheduler's zone"
+    )
+
+
 def _check_cookie_secure(settings: Settings) -> tuple[bool, str]:
     """Report the RESOLVED session-cookie `Secure` posture against the scheme
     doctor actually prints (always `http://` — see `_check_tailscale`).
@@ -618,6 +663,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     ok, detail = _check_web_token(settings)
     lines.append(_line(ok, "web token", detail))
+
+    ok, detail = _check_timezone(settings)
+    lines.append(_line(ok, "timezone", detail))
+    boundary = _check_day_boundary(settings)
+    if boundary is not None:
+        lines.append(_line(boundary[0], "day boundary", boundary[1]))
 
     lines.append(_check_tailscale(settings))
 

@@ -9,6 +9,7 @@ import logging
 import subprocess
 import tomllib
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -858,6 +859,111 @@ def test_doctor_tool_table_reports_the_external_flag(
     # An ordinary tool still gets the column, reading False -- absence of the
     # word is not the same as a reported False.
     assert rows["add_note"] == ["add_note", "False", "False", "False", "-", "native"]
+
+
+def _pin_host_zone(monkeypatch: pytest.MonkeyPatch, zone: str) -> None:
+    """Pin the zone `Settings` falls back to when no top-level key is set.
+
+    Never read the real host zone to build an expectation: CI runs on UTC
+    runners, where an implementation that simply printed `UTC` would pass every
+    assertion below while telling a Sao Paulo operator the wrong thing."""
+    monkeypatch.setattr("dudamel.config.get_localzone", lambda: ZoneInfo(zone))
+
+
+def _set_top_level(target: Path, line: str) -> None:
+    """PREPEND the key. The scaffold's first section header is
+    `[llm.tiers.standard]`, so a top-level key appended to the end of the file
+    parses as a member of whatever table precedes it -- silently, because
+    unknown keys inside a known table are dropped rather than rejected."""
+    toml = target / "dudamel.toml"
+    toml.write_text(line + toml.read_text())
+
+
+def test_doctor_reports_a_configured_zone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Whole line, not a substring: `dudamel.toml` and `host` both already
+    appear elsewhere in this report, so a substring match on either would pass
+    against a report that never mentions a zone at all."""
+    target = scaffold(tmp_path)
+    _set_top_level(target, 'timezone = "Pacific/Auckland"\n')
+    monkeypatch.chdir(target)
+    capsys.readouterr()  # drain `new`'s output
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "\u2713 timezone: Pacific/Auckland (from `timezone` in dudamel.toml)" in out
+
+
+def test_doctor_reports_the_host_zone_when_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Unset is not `no timezone` -- it is the host's, so the answer depends on
+    /etc/localtime and is worth printing. It is also the only place an operator
+    sees that a misspelled top-level key did nothing: the report says `from the
+    host` while their config plainly reads otherwise."""
+    _pin_host_zone(monkeypatch, "America/Sao_Paulo")
+    target = scaffold(tmp_path)
+    monkeypatch.chdir(target)
+    capsys.readouterr()  # drain `new`'s output
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert (
+        "\u2713 timezone: America/Sao_Paulo "
+        "(from the host; set a top-level `timezone` to pin it)" in out
+    )
+
+
+def test_doctor_warns_when_the_day_boundary_has_moved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An operator who never set a per-app zone had a UTC day boundary. Unset
+    now means the host's, and rows already written keep the old one -- a `day`
+    column is a date, so nothing can re-derive it and a streak just reads
+    short. Nothing else reports this, so a silent upgrade is the default."""
+    _pin_host_zone(monkeypatch, "Pacific/Auckland")
+    target = scaffold(tmp_path)
+    monkeypatch.chdir(target)
+    capsys.readouterr()  # drain `new`'s output
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert (
+        "\u2717 day boundary: the day boundary for tasks and habits is now "
+        "Pacific/Auckland, not UTC." in out
+    )
+
+
+def test_doctor_does_not_warn_when_the_zone_is_pinned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Pinning the key is the operator having answered the question -- even
+    pinning it to a zone the host disagrees with. Warning anyway would train
+    them to ignore the line."""
+    _pin_host_zone(monkeypatch, "Pacific/Auckland")
+    target = scaffold(tmp_path)
+    _set_top_level(target, 'timezone = "UTC"\n')
+    monkeypatch.chdir(target)
+    capsys.readouterr()  # drain `new`'s output
+
+    assert cli.main(["doctor"]) == 0
+    assert "day boundary" not in capsys.readouterr().out
+
+
+def test_doctor_does_not_warn_a_utc_host_that_nothing_moved_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The old per-app default was UTC, so a UTC host's boundary is exactly
+    where it was. Warning here would read `the boundary is now UTC, not UTC`
+    and would fire for every operator who has nothing to do."""
+    _pin_host_zone(monkeypatch, "UTC")
+    target = scaffold(tmp_path)
+    monkeypatch.chdir(target)
+    capsys.readouterr()  # drain `new`'s output
+
+    assert cli.main(["doctor"]) == 0
+    assert "day boundary" not in capsys.readouterr().out
 
 
 # --- token rotate --------------------------------------------------------
