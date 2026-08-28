@@ -4,7 +4,9 @@ dashboard."""
 from __future__ import annotations
 
 import json
+import os
 import re
+import time
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -274,14 +276,48 @@ def _stamps(text: str) -> list[str]:
     return TIMESTAMP_CELL.findall(text)
 
 
+# A POSIX TZ string, not a zone name: five hours west of UTC with no DST, read
+# straight out of the variable, so it pins the same way on an image carrying no
+# tzdata on disk.
+PROCESS_TZ = "XYZ5"
+
+
+@pytest.fixture
+def process_zone_is_not_utc():
+    """Pin the PROCESS zone, which is a different thing from the configured one.
+
+    `datetime.astimezone()` on a NAIVE value reads the process zone silently. A
+    conversion that forgot to say the stored column is UTC therefore produces
+    the right answer on a UTC machine and the wrong one everywhere else -- so a
+    test pinning only the configured zone is green on exactly the hosts CI runs
+    on, and red only for whoever happens to sit somewhere else.
+    """
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = PROCESS_TZ
+    time.tzset()
+    try:
+        yield
+    finally:
+        if previous is None:
+            del os.environ["TZ"]
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
+
+
 async def test_every_rendered_timestamp_is_in_the_configured_zone(
-    tmp_path: Path, token_env: str
+    tmp_path: Path, token_env: str, process_zone_is_not_utc: None
 ) -> None:
     """Both pages, not one. `next_run_time` is aware and already rendered with
     %Z, while `started_at` and `created_at` come out of the database naive, so
     an unconverted page shows the operator two different clocks with only one
     of them labelled -- and fixing a single page moves that mismatch across
     pages, where it is harder to see.
+
+    The process zone is pinned away from UTC as well as the configured one:
+    the naive columns are UTC by storage convention, and a conversion that
+    leaves that unsaid is indistinguishable from a correct one on a UTC
+    machine.
     """
     rt, settings, transport = await build(tmp_path, [], timezone="Pacific/Auckland")
     db = Database(settings.database_url)
