@@ -296,3 +296,88 @@ def test_a_stale_habits_timezone_is_rejected_by_binding():
 
     with pytest.raises(AppSettingsError, match="timezone"):
         habits_app.bind_settings({"timezone": "UTC"})
+
+
+# --- the user's day, at each call site that resolves one --------------------
+#
+# The instant `test_the_tick_day_is_the_users_day` measures, reused: 21:00 in
+# UTC-5, when the UTC day has already turned over. Both of the days it
+# straddles are in the past and stay there, so a body reading the machine's
+# date instead of `app.today()` can never coincide with either -- unlike a pin
+# on the current day, which stops discriminating on exactly the day the suite
+# is run on it.
+USERS_ZONE = "America/New_York"
+USERS_EVENING = "2026-01-16T02:00:00Z"
+USERS_DAY = date(2026, 1, 15)
+UTC_DAY = date(2026, 1, 16)
+
+
+async def test_untick_removes_the_tick_for_the_users_day(habits_app, monkeypatch):
+    """`untick_habit` chooses the row to delete by day, so the day it resolves
+    is the whole behaviour. Reading the machine's date leaves this evening's
+    tick standing and reports the habit as never ticked; reading UTC deletes a
+    day the user has not reached yet.
+    """
+    from dudamel.apps.habits import Tick, untick_habit
+
+    habits_app.bind_timezone(ZoneInfo(USERS_ZONE))
+    _freeze_app_clock(monkeypatch, USERS_EVENING)
+    habit_id = await _habit_id(habits_app, "journal")
+    async with habits_app.db() as session:
+        session.add(Tick(habit_id=habit_id, day=USERS_DAY))
+        session.add(Tick(habit_id=habit_id, day=UTC_DAY))
+
+    assert "Unticked" in await untick_habit(habit_id)
+
+    async with habits_app.db() as session:
+        remaining = list((await session.execute(select(Tick.day))).scalars().all())
+    assert remaining == [UTC_DAY], "the UTC day's row was never the user's today"
+
+
+async def test_list_habits_counts_streaks_from_the_users_day(habits_app, monkeypatch):
+    """Two habits pulling in opposite directions, because one alone cannot tell
+    a wrong anchor from a right one: a streak ending on the user's day reads
+    dead if the anchor runs ahead, and a tick sitting on the UTC day reads live
+    if it runs ahead by exactly one.
+    """
+    from dudamel.apps.habits import Tick, list_habits
+
+    habits_app.bind_timezone(ZoneInfo(USERS_ZONE))
+    _freeze_app_clock(monkeypatch, USERS_EVENING)
+    live = await _habit_id(habits_app, "journal")
+    ahead = await _habit_id(habits_app, "premature")
+    async with habits_app.db() as session:
+        session.add(Tick(habit_id=live, day=USERS_DAY))
+        session.add(Tick(habit_id=live, day=USERS_DAY - timedelta(days=1)))
+        session.add(Tick(habit_id=ahead, day=UTC_DAY))
+
+    listing = await list_habits()
+
+    assert "journal — 2 day streak" in listing
+    assert "premature — 0 day streak" in listing
+
+
+async def test_today_card_marks_the_users_day_done_not_the_utc_one(habits_app, monkeypatch):
+    """The card resolves `done` per row against one day, and that flag picks
+    the button. Resolved against the wrong day it offers Undo for a tick that
+    does not exist, or Tick for one already made -- either way a tap that does
+    the opposite of what it says.
+    """
+    from dudamel.apps.habits import Tick
+    from dudamel.widgets import run_widget
+
+    habits_app.bind_timezone(ZoneInfo(USERS_ZONE))
+    _freeze_app_clock(monkeypatch, USERS_EVENING)
+    done = await _habit_id(habits_app, "journal")
+    ahead = await _habit_id(habits_app, "premature")
+    async with habits_app.db() as session:
+        session.add(Tick(habit_id=done, day=USERS_DAY))
+        session.add(Tick(habit_id=ahead, day=UTC_DAY))
+
+    card = await run_widget(habits_app.widgets["today"], _actions(habits_app))
+    rows = {item["title"]: item for item in card["data"]}
+
+    assert rows["journal"]["action"]["tool"] == "untick_habit"
+    assert rows["journal"]["subtitle"] == "1 day streak · done today"
+    assert rows["premature"]["action"]["tool"] == "tick_habit"
+    assert rows["premature"]["subtitle"] == "0 day streak"
