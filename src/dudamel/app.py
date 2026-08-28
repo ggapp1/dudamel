@@ -352,6 +352,46 @@ class App:
 
         return NOW
 
+    @property
+    def timezone(self) -> ZoneInfo:
+        """The framework's zone, the one every surface labels its clocks with.
+
+        Prefer `in_timezone()` for the common case -- rendering a stored
+        timestamp -- because that is the operation an app actually wants and it
+        cannot be spelled wrong. This property is for the rest: building an
+        aware datetime, handing a zone to a formatter, comparing against one.
+        Both exist so no app has to reach for the private attribute `Runtime`
+        binds, which is what an app with a timestamp column had to do before.
+        """
+        if self._timezone is None:
+            raise RuntimeNotBoundError(
+                f"app {self.name!r} has no timezone bound; it is bound at run time"
+            )
+        return self._timezone
+
+    def in_timezone(self, value: datetime) -> datetime:
+        """A stored timestamp, as an aware datetime in the framework's zone.
+
+        Columns defaulted from `now()` are stored NAIVE UTC, and what an
+        operator should read is their own local time -- a note written at 00:30
+        in Auckland is dated the previous day everywhere its raw stored value is
+        printed, which puts one card a day behind the rest of the homescreen.
+
+        The conversion is `value.replace(tzinfo=UTC).astimezone(zone)`: the
+        value is LABELLED UTC first, then moved. Calling `.astimezone(zone)`
+        straight on a naive value is the tempting one-liner and it is wrong --
+        Python reads a naive value in the PROCESS's zone, so that bug is
+        invisible on a UTC machine (CI, most containers) and wrong on every host
+        configured to a real location.
+
+        An already-aware value is moved without relabelling, so its instant
+        survives.
+        """
+        zone = self.timezone
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        return value.astimezone(zone)
+
     def today(self) -> date:
         """The current date in the framework's zone.
 
@@ -368,8 +408,4 @@ class App:
         so there is no fold and no `fold` parameter to add. The ambiguity lives
         entirely in `CronTrigger`.
         """
-        if self._timezone is None:
-            raise RuntimeNotBoundError(
-                f"app {self.name!r} has no timezone bound; it is bound at run time"
-            )
-        return datetime.now(UTC).astimezone(self._timezone).date()
+        return datetime.now(UTC).astimezone(self.timezone).date()
