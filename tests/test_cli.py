@@ -915,34 +915,87 @@ def test_doctor_reports_the_host_zone_when_unset(
     )
 
 
-def test_doctor_warns_when_the_day_boundary_has_moved(
+def _enable_suite_apps(target: Path, *names: str) -> None:
+    """Switch on suite apps the way an operator does. These are section
+    headers, so unlike a top-level key they can safely be appended."""
+    toml = target / "dudamel.toml"
+    toml.write_text(toml.read_text() + "".join(f"\n[apps.{name}]\n" for name in names))
+
+
+BOUNDARY_TAIL = (
+    "the host's zone, unpinned, so it follows /etc/localtime and moves if this "
+    "machine's zone does. A recorded day is a date, not an instant, so nothing "
+    "can re-cut it: rows written by a version that cut them at UTC keep a UTC "
+    'day. Set a top-level timezone = "Pacific/Auckland" in dudamel.toml to hold '
+    'this boundary, or timezone = "UTC" to restore the old one \u2014 that key is '
+    "also the scheduler's zone. Pinning any other zone moves the boundary too, "
+    "and this check cannot see that it did"
+)
+
+
+def test_doctor_says_nothing_about_a_day_boundary_when_no_app_keys_one(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """An operator who never set a per-app zone had a UTC day boundary. Unset
-    now means the host's, and rows already written keep the old one -- a `day`
-    column is a date, so nothing can re-derive it and a streak just reads
-    short. Nothing else reports this, so a silent upgrade is the default."""
+    """A fresh project on a non-UTC host enables no apps at all, so no stored
+    row is keyed to any boundary and there is nothing to report. A line here
+    would be unclearable except by pinning a zone the operator never needed."""
     _pin_host_zone(monkeypatch, "Pacific/Auckland")
     target = scaffold(tmp_path)
     monkeypatch.chdir(target)
     capsys.readouterr()  # drain `new`'s output
 
     assert cli.main(["doctor"]) == 0
+    assert "day boundary" not in capsys.readouterr().out
+
+
+def test_doctor_reports_an_unpinned_day_boundary_for_an_app_that_keys_days(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Whole line, not a substring: `host` and `dudamel.toml` both appear
+    elsewhere in this report. The line names only the app that is on, states
+    the posture -- host-derived, so it follows the machine -- and leads with
+    pinning the zone doctor just resolved, the remedy that changes nothing
+    about today's behaviour."""
+    _pin_host_zone(monkeypatch, "Pacific/Auckland")
+    target = scaffold(tmp_path)
+    _enable_suite_apps(target, "habits")
+    monkeypatch.chdir(target)
+    capsys.readouterr()  # drain `new`'s output
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert f"\u2713 day boundary: habits cut days at Pacific/Auckland \u2014 {BOUNDARY_TAIL}" in out
+
+
+def test_doctor_names_every_enabled_app_that_keys_days(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`notes` stores no day, so naming it would send an operator looking for
+    rows that cannot exist -- and a fixed phrase would name `tasks` to a
+    project that runs only habits."""
+    _pin_host_zone(monkeypatch, "Pacific/Auckland")
+    target = scaffold(tmp_path)
+    _enable_suite_apps(target, "habits", "notes", "tasks")
+    monkeypatch.chdir(target)
+    capsys.readouterr()  # drain `new`'s output
+
+    assert cli.main(["doctor"]) == 0
     out = capsys.readouterr().out
     assert (
-        "\u2717 day boundary: the day boundary for tasks and habits is now "
-        "Pacific/Auckland, not UTC." in out
+        f"\u2713 day boundary: tasks and habits cut days at Pacific/Auckland "
+        f"\u2014 {BOUNDARY_TAIL}" in out
     )
 
 
-def test_doctor_does_not_warn_when_the_zone_is_pinned(
+def test_doctor_says_nothing_about_a_day_boundary_once_the_zone_is_pinned(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Pinning the key is the operator having answered the question -- even
-    pinning it to a zone the host disagrees with. Warning anyway would train
-    them to ignore the line."""
+    """A pinned zone answers the whole condition: the boundary no longer
+    depends on the machine, whichever zone was chosen. Pinning UTC here also
+    disagrees with the host, which must not resurrect the line."""
     _pin_host_zone(monkeypatch, "Pacific/Auckland")
     target = scaffold(tmp_path)
+    _enable_suite_apps(target, "habits", "tasks")
     _set_top_level(target, 'timezone = "UTC"\n')
     monkeypatch.chdir(target)
     capsys.readouterr()  # drain `new`'s output
@@ -951,14 +1004,15 @@ def test_doctor_does_not_warn_when_the_zone_is_pinned(
     assert "day boundary" not in capsys.readouterr().out
 
 
-def test_doctor_does_not_warn_a_utc_host_that_nothing_moved_for(
+def test_doctor_says_nothing_about_a_day_boundary_on_a_utc_host(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The old per-app default was UTC, so a UTC host's boundary is exactly
-    where it was. Warning here would read `the boundary is now UTC, not UTC`
-    and would fire for every operator who has nothing to do."""
+    """A UTC host derives the same boundary these apps used before the
+    framework zone existed, so no stored day is read against a boundary it was
+    not written for, and the remedy would be to pin what is already true."""
     _pin_host_zone(monkeypatch, "UTC")
     target = scaffold(tmp_path)
+    _enable_suite_apps(target, "habits", "tasks")
     monkeypatch.chdir(target)
     capsys.readouterr()  # drain `new`'s output
 

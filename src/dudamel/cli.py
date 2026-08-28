@@ -59,11 +59,11 @@ from dudamel.migrate import (
 )
 from dudamel.orchestrator import Orchestrator
 
-# `_is_enabled` is the resolver's own "presence means enabled" rule, reused
-# rather than restated: a second copy that drifted would make `apps list`
-# describe a configuration different from the one that actually runs.
+# `_is_enabled` below is the resolver's own "presence means enabled" rule,
+# reused rather than restated: a second copy that drifted would make `apps
+# list` describe a configuration different from the one that actually runs.
+from dudamel.resolve import Resolution, resolve_apps
 from dudamel.resolve import _is_enabled as _suite_app_enabled
-from dudamel.resolve import resolve_apps
 from dudamel.runtime import build_provider
 from dudamel.serve import serve
 from dudamel.web.api import resolve_cookie_secure
@@ -463,34 +463,61 @@ def _check_timezone(settings: Settings) -> tuple[bool, str]:
     return True, f"{zone} (from the host; set a top-level `timezone` to pin it)"
 
 
-def _check_day_boundary(settings: Settings) -> tuple[bool, str] | None:
-    """Warn once when an upgrade has moved a day boundary that existing rows use.
+# The suite apps that key a stored row to a calendar day, in the order the
+# report names them. `notes` is absent deliberately: it stores timestamps, so
+# moving the zone changes how a note is displayed but never what a row means.
+_DAY_KEYED_APPS = ("tasks", "habits")
 
-    `tasks` and `habits` used to carry their own timezone, defaulting to UTC.
-    That setting is gone and the framework zone replaces it -- so an operator who
-    never set it, on a host that is not UTC, has just had the boundary move
-    under rows that were written against the old one. A habit's `day` column is
-    a date, which has lost the instant, so nothing can re-derive it: the streak
-    simply reads against a boundary it was not written for.
+
+def _check_day_boundary(settings: Settings, resolution: Resolution) -> tuple[bool, str] | None:
+    """Report an unpinned, host-derived day boundary under the apps that store
+    days -- what is true and checkable from config, and nothing more.
+
+    Reported, not warned: nothing here is broken. The condition is a posture,
+    the same shape as `_check_cookie_secure`'s derived-value lines -- these
+    apps cut days somewhere the operator never chose, so the answer follows
+    /etc/localtime and moves with the machine. It is worth a line because
+    `tasks` and `habits` used to carry their own `timezone`, defaulting to UTC:
+    on an install old enough to have run that, the days already stored were cut
+    at UTC and cannot be re-cut, because a `day` column is a date and a date has
+    lost the instant it came from.
+
+    So the remedy leads with pinning the zone just resolved, which keeps every
+    boundary exactly where it is today and only stops it drifting; UTC comes
+    second, as the way back to the old boundary, and carries the warning that it
+    moves the scheduler too.
+
+    Gated on the apps actually being enabled, because a project running neither
+    has no row keyed to any boundary -- and an unclearable line on a fresh
+    install is how an operator learns to skip this report. Judged on
+    `resolution.apps`, the set that will really run: a local app may not take a
+    suite app's name, so a name here is that suite app.
 
     Config-only, with no database query: `doctor` runs before migrations and
-    against projects that have no database yet, and the warning is actionable
-    without a row count. So it can fire for an operator who has no rows at all
-    -- cheaper than staying silent for one with a 300-day streak.
+    against projects with no database at all.
 
-    Returns None when there is nothing to say -- the zone is pinned, or the host
-    is UTC and nothing moved.
+    Returns None when there is nothing to say -- no such app is on, the zone is
+    pinned (the boundary is then the operator's own answer, and fixed against
+    the host), or the host is UTC and matches what these apps used to do.
     """
+    running = [app.name for app in resolution.apps]
+    named = [name for name in _DAY_KEYED_APPS if name in running]
+    if not named:
+        return None
     if timezone_source(settings) == "config":
         return None
     zone = resolve_timezone(settings)
     if str(zone) == "UTC":
         return None
-    return False, (
-        f"the day boundary for tasks and habits is now {zone}, not UTC. Rows "
-        "written before this upgrade keep the old boundary, so a streak may "
-        'read short. Set a top-level timezone = "UTC" to restore it \u2014 but note '
-        "that also becomes the scheduler's zone"
+    return True, (
+        f"{' and '.join(named)} cut days at {zone} \u2014 the host's zone, unpinned, "
+        "so it follows /etc/localtime and moves if this machine's zone does. A "
+        "recorded day is a date, not an instant, so nothing can re-cut it: rows "
+        "written by a version that cut them at UTC keep a UTC day. Set a top-level "
+        f'timezone = "{zone}" in dudamel.toml to hold this boundary, or '
+        'timezone = "UTC" to restore the old one \u2014 that key is also the '
+        "scheduler's zone. Pinning any other zone moves the boundary too, and this "
+        "check cannot see that it did"
     )
 
 
@@ -666,7 +693,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     ok, detail = _check_timezone(settings)
     lines.append(_line(ok, "timezone", detail))
-    boundary = _check_day_boundary(settings)
+    boundary = _check_day_boundary(settings, resolution)
     if boundary is not None:
         lines.append(_line(boundary[0], "day boundary", boundary[1]))
 
