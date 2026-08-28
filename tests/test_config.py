@@ -1,3 +1,6 @@
+import importlib.resources
+import io
+import zoneinfo
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -203,6 +206,23 @@ def test_timezone_defaults_to_the_host_zone(monkeypatch: pytest.MonkeyPatch) -> 
     assert timezone_source(settings) == "host"
 
 
+def _zone_bytes(key: str) -> bytes:
+    """The compiled zone file for `key`, from wherever this interpreter's
+    `zoneinfo` would read it.
+
+    Both sources, because a slim image has only the second one and that is
+    exactly where the crash below happens. Skipping when the first is missing
+    would silently retire this test on the container images it exists for.
+    """
+    for base in zoneinfo.TZPATH:
+        candidate = Path(base, *key.split("/"))
+        if candidate.is_file():
+            return candidate.read_bytes()
+    directory, _, name = key.rpartition("/")
+    package = "tzdata.zoneinfo." + directory.replace("/", ".")
+    return (importlib.resources.files(package) / name).read_bytes()
+
+
 def test_the_host_zone_survives_having_no_name(monkeypatch: pytest.MonkeyPatch) -> None:
     """`tzlocal` falls back to `ZoneInfo.from_file(..., key="local")` when
     /etc/localtime is a regular file with no matching name file -- the ordinary
@@ -210,11 +230,10 @@ def test_the_host_zone_survives_having_no_name(monkeypatch: pytest.MonkeyPatch) 
     works; its *name* does not resolve, so anything that round-trips it through
     `ZoneInfo(str(...))` raises and the process cannot start.
     """
-    path = Path("/usr/share/zoneinfo/Europe/Lisbon")
-    if not path.exists():
-        pytest.skip("no system tzdata to build a nameless zone from")
-    with path.open("rb") as handle:
-        nameless = ZoneInfo.from_file(handle, key="local")
+    nameless = ZoneInfo.from_file(io.BytesIO(_zone_bytes("Europe/Lisbon")), key="local")
+    assert nameless.key == "local"
+    with pytest.raises(zoneinfo.ZoneInfoNotFoundError):
+        ZoneInfo(str(nameless))  # the round-trip that used to kill startup
     monkeypatch.setattr("dudamel.config.get_localzone", lambda: nameless)
     settings = Settings(database_url="sqlite+aiosqlite:///x.db")
     assert resolve_timezone(settings) is nameless
