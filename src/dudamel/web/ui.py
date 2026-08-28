@@ -42,8 +42,10 @@ widget payload inert.
 
 from __future__ import annotations
 
+from datetime import UTC
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse
@@ -61,6 +63,28 @@ _WEB_DIR = Path(__file__).parent
 _TEMPLATES = Jinja2Templates(directory=str(_WEB_DIR / "templates"))
 
 _CHAT_CHANNEL = "web:default"
+
+
+def _in_zone(
+    rows: list[dict[str, Any]], fields: tuple[str, ...], tz: ZoneInfo
+) -> list[dict[str, Any]]:
+    """Stored timestamps, rendered in the framework's zone.
+
+    These columns come out of the database naive UTC, so `%Z` renders empty on
+    them -- and they sit in the same tables as the scheduler's next-fire times,
+    which are aware and already local. Left alone the pages show an operator
+    two clocks and label only one of them. Jinja has no timezone filter here,
+    so the conversion belongs in Python.
+    """
+    converted: list[dict[str, Any]] = []
+    for row in rows:
+        moved = {
+            field: row[field].replace(tzinfo=UTC).astimezone(tz)
+            for field in fields
+            if row.get(field) is not None
+        }
+        converted.append({**row, **moved} if moved else row)
+    return converted
 
 
 def add_ui(app: FastAPI, runtime: Runtime, settings: Settings) -> None:
@@ -129,13 +153,15 @@ def add_ui(app: FastAPI, runtime: Runtime, settings: Settings) -> None:
     async def activity_page(request: Request) -> Any:
         if _session(request) is None:
             return RedirectResponse("/login", status_code=303)
-        rows = await runtime.list_activity(100)
+        rows = _in_zone(await runtime.list_activity(100), ("created_at",), runtime.timezone)
         return _TEMPLATES.TemplateResponse(request, "activity.html", {"rows": rows})
 
     @app.get("/jobs")
     async def jobs_page(request: Request) -> Any:
         if _session(request) is None:
             return RedirectResponse("/login", status_code=303)
-        runs = await runtime.list_job_runs(50)
+        runs = _in_zone(
+            await runtime.list_job_runs(50), ("started_at", "finished_at"), runtime.timezone
+        )
         jobs = runtime.list_jobs()
         return _TEMPLATES.TemplateResponse(request, "jobs.html", {"runs": runs, "jobs": jobs})

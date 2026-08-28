@@ -22,7 +22,7 @@
   <tbody>
     {% for run in runs %}
       <tr>
-        <td>{{ run.started_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+        <td>{{ run.started_at.strftime('%Y-%m-%d %H:%M:%S %Z') }}</td>
         <td>{{ run.job_id }}</td>
         <td>{{ run.status }}</td>
         <td>{{ run.detail or '' }}</td>
