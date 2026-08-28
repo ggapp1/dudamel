@@ -614,14 +614,6 @@ Run `dudamel apps list` to see what is available and what you have enabled, and
 `dudamel db migrate` after enabling one — each app owns its own migration lane,
 so enabling `notes` creates only the notes table.
 
-### Why `timezone` is set per app
-
-The framework has no timezone of its own: the scheduler runs on UTC. But a
-habit streak and a "due today" both depend on *your* day, and a habit ticked at
-21:00 in UTC−5 would otherwise be recorded on the next UTC day — making a
-perfect streak read as broken. Until dudamel grows a single timezone setting,
-the two date-sensitive apps carry their own. Set them to the same value.
-
 ### Laying out your homescreen
 
 Both the web dashboard and Telegram's `/home` render the same cards in the same
@@ -650,6 +642,56 @@ and body. There is no ranking and no stemming, and a multi-word query matches
 the whole phrase rather than the individual words. For one person's notes this
 is enough; if it stops being enough, that is a signal for a real index rather
 than a bigger `LIKE`.
+
+## Timezone
+
+dudamel has one timezone, used by the scheduler and by every app that needs a
+local date. It is a top-level key in `dudamel.toml`, beside `database_url` —
+there is no section wrapping it:
+
+```toml
+timezone = "Pacific/Auckland"
+```
+
+Leave it unset and dudamel uses the host's zone. That is what the scheduler has
+always done — despite what earlier versions of this file said — so an existing
+install's jobs keep firing at the same moment. `dudamel doctor` prints the zone
+it resolved and whether it came from your config or from the host.
+
+**Daylight saving.** A cron job scheduled inside the hour that repeats on a
+fall-back day fires twice. One scheduled inside the hour that is skipped on a
+spring-forward day still fires, but an hour late in wall-clock terms. This is
+cron's semantics rather than a dudamel behaviour, and `coalesce` does not merge
+two fires an hour apart on a scheduler that is up. For a job that must run
+exactly once a day, pick an hour outside 01:00–03:00.
+
+**Budgets.** `llm.budget.daily_tokens` resets at midnight in this zone.
+
+## Upgrading from 0.1.x
+
+`tasks` and `habits` used to take their own `timezone` setting, defaulting to
+UTC. It has been replaced by the top-level key, and dudamel will refuse to start
+while the old one is present, so that this change cannot happen silently.
+
+Two things move when you migrate, and they cannot both be preserved:
+
+- **Your day boundary.** If you never set the per-app value, your habit ticks
+  were recorded against UTC days. Leaving `timezone` unset moves that boundary
+  to your host's zone, and existing rows keep the old one — so a streak can read
+  short, and there is no way to convert them, because a recorded day no longer
+  knows what instant produced it. Setting `timezone = "UTC"` keeps every streak
+  exactly as it was.
+- **Your cron schedule.** Jobs already fire in the host's zone. Setting
+  `timezone` to anything else moves them by the difference, and pins them to a
+  zone with its own daylight-saving behaviour.
+
+`dudamel doctor` will tell you if your boundary has moved. Pick whichever
+matters more to you; there is no setting that preserves both.
+
+**One-off budget effect.** The `daily_tokens` window moves with the boundary, so
+on the day you upgrade it may cover more or less than 24 hours. West of UTC the
+window shrinks, so you may be able to spend up to twice the cap that day; east of
+UTC it grows, so a busy install can start already over its limit.
 
 ## Breaking changes for next release
 
