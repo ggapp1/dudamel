@@ -6,12 +6,15 @@ import asyncio
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
+import pytest
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import select
 
 from dudamel import App, Orchestrator
+from dudamel.config import Settings, resolve_timezone
 from dudamel.db import Database
 from dudamel.migrate import upgrade_core
 from dudamel.models_core import JobRun
@@ -55,7 +58,7 @@ async def test_interval_job_fires_and_records_ok_row(tmp_path) -> None:
 
     orc = Orchestrator(apps=[app])
     db = await make_db(tmp_path)
-    sched = JobScheduler(orc.registry, db)
+    sched = JobScheduler(orc.registry, db, timezone=ZoneInfo("UTC"))
     await sched.start()
     try:
         rows = await poll_job_runs(db, "stats.tick")
@@ -77,7 +80,7 @@ async def test_raising_job_records_error_row_with_traceback(tmp_path) -> None:
 
     orc = Orchestrator(apps=[app])
     db = await make_db(tmp_path)
-    sched = JobScheduler(orc.registry, db)
+    sched = JobScheduler(orc.registry, db, timezone=ZoneInfo("UTC"))
     await sched.start()
     try:
         rows = await poll_job_runs(db, "stats.boom")
@@ -102,7 +105,7 @@ async def test_slow_job_times_out(tmp_path) -> None:
 
     orc = Orchestrator(apps=[app])
     db = await make_db(tmp_path)
-    sched = JobScheduler(orc.registry, db)
+    sched = JobScheduler(orc.registry, db, timezone=ZoneInfo("UTC"))
     await sched.start()
     try:
         rows = await poll_job_runs(db, "stats.slow")
@@ -131,7 +134,7 @@ async def test_job_that_raises_its_own_timeouterror_is_an_error_not_a_timeout(
 
     orc = Orchestrator(apps=[app])
     db = await make_db(tmp_path)
-    sched = JobScheduler(orc.registry, db)
+    sched = JobScheduler(orc.registry, db, timezone=ZoneInfo("UTC"))
     await sched.start()
     try:
         rows = await poll_job_runs(db, "stats.flaky")
@@ -158,7 +161,7 @@ async def test_record_swallows_any_db_error_not_just_operationalerror(tmp_path) 
     app = App("stats", description="d")
     orc = Orchestrator(apps=[app])
     db = await make_db(tmp_path)
-    sched = JobScheduler(orc.registry, db)
+    sched = JobScheduler(orc.registry, db, timezone=ZoneInfo("UTC"))
 
     class _BrokenDB:
         def session(self):
@@ -181,7 +184,7 @@ async def test_cron_job_registers_with_correct_next_fire(tmp_path) -> None:
 
     orc = Orchestrator(apps=[app])
     db = await make_db(tmp_path)
-    sched = JobScheduler(orc.registry, db)
+    sched = JobScheduler(orc.registry, db, timezone=ZoneInfo("UTC"))
     try:
         aps_job = sched._aps_jobs["stats.nightly"]
         assert isinstance(aps_job.trigger, CronTrigger)
@@ -212,7 +215,7 @@ async def test_interval_job_uses_interval_trigger(tmp_path) -> None:
 
     orc = Orchestrator(apps=[app])
     db = await make_db(tmp_path)
-    sched = JobScheduler(orc.registry, db)
+    sched = JobScheduler(orc.registry, db, timezone=ZoneInfo("UTC"))
     try:
         aps_job = sched._aps_jobs["stats.poll"]
         assert isinstance(aps_job.trigger, IntervalTrigger)
@@ -233,7 +236,7 @@ async def test_job_registered_with_global_constraint_settings(tmp_path) -> None:
 
     orc = Orchestrator(apps=[app])
     db = await make_db(tmp_path)
-    sched = JobScheduler(orc.registry, db)
+    sched = JobScheduler(orc.registry, db, timezone=ZoneInfo("UTC"))
     try:
         aps_job = sched._aps_jobs["stats.poll"]
         assert aps_job.coalesce is True
@@ -257,7 +260,7 @@ async def test_misfire_listener_records_misfired_row(tmp_path) -> None:
 
     orc = Orchestrator(apps=[app])
     db = await make_db(tmp_path)
-    sched = JobScheduler(orc.registry, db)
+    sched = JobScheduler(orc.registry, db, timezone=ZoneInfo("UTC"))
     try:
         event = JobExecutionEvent(
             code=EVENT_JOB_MISSED,
@@ -287,7 +290,7 @@ async def test_max_instances_listener_records_skipped_row(tmp_path) -> None:
 
     orc = Orchestrator(apps=[app])
     db = await make_db(tmp_path)
-    sched = JobScheduler(orc.registry, db)
+    sched = JobScheduler(orc.registry, db, timezone=ZoneInfo("UTC"))
     try:
         event = JobExecutionEvent(
             code=EVENT_JOB_MAX_INSTANCES,
@@ -316,7 +319,7 @@ async def test_list_jobs_reports_next_fire_before_scheduler_starts(tmp_path) -> 
 
     orc = Orchestrator(apps=[app])
     db = await make_db(tmp_path)
-    sched = JobScheduler(orc.registry, db)
+    sched = JobScheduler(orc.registry, db, timezone=ZoneInfo("UTC"))
     try:
         jobs = sched.list_jobs()
         assert [j["id"] for j in jobs] == ["stats.nightly"]
@@ -334,7 +337,7 @@ async def test_list_jobs_reflects_real_next_run_time_once_started(tmp_path) -> N
 
     orc = Orchestrator(apps=[app])
     db = await make_db(tmp_path)
-    sched = JobScheduler(orc.registry, db)
+    sched = JobScheduler(orc.registry, db, timezone=ZoneInfo("UTC"))
     await sched.start()
     try:
         jobs = sched.list_jobs()
@@ -348,7 +351,7 @@ async def test_list_jobs_reflects_real_next_run_time_once_started(tmp_path) -> N
 async def test_start_then_shutdown_is_idempotent_safe(tmp_path) -> None:
     orc = Orchestrator(apps=[])
     db = await make_db(tmp_path)
-    sched = JobScheduler(orc.registry, db)
+    sched = JobScheduler(orc.registry, db, timezone=ZoneInfo("UTC"))
     await sched.start()
     await sched.shutdown()
     # shutdown() again (never started a second time) must not raise
@@ -372,7 +375,7 @@ async def test_job_cancelled_at_shutdown_records_a_row(tmp_path) -> None:
 
     orc = Orchestrator(apps=[app])
     db = await make_db(tmp_path)
-    sched = JobScheduler(orc.registry, db)
+    sched = JobScheduler(orc.registry, db, timezone=ZoneInfo("UTC"))
     await sched.start()
     try:
         await asyncio.wait_for(started.wait(), timeout=5.0)
@@ -405,7 +408,7 @@ async def test_shutdown_drains_listener_recording_tasks(tmp_path) -> None:
 
     orc = Orchestrator(apps=[app])
     db = await make_db(tmp_path)
-    sched = JobScheduler(orc.registry, db)
+    sched = JobScheduler(orc.registry, db, timezone=ZoneInfo("UTC"))
     await sched.start()
     try:
         sched._on_missed(
@@ -425,5 +428,66 @@ async def test_shutdown_drains_listener_recording_tasks(tmp_path) -> None:
                 .all()
             )
         assert [r.status for r in rows] == ["misfired"]
+    finally:
+        await db.dispose()
+
+
+def _next_fire(scheduler: JobScheduler, job_id: str, after: datetime) -> datetime:
+    """The trigger's own answer, as an absolute instant.
+
+    Deliberately NOT an assertion about `scheduler.timezone`: apscheduler
+    applies the scheduler's zone only when IT builds a trigger from a string
+    alias, so that attribute reads correct while every job fires in the host's
+    zone. `_aps_jobs` is the documented way to reach a trigger before start().
+    """
+    return scheduler._aps_jobs[job_id].trigger.get_next_fire_time(None, after)
+
+
+async def test_cron_fires_in_the_configured_zone(tmp_path: Path) -> None:
+    app = App("stats", description="d")
+
+    @app.job(cron="0 20 * * *")
+    async def nightly() -> None:
+        return None
+
+    orc = Orchestrator(apps=[app])
+    db = await make_db(tmp_path)
+    sched = JobScheduler(orc.registry, db, timezone=ZoneInfo("Pacific/Auckland"))
+    try:
+        after = datetime(2026, 8, 27, 0, 0, tzinfo=UTC)
+        assert _next_fire(sched, "stats.nightly", after) == datetime(
+            2026, 8, 27, 20, 0, tzinfo=ZoneInfo("Pacific/Auckland")
+        )
+        assert sched._aps_jobs["stats.nightly"].trigger.timezone == ZoneInfo("Pacific/Auckland")
+    finally:
+        await db.dispose()
+
+
+async def test_an_unset_timezone_keeps_firing_where_it_used_to(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Goes through `Settings()` and `resolve_timezone`, not through a zone the
+    test picked. The promise is 'an existing install's jobs do not move', and
+    that promise lives in the DEFAULT, so the default is what this exercises.
+
+    The host zone is PINNED. Without that, this passes against the unfixed code
+    on any UTC+12 machine -- measured -- so the red would depend on who ran it.
+    """
+    monkeypatch.setattr("dudamel.config.get_localzone", lambda: ZoneInfo("America/Sao_Paulo"))
+    app = App("stats", description="d")
+
+    @app.job(cron="0 20 * * *")
+    async def nightly() -> None:
+        return None
+
+    orc = Orchestrator(apps=[app])
+    db = await make_db(tmp_path)
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/s.db")
+    sched = JobScheduler(orc.registry, db, timezone=resolve_timezone(settings))
+    try:
+        after = datetime(2026, 8, 27, 0, 0, tzinfo=UTC)
+        assert _next_fire(sched, "stats.nightly", after) == datetime(
+            2026, 8, 27, 20, 0, tzinfo=ZoneInfo("America/Sao_Paulo")
+        )
     finally:
         await db.dispose()
