@@ -16,7 +16,7 @@ from sqlalchemy import select
 
 from dudamel.activity import json_safe, log_activity
 from dudamel.compaction import Compactor
-from dudamel.config import Settings, TierConfig
+from dudamel.config import Settings, TierConfig, resolve_timezone
 from dudamel.contract.types import Tool
 from dudamel.convo import ConversationStore
 from dudamel.db import Database
@@ -101,6 +101,7 @@ class Runtime:
         self._registry = orchestrator.registry
         self._mcp_commands = list(orchestrator.mcp)
         self._mcp_mount: MCPMount | None = None
+        framework_tz = resolve_timezone(settings)
         tiers = self._build_tiers(providers or {})
         self._llm = LLMClient(tiers=tiers, db=self._db, budget=settings.llm_budget)
         self._convo = ConversationStore(self._db)
@@ -118,7 +119,7 @@ class Runtime:
         # only the single-process assembly (dudamel.serve.serve) calls
         # scheduler.start(), once everything else (db migrations,
         # interfaces) is up.
-        self.scheduler = JobScheduler(self._registry, self._db)
+        self.scheduler = JobScheduler(self._registry, self._db, timezone=framework_tz)
         for app in orchestrator.registry.apps.values():
             app.bind_database(self._db)
             app._llm = self._make_app_llm()

@@ -20,6 +20,7 @@ import logging
 import traceback
 from datetime import UTC, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from apscheduler.events import EVENT_JOB_MAX_INSTANCES, EVENT_JOB_MISSED, JobExecutionEvent
 from apscheduler.job import Job as APSJob
@@ -54,9 +55,13 @@ class JobScheduler:
     """Wraps an `AsyncIOScheduler`. `Runtime` owns one instance per process
     (created but not started); only the assembly calls `start()`."""
 
-    def __init__(self, registry: Registry, db: Database) -> None:
+    def __init__(self, registry: Registry, db: Database, timezone: ZoneInfo) -> None:
         self._db = db
-        self._scheduler = AsyncIOScheduler()
+        self._timezone = timezone
+        # The scheduler's own zone does not reach the triggers below (they are
+        # handed in already built), but it is set anyway so a job added by any
+        # other route does not silently pick up the host zone instead.
+        self._scheduler = AsyncIOScheduler(timezone=timezone)
         self._scheduler.add_listener(self._on_missed, EVENT_JOB_MISSED)
         self._scheduler.add_listener(self._on_max_instances, EVENT_JOB_MAX_INSTANCES)
         # Keeps fire-and-forget misfire-recording tasks alive until they
@@ -76,10 +81,14 @@ class JobScheduler:
         self._aps_jobs: dict[str, APSJob] = {job.id: self._register(job) for job in registry.jobs}
 
     def _register(self, job: Job) -> APSJob:
+        # The zone goes on the TRIGGER. apscheduler applies the scheduler's own
+        # zone only when it builds a trigger from a string alias; a trigger
+        # handed in already built keeps whatever zone it was constructed with,
+        # which for `from_crontab` with no argument is `get_localzone()`.
         trigger = (
-            CronTrigger.from_crontab(job.cron)
+            CronTrigger.from_crontab(job.cron, timezone=self._timezone)
             if job.cron is not None
-            else IntervalTrigger(seconds=job.interval_seconds)
+            else IntervalTrigger(seconds=job.interval_seconds, timezone=self._timezone)
         )
         return self._scheduler.add_job(
             self._run_job,
