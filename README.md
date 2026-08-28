@@ -696,8 +696,13 @@ Two things move when you migrate, and they cannot both be preserved:
   `timezone` to anything else moves them by the difference, and pins them to a
   zone with its own daylight-saving behaviour.
 
-`dudamel doctor` will tell you if your boundary has moved. Pick whichever
-matters more to you; there is no setting that preserves both.
+Pick whichever matters more to you; there is no setting that preserves both.
+
+`dudamel doctor` prints which zone your days are currently cut at and whether
+that came from your config or from the host. It cannot tell you whether your
+boundary *moved* — a recorded day is a date, so nothing in the database says
+which zone produced it — so the decision above is yours to make from what you
+know about your own install.
 
 **One-off budget effect.** `daily_tokens` counts spend since the start of the
 day, and that start moves from the last UTC midnight to the last *local*
