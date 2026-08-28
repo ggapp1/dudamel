@@ -113,6 +113,24 @@ def resolve_apps(orchestrator: Orchestrator, settings: Settings, *, strict: bool
             known = ", ".join(sorted(suite_apps)) or "(none)"
             fail(name, 1, f"[apps.{name}] names no known app; suite apps: {known}")
 
+    # Suite apps only. Checked for every block, enabled or not: a disabled app's
+    # import is skipped, so nothing downstream would ever look at its settings --
+    # and this key used to define the day boundary that existing rows are already
+    # keyed to. Accepting it and ignoring it would re-key those rows' meaning in
+    # silence. A local app may still declare a `timezone` setting of its own;
+    # the name is not reserved, only this key on these apps.
+    for name in sorted(set(blocks) & set(suite_apps)):
+        if "timezone" in blocks[name]:
+            fail(
+                name,
+                1,
+                f"[apps.{name}] timezone was removed; set a top-level "
+                'timezone = "..." in dudamel.toml instead. That key is also the '
+                "scheduler's zone, so if it differs from this app's old value "
+                "your cron jobs will move by the difference — and any rows this "
+                "app already keyed to a local date keep their old boundary",
+            )
+
     enabled_suite: list[SuiteApp] = []
     for name, entry in sorted(suite_apps.items()):
         if not _is_enabled(blocks, name):

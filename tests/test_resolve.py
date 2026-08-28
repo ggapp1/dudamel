@@ -343,3 +343,56 @@ def test_a_healthy_app_survives_its_broken_neighbours(tmp_path, monkeypatch) -> 
         ("badcfg", 3),
         ("ghost", 1),
     }
+
+
+def test_a_stale_per_app_timezone_fails_and_names_the_app(tmp_path, monkeypatch) -> None:
+    register(monkeypatch, write_suite_app(tmp_path, monkeypatch, "demo", DEMO))
+    settings = settings_for(tmp_path, "[apps.demo]\ntimezone = 'UTC'\n")
+    with pytest.raises(AppResolutionError) as excinfo:
+        resolve_apps(Orchestrator(), settings, strict=True)
+    message = str(excinfo.value)
+    assert "demo" in message
+    # The guidance only this check produces. `bind_settings` already rejects the
+    # key with a message naming the app and the key, so asserting on "demo" and
+    # "timezone" alone cannot tell whether the resolver looks at the block.
+    assert "timezone =" in message
+
+
+def test_a_stale_timezone_fails_even_when_the_app_is_disabled(tmp_path, monkeypatch) -> None:
+    """Resolution skips a disabled app's import, so nothing would otherwise look
+    at its block -- and the operator re-enabling it next week gets the
+    corruption then, with no warning in between."""
+    register(monkeypatch, write_suite_app(tmp_path, monkeypatch, "demo", DEMO))
+    settings = settings_for(tmp_path, "[apps.demo]\nenabled = false\ntimezone = 'UTC'\n")
+    with pytest.raises(AppResolutionError) as excinfo:
+        resolve_apps(Orchestrator(), settings, strict=True)
+    assert "timezone =" in str(excinfo.value)
+
+
+def test_the_non_strict_path_reports_a_stale_timezone_too(tmp_path, monkeypatch) -> None:
+    """Diagnostic mode records instead of raising, and it is what `doctor` and
+    the web UI run. An error only reachable under strict is invisible to both."""
+    register(monkeypatch, write_suite_app(tmp_path, monkeypatch, "demo", DEMO))
+    settings = settings_for(tmp_path, "[apps.demo]\ntimezone = 'UTC'\n")
+    resolution = resolve_apps(Orchestrator(), settings, strict=False)
+    assert any("timezone =" in e.message for e in resolution.errors)
+
+
+def test_a_local_app_may_still_have_its_own_timezone_setting(tmp_path, monkeypatch) -> None:
+    """The removed key belonged to the suite. A local app is public API and may
+    legitimately declare `timezone` in its own settings model; reserving the
+    name framework-wide would hard-fail a working install over a key that was
+    never ours."""
+    from pydantic import BaseModel
+
+    register(monkeypatch)
+
+    class LocalSettings(BaseModel):
+        timezone: str = "UTC"
+
+    local = App("mine", description="d", settings=LocalSettings)
+    settings = settings_for(tmp_path, "[apps.mine]\ntimezone = 'Pacific/Auckland'\n")
+    resolution = resolve_apps(Orchestrator(apps=[local]), settings, strict=True)
+    assert resolution.errors == []
+    assert [a.name for a in resolution.local_apps] == ["mine"]
+    assert local.settings.timezone == "Pacific/Auckland"
