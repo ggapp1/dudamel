@@ -125,6 +125,16 @@ picks the model up automatically — no separate schema file. Save a file
 like this under your project's `apps/` and add it to the list in
 `assistant.py` to run it.
 
+**Dates inside an app.** `app.now()` is a column default and stores UTC. When
+you need *the operator's* day — a "due today", a streak, anything a person reads
+as a date — use `app.today()`, never `date.today()`: the server's clock is not
+the user's, and a habit ticked at 21:00 in UTC−5 lands on the next UTC day, which
+makes a perfect streak read as broken. To render a stored timestamp, use
+`app.in_timezone(value)` rather than converting it yourself; calling
+`.astimezone(...)` on a naive column reads the *process* zone, which is right on
+a UTC machine and wrong on every host set to a real location. Both resolve
+against the single [timezone](#timezone) below.
+
 ### Buttons: running a tool without the model
 
 Give a tool an `action=` label and it gains a second invocation path with no
