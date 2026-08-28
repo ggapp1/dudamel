@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, time
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
@@ -17,6 +18,8 @@ from dudamel.models_core import LlmCall
 
 logger = logging.getLogger("dudamel.llm")
 
+UTC_ZONE = ZoneInfo("UTC")
+
 
 @dataclass
 class Tier:
@@ -29,10 +32,17 @@ class Tier:
 class LLMClient:
     """The only code that talks to a model."""
 
-    def __init__(self, tiers: dict[str, Tier], db: Database, budget: BudgetConfig) -> None:
+    def __init__(
+        self,
+        tiers: dict[str, Tier],
+        db: Database,
+        budget: BudgetConfig,
+        timezone: ZoneInfo = UTC_ZONE,
+    ) -> None:
         self._tiers = tiers
         self._db = db
         self._budget = budget
+        self._timezone = timezone
 
     async def complete(
         self,
@@ -88,7 +98,20 @@ class LLMClient:
         limit = self._budget.daily_tokens
         if limit is None:
             return
-        midnight = datetime.combine(datetime.now(UTC).date(), time.min)
+        # The framework's day, not UTC's. This is the one boundary an operator
+        # feels directly -- it is the spend cap -- so it follows the same zone
+        # as the scheduler and every app rather than being the one exception.
+        #
+        # `fold=0` is deliberate: in the zones where local midnight does not
+        # exist at all (Santiago, Havana, Cairo all skip it on some spring
+        # date) it yields the real start of the local day. `fold=1` would put
+        # the window an hour early.
+        local_midnight = datetime.combine(
+            datetime.now(self._timezone).date(), time.min, tzinfo=self._timezone
+        )
+        # `LlmCall.created_at` is stored naive UTC, so the comparison value has
+        # to come back the same way or SQLite compares two different clocks.
+        midnight = local_midnight.astimezone(UTC).replace(tzinfo=None)
         async with self._db.session() as s:
             spent = (
                 await s.execute(
@@ -100,5 +123,6 @@ class LLMClient:
         if spent >= limit:
             raise BudgetExceededError(
                 f"daily token budget exhausted ({spent}/{limit}); "
-                "raise llm.budget.daily_tokens or wait for the UTC day to roll over"
+                "raise llm.budget.daily_tokens or wait for the day to roll over "
+                "in your configured timezone"
             )

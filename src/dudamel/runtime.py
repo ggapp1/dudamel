@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 
@@ -102,8 +103,11 @@ class Runtime:
         self._mcp_commands = list(orchestrator.mcp)
         self._mcp_mount: MCPMount | None = None
         framework_tz = resolve_timezone(settings)
+        self._timezone = framework_tz
         tiers = self._build_tiers(providers or {})
-        self._llm = LLMClient(tiers=tiers, db=self._db, budget=settings.llm_budget)
+        self._llm = LLMClient(
+            tiers=tiers, db=self._db, budget=settings.llm_budget, timezone=framework_tz
+        )
         self._convo = ConversationStore(self._db)
         self._compactor = self._build_compactor(settings, tiers)
         self._router = Router(
@@ -125,6 +129,16 @@ class Runtime:
             app.bind_timezone(framework_tz)
             app._llm = self._make_app_llm()
             app._notify = self._fallback_notify
+
+    @property
+    def timezone(self) -> ZoneInfo:
+        """The zone this process resolved once, at construction.
+
+        Public because the web pages render stored timestamps, which are naive
+        UTC: without this they would show a different clock from the scheduler
+        next-fire times sitting in the same table.
+        """
+        return self._timezone
 
     def _build_tiers(self, overrides: dict[str, Provider]) -> dict[str, Tier]:
         tiers: dict[str, Tier] = {}

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from dudamel import App, Orchestrator, Runtime
 from dudamel.config import HomeConfig, HomeSection, Settings, TierConfig, WebConfig
 from dudamel.db import Database
 from dudamel.llm.testing import FakeProvider, fake_text, fake_tool_call
-from dudamel.models_core import JobRun
+from dudamel.models_core import Activity, JobRun
 from dudamel.web.api import create_api
 from dudamel.web.ui import add_ui
 
@@ -51,18 +52,21 @@ def make_orc() -> Orchestrator:
     return Orchestrator(apps=[app])
 
 
-def make_settings(tmp_path: Path) -> Settings:
+def make_settings(tmp_path: Path, timezone: str | None = None) -> Settings:
     return Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/web.db",
         data_dir=tmp_path,
         llm_tiers={"standard": TierConfig(provider="fake", model="f")},
         web=WebConfig(),
+        timezone=timezone,
     )
 
 
-async def build(tmp_path: Path, script: list) -> tuple[Runtime, Settings, httpx.ASGITransport]:
+async def build(
+    tmp_path: Path, script: list, timezone: str | None = None
+) -> tuple[Runtime, Settings, httpx.ASGITransport]:
     orc = make_orc()
-    settings = make_settings(tmp_path)
+    settings = make_settings(tmp_path, timezone)
     rt = Runtime(orc, settings, providers={"standard": FakeProvider(script)})
     await rt.start()
     app = create_api(rt, settings)
@@ -251,6 +255,69 @@ async def test_jobs_page_shows_recorded_run(tmp_path: Path, token_env: str) -> N
     assert resp.status_code == 200
     assert "gym.nightly_report" in resp.text
     assert "ok" in resp.text
+    await db.dispose()
+    await rt.stop()
+
+
+# --- one zone across both timestamped pages ---------------------------------
+
+
+TIMESTAMP_CELL = re.compile(r"<td>(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[^<]*)</td>")
+
+# Both spellings of the same configured zone. A stored row from January and a
+# next-fire time computed from the wall clock legitimately differ in season,
+# so what is pinned is the zone they belong to, not one literal label.
+AUCKLAND_LABELS = {"NZST", "NZDT"}
+
+
+def _stamps(text: str) -> list[str]:
+    return TIMESTAMP_CELL.findall(text)
+
+
+async def test_every_rendered_timestamp_is_in_the_configured_zone(
+    tmp_path: Path, token_env: str
+) -> None:
+    """Both pages, not one. `next_run_time` is aware and already rendered with
+    %Z, while `started_at` and `created_at` come out of the database naive, so
+    an unconverted page shows the operator two different clocks with only one
+    of them labelled -- and fixing a single page moves that mismatch across
+    pages, where it is harder to see.
+    """
+    rt, settings, transport = await build(tmp_path, [], timezone="Pacific/Auckland")
+    db = Database(settings.database_url)
+    async with db.session() as s:
+        s.add(
+            JobRun(
+                job_id="gym.nightly_report",
+                status="ok",
+                detail=None,
+                started_at=datetime(2026, 1, 16, 4, 59),
+            )
+        )
+        s.add(
+            Activity(
+                tool="log_workout",
+                args={},
+                status="ok",
+                created_at=datetime(2026, 1, 16, 4, 59),
+            )
+        )
+    async with client(transport) as c:
+        await login(c, token_env)
+        jobs = (await c.get("/jobs")).text
+        activity = (await c.get("/activity")).text
+
+    # 04:59 UTC on that date is 17:59 in Auckland; both pages must say so, in
+    # the same words.
+    assert "2026-01-16 17:59:00 NZDT" in jobs
+    assert "2026-01-16 17:59:00 NZDT" in activity
+
+    stamps = _stamps(jobs) + _stamps(activity)
+    # next fire + the seeded run + the seeded activity row.
+    assert len(stamps) == 3
+    labels = {stamp.split(" ")[2] if len(stamp.split(" ")) > 2 else "" for stamp in stamps}
+    assert labels <= AUCKLAND_LABELS, stamps
+
     await db.dispose()
     await rt.stop()
 
