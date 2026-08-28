@@ -122,6 +122,7 @@ class Runtime:
         self.scheduler = JobScheduler(self._registry, self._db, timezone=framework_tz)
         for app in orchestrator.registry.apps.values():
             app.bind_database(self._db)
+            app.bind_timezone(framework_tz)
             app._llm = self._make_app_llm()
             app._notify = self._fallback_notify
 

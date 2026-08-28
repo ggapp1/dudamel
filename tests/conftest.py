@@ -7,35 +7,63 @@ every later test in collection order. These fixtures snapshot and restore.
 Binding settings is not optional: `App.settings` raises RuntimeNotBoundError
 when unbound (app.py), and `run_widget` swallows that into an error card with no
 "data" key -- so an unbound app surfaces as a bare KeyError far from its cause.
+The timezone binds the same way and for the same reason: `App.today()` raises
+RuntimeNotBoundError when no zone is bound, so an app left unbound surfaces as
+that same distant KeyError rather than at the line that forgot to bind it.
 """
 
 from __future__ import annotations
 
 import contextlib
 import importlib
-from typing import Any
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
+import dudamel.app
 from dudamel.db import Database
 
 
+def _freeze_app_clock(monkeypatch, instant: str) -> None:
+    """Pin `App.today()`'s clock.
+
+    Patches `dudamel.app`, which is where the date is now computed. Patching an
+    APP module instead still SUCCEEDS -- those modules import `datetime` for
+    their column annotations -- while having no effect at all, so a test written
+    that way reads the wall clock and silently stops testing anything.
+    """
+    moment = datetime.fromisoformat(instant)
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return moment if tz is None else moment.astimezone(tz)
+
+    monkeypatch.setattr(dudamel.app, "datetime", _Frozen)
+
+
 @contextlib.asynccontextmanager
-async def bound_app(module_name: str, tmp_path: Any, settings: dict | None = None):
+async def bound_app(module_name, tmp_path, settings=None, timezone: str = "UTC"):
     app = importlib.import_module(module_name).app
-    previous_db, previous_settings = app._database, app._settings
+    previous_db = app._database
+    previous_settings = app._settings
+    previous_tz = app._timezone
     db = Database(f"sqlite+aiosqlite:///{tmp_path}/{app.name}.db")
     try:
         async with db.engine.begin() as conn:
             await conn.run_sync(app.metadata.create_all)
         app.bind_database(db)
         app.bind_settings(settings or {})
+        app.bind_timezone(ZoneInfo(timezone))
         yield app
     finally:
         await db.dispose()
         # Reaching into the private attributes is deliberate: there is no public
         # restore seam, and leaving a disposed Database bound is worse.
-        app._database, app._settings = previous_db, previous_settings
+        app._database = previous_db
+        app._settings = previous_settings
+        app._timezone = previous_tz
 
 
 @pytest.fixture
