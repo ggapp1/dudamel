@@ -646,12 +646,23 @@ than a bigger `LIKE`.
 ## Timezone
 
 dudamel has one timezone, used by the scheduler and by every app that needs a
-local date. It is a top-level key in `dudamel.toml`, beside `database_url` —
-there is no section wrapping it:
+local date. It is a top-level key in `dudamel.toml` — there is no section
+wrapping it, so it goes **at the top of the file, above the first `[section]`
+header**:
 
 ```toml
 timezone = "Pacific/Auckland"
+
+[llm.tiers.standard]
+# ...
 ```
+
+TOML has no way to tell you when you get this wrong: a bare key placed *after* a
+`[section]` header belongs to that section, so a `timezone` appended to the end
+of the file is read as `web.timezone`, which dudamel ignores in silence. The
+generated `dudamel.toml` starts with a section, so there is no existing
+top-level key to put it beside. Run `dudamel doctor` afterwards — it prints the
+zone it actually resolved, which is how you confirm the key landed.
 
 Leave it unset and dudamel uses the host's zone. That is what the scheduler has
 always done — despite what earlier versions of this file said — so an existing
@@ -688,10 +699,17 @@ Two things move when you migrate, and they cannot both be preserved:
 `dudamel doctor` will tell you if your boundary has moved. Pick whichever
 matters more to you; there is no setting that preserves both.
 
-**One-off budget effect.** The `daily_tokens` window moves with the boundary, so
-on the day you upgrade it may cover more or less than 24 hours. West of UTC the
-window shrinks, so you may be able to spend up to twice the cap that day; east of
-UTC it grows, so a busy install can start already over its limit.
+**One-off budget effect.** `daily_tokens` counts spend since the start of the
+day, and that start moves from the last UTC midnight to the last *local*
+midnight. The window is still a day long either way — what changes, once, is
+which calls fall inside it.
+
+Which direction it jumps depends on the hour you restart, not on whether you are
+east or west of UTC. A US-Eastern install restarting at 22:00 local moves its
+window start back 20 hours, so nearly a full extra day of spend is suddenly
+counted and a busy install can be over its cap on the first call. The same
+install restarting at 08:00 local moves the start forward 4 hours, which drops
+spend out of the window and acts as a partial reset. It settles the next day.
 
 ## Breaking changes for next release
 
