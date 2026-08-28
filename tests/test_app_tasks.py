@@ -289,9 +289,12 @@ def test_tasks_settings_no_longer_carries_a_timezone() -> None:
     assert "timezone" not in TasksSettings.model_fields
 
 
-def test_an_unknown_timezone_is_refused_at_config_load_naming_the_app(tasks_app):
-    """7.1 requires the message name the app, and that naming happens in
-    `bind_settings` -- not in the model -- so this asserts through that path."""
+def test_a_stale_tasks_timezone_is_refused_and_names_the_app(tasks_app):
+    """`timezone` moved to the framework, so the key is now simply unknown here.
+    The message must still name the app: an operator upgrading has this key in
+    their config today, and a rejection that does not say which app it came from
+    is a puzzle rather than an instruction. The naming happens in
+    `bind_settings`, not in the model, so this asserts through that path."""
     import pytest
 
     from dudamel.exceptions import AppSettingsError
