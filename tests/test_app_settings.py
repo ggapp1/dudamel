@@ -1,4 +1,9 @@
+import inspect
+from datetime import date
+from zoneinfo import ZoneInfo
+
 import pytest
+from conftest import _freeze_app_clock
 from pydantic import AliasChoices, AliasPath, BaseModel, ConfigDict, Field
 
 from dudamel import App
@@ -148,3 +153,32 @@ def test_alias_choices_mixing_a_path_accepts_both_forms() -> None:
 
     with pytest.raises(AppSettingsError, match="unknown setting\\(s\\) api_key"):
         App("svc", description="d", settings=Mixed).bind_settings({"api_key": "abc"})
+
+
+def test_today_is_the_local_date_for_the_bound_zone(monkeypatch) -> None:
+    """A frozen clock, not `datetime.now()` recomputed in the assertion. A
+    mirrored assertion only fires when the wall clock happens to sit where the
+    two implementations disagree -- measured at about 2% of the year for a
+    frozen-offset regression."""
+    _freeze_app_clock(monkeypatch, "2026-01-16T11:30:00Z")
+    app = App("t", description="d")
+    app.bind_timezone(ZoneInfo("Pacific/Auckland"))
+    assert app.today() == date(2026, 1, 17)
+
+
+def test_today_raises_when_no_zone_is_bound() -> None:
+    """Same posture as `db()` and `settings`: an unbound app fails loudly rather
+    than silently answering with the server's own date, which is the exact
+    off-by-one this exists to remove."""
+    app = App("t", description="d")
+    with pytest.raises(RuntimeNotBoundError):
+        app.today()
+
+
+def test_now_is_static_and_today_is_not() -> None:
+    """`now()` returns a column-default sentinel and belongs to the class;
+    `today()` answers a question about a bound zone and cannot. Confusing them
+    writes a column default that is a local date -- wrong for every row inserted
+    from a different offset."""
+    assert isinstance(inspect.getattr_static(App, "now"), staticmethod)
+    assert not isinstance(inspect.getattr_static(App, "today"), staticmethod)

@@ -5,6 +5,7 @@ import inspect
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
+from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any
 
 from pydantic import AliasChoices, AliasPath, BaseModel, ValidationError
@@ -15,6 +16,8 @@ from dudamel.contract.types import TOOL_NAME_RE, Job, Tool, Widget
 from dudamel.exceptions import AppSettingsError, RegistryError, RuntimeNotBoundError
 
 if TYPE_CHECKING:
+    from zoneinfo import ZoneInfo
+
     from sqlalchemy import MetaData
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -97,6 +100,7 @@ class App:
         self._model_base: type | None = None
         self.settings_model = settings
         self._settings: BaseModel | None = None  # bound by config resolution, not at import
+        self._timezone: ZoneInfo | None = None  # bound by Runtime, or by tests
 
     # --- tools -------------------------------------------------------------
     def tool(
@@ -319,6 +323,9 @@ class App:
     def bind_database(self, database: Database) -> None:
         self._database = database
 
+    def bind_timezone(self, timezone: ZoneInfo) -> None:
+        self._timezone = timezone
+
     def db(self) -> AbstractAsyncContextManager[AsyncSession]:
         if self._database is None:
             raise RuntimeNotBoundError(
@@ -344,3 +351,25 @@ class App:
         from dudamel.modelsugar import NOW
 
         return NOW
+
+    def today(self) -> date:
+        """The current date in the framework's zone.
+
+        NOT `date.today()`: the server's clock is not the user's, and a task due
+        "today" means today where the operator lives.
+
+        An INSTANCE method, unlike `now()` -- which is a `@staticmethod`
+        returning a column-default sentinel and has no zone to consult. Do not
+        make this one static and do not use `now()` for a date: a column default
+        resolved to a local date is wrong for every row written from a different
+        offset.
+
+        There is no DST ambiguity here. This derives from an absolute instant,
+        so there is no fold and no `fold` parameter to add. The ambiguity lives
+        entirely in `CronTrigger`.
+        """
+        if self._timezone is None:
+            raise RuntimeNotBoundError(
+                f"app {self.name!r} has no timezone bound; it is bound at run time"
+            )
+        return datetime.now(UTC).astimezone(self._timezone).date()
