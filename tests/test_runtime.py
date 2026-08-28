@@ -3,6 +3,7 @@ import json
 import logging
 import time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -615,3 +616,65 @@ def test_list_jobs_reports_next_fire_before_scheduler_starts(tmp_path) -> None:
     jobs = rt.list_jobs()  # scheduler never started
     assert [j["id"] for j in jobs] == ["gym.poll"]
     assert jobs[0]["next_run_time"] is not None
+
+
+# --- the framework zone reaches everything Runtime builds --------------------
+
+
+def zoned_settings(tmp_path: Path, timezone: str, **extra) -> Settings:
+    return Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/rt.db",
+        data_dir=tmp_path,
+        project_dir=tmp_path,
+        llm_tiers={"standard": TierConfig(provider="fake", model="f")},
+        timezone=timezone,
+        **extra,
+    )
+
+
+async def test_every_suite_app_runs_on_the_framework_zone(tmp_path: Path) -> None:
+    """A real Runtime holding real suite apps, not a fixture that binds the zone
+    itself.
+
+    `App.today()` raises when nothing bound a zone, and `run_widget` turns that
+    into an error card with no "data" key -- so an app Runtime forgot to bind
+    does not crash anything, it just stops answering. Both halves are asserted:
+    the object each app holds, and a card that actually rendered.
+    """
+    from dudamel.resolve import resolve_apps
+    from dudamel.widgets import run_widget
+
+    settings = zoned_settings(tmp_path, "Pacific/Auckland", apps={"tasks": {}, "habits": {}})
+    resolution = resolve_apps(Orchestrator(apps=[]), settings, strict=True)
+    assert sorted(a.name for a in resolution.apps) == ["habits", "tasks"]
+
+    rt = Runtime(
+        Orchestrator(apps=resolution.apps),
+        settings,
+        providers={"standard": FakeProvider([])},
+        suite_lanes=resolution.suite_lanes,
+    )
+    await rt.start()
+    try:
+        for app in resolution.apps:
+            # Identity, not equality: `resolve_timezone` returns the one object
+            # the process resolved, and every app must be reading that exact
+            # zone rather than an equal one rebuilt somewhere else.
+            assert app._timezone is rt.timezone, app.name
+            for name, widget in app.widgets.items():
+                card = await run_widget(widget, {})
+                assert "data" in card, f"{app.name}.{name}: {card.get('error')}"
+    finally:
+        await rt.stop()
+
+
+async def test_the_llm_client_is_built_on_the_framework_zone(tmp_path: Path) -> None:
+    """The budget day is a local day. A client left on UTC would reset an
+    operator's daily token allowance at the wrong hour, silently."""
+    settings = zoned_settings(tmp_path, "Pacific/Auckland")
+    rt = Runtime(make_orc(), settings, providers={"standard": FakeProvider([])})
+    try:
+        assert rt._llm._timezone is rt.timezone
+        assert rt.timezone == ZoneInfo("Pacific/Auckland")
+    finally:
+        await rt.stop()
