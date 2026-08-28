@@ -3,13 +3,15 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
 )
+from tzlocal import get_localzone
 
 from dudamel.mcp_mount import (
     CALL_TIMEOUT,
@@ -160,6 +162,12 @@ class HomeConfig(BaseModel):
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="DUDAMEL_",
+        # NOTE: a misspelled top-level key is dropped rather than rejected, so
+        # `timezome = "UTC"` does nothing and says nothing. Left as-is
+        # deliberately -- "forbid" would reject any config carrying a key from a
+        # different dudamel version. `doctor`'s timezone line is the mitigation:
+        # it prints the zone that was actually resolved, so a typo shows up as
+        # "from the host" next to a config that says otherwise.
         extra="ignore",
         # Lets a single per-app setting be overridden from the environment
         # (DUDAMEL_APPS__WEATHER__LATITUDE) so secrets never have to live in
@@ -196,6 +204,31 @@ class Settings(BaseSettings):
     # imported only when the app is enabled, so validation happens later
     # during resolution.
     apps: dict[str, dict[str, Any]] = {}
+    # One zone for the whole framework: the scheduler's cron expressions and
+    # every app's idea of "today". A top-level key, like `database_url` -- there
+    # is no section wrapping these.
+    #
+    # `None` means the host's zone, which is what the scheduler has always
+    # actually done: apscheduler builds a trigger with `get_localzone()` when
+    # none is passed, so defaulting to UTC here would move every existing
+    # operator's jobs without them asking. The cost is that behaviour depends on
+    # /etc/localtime, so `doctor` prints the zone it resolved and where it came
+    # from.
+    timezone: str | None = None
+
+    @field_validator("timezone")
+    @classmethod
+    def _check_timezone(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            # ValueError, not just ZoneInfoNotFoundError: zoneinfo rejects an
+            # absolute or non-normalised key before it touches the filesystem,
+            # and raises the other type doing it.
+            raise ValueError(f"unknown timezone {value!r}") from exc
+        return value
 
     @classmethod
     def settings_customise_sources(
@@ -224,3 +257,20 @@ class Settings(BaseSettings):
         # the CLI (an explicit [project_dir] in the toml still wins).
         data.setdefault("project_dir", project_dir)
         return cls(_env_file=project_dir / ".env", **data)
+
+
+def resolve_timezone(settings: Settings) -> ZoneInfo:
+    """The framework's zone, concrete. The one place `None` becomes a zone.
+
+    Returns `get_localzone()`'s object as-is. It is already a `ZoneInfo`, and
+    round-tripping it through its own name is not merely redundant -- when
+    /etc/localtime is a regular file with no name file, tzlocal returns a zone
+    whose key is "local", which no `ZoneInfo(...)` lookup can reconstruct.
+    """
+    if settings.timezone is not None:
+        return ZoneInfo(settings.timezone)
+    return get_localzone()
+
+
+def timezone_source(settings: Settings) -> str:
+    return "config" if settings.timezone is not None else "host"

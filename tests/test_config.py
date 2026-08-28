@@ -1,8 +1,10 @@
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
+from pydantic import ValidationError
 
-from dudamel.config import McpConfig, Settings
+from dudamel.config import McpConfig, Settings, resolve_timezone, timezone_source
 from dudamel.mcp_mount import (
     CALL_TIMEOUT,
     MAX_RECONNECT_ATTEMPTS,
@@ -187,3 +189,60 @@ def test_a_misspelled_home_key_is_refused_at_load(tmp_path: Path) -> None:
     (tmp_path / "dudamel.toml").write_text('[[home.sections]]\ntitle = "Today"\n')
     with pytest.raises(ValueError, match="sections"):
         Settings.load(tmp_path)
+
+
+def test_timezone_defaults_to_the_host_zone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The host zone is PINNED here rather than read. CI runs on UTC runners,
+    so a test comparing the resolved zone against the host's own would pass
+    against an implementation that simply hardcodes UTC -- the one regression
+    this test exists to prevent."""
+    monkeypatch.setattr("dudamel.config.get_localzone", lambda: ZoneInfo("America/Sao_Paulo"))
+    settings = Settings(database_url="sqlite+aiosqlite:///x.db")
+    assert settings.timezone is None
+    assert resolve_timezone(settings) == ZoneInfo("America/Sao_Paulo")
+    assert timezone_source(settings) == "host"
+
+
+def test_the_host_zone_survives_having_no_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`tzlocal` falls back to `ZoneInfo.from_file(..., key="local")` when
+    /etc/localtime is a regular file with no matching name file -- the ordinary
+    result of `docker run -v /etc/localtime:/etc/localtime:ro`. That object
+    works; its *name* does not resolve, so anything that round-trips it through
+    `ZoneInfo(str(...))` raises and the process cannot start.
+    """
+    path = Path("/usr/share/zoneinfo/Europe/Lisbon")
+    if not path.exists():
+        pytest.skip("no system tzdata to build a nameless zone from")
+    with path.open("rb") as handle:
+        nameless = ZoneInfo.from_file(handle, key="local")
+    monkeypatch.setattr("dudamel.config.get_localzone", lambda: nameless)
+    settings = Settings(database_url="sqlite+aiosqlite:///x.db")
+    assert resolve_timezone(settings) is nameless
+
+
+def test_timezone_set_resolves_to_that_zone() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///x.db", timezone="Pacific/Auckland")
+    assert resolve_timezone(settings) == ZoneInfo("Pacific/Auckland")
+    assert timezone_source(settings) == "config"
+
+
+def test_timezone_is_a_top_level_key_in_the_config_file(tmp_path: Path) -> None:
+    """Through `Settings.load`, not through kwargs. Top-level TOML keys ARE the
+    Settings fields, and unknown ones are dropped in silence -- so a key written
+    under a section that does not exist would be ignored with no error, and a
+    kwargs-only test cannot see that."""
+    (tmp_path / "dudamel.toml").write_text(
+        'database_url = "sqlite+aiosqlite:///x.db"\ntimezone = "Pacific/Auckland"\n'
+    )
+    settings = Settings.load(tmp_path)
+    assert settings.timezone == "Pacific/Auckland"
+
+
+@pytest.mark.parametrize("value", ["Mars/Olympus", "/etc/passwd", "", "../../etc/passwd"])
+def test_an_unusable_timezone_is_rejected_at_startup(value: str) -> None:
+    """Both failure modes: an unknown key raises ZoneInfoNotFoundError, while a
+    key that is absolute or not normalised raises ValueError before zoneinfo
+    touches the filesystem. Catching only the first lets a config through that
+    explodes later, inside a job."""
+    with pytest.raises(ValidationError):
+        Settings(database_url="sqlite+aiosqlite:///x.db", timezone=value)

@@ -64,6 +64,12 @@ dependencies = [
     # Note mcp 2.x brings a second HTTP stack (httpx2) alongside our httpx.
     "mcp>=2,<3",
     "python-dotenv>=1.2.2",
+    # Reached directly for the host zone, so it is declared rather than left
+    # transitive through apscheduler -- apscheduler 4 drops it, and an
+    # undeclared import is how a dependency bump breaks a release. The floor
+    # is load-bearing: apscheduler's own floor permits tzlocal 2.x, whose
+    # get_localzone() returns a pytz object rather than a ZoneInfo.
+    "tzlocal>=5",
 ]
 
 [project.scripts]
