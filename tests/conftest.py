@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import importlib
 from datetime import datetime
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -25,7 +26,7 @@ import dudamel.app
 from dudamel.db import Database
 
 
-def _freeze_app_clock(monkeypatch, instant: str) -> None:
+def _freeze_app_clock(monkeypatch: pytest.MonkeyPatch, instant: str) -> None:
     """Pin `App.today()`'s clock.
 
     Patches `dudamel.app`, which is where the date is now computed. Patching an
@@ -44,7 +45,12 @@ def _freeze_app_clock(monkeypatch, instant: str) -> None:
 
 
 @contextlib.asynccontextmanager
-async def bound_app(module_name, tmp_path, settings=None, timezone: str = "UTC"):
+async def bound_app(
+    module_name: str,
+    tmp_path: Any,
+    settings: dict | None = None,
+    timezone: str = "UTC",
+):
     app = importlib.import_module(module_name).app
     previous_db = app._database
     previous_settings = app._settings
