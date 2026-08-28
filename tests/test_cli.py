@@ -923,13 +923,10 @@ def _enable_suite_apps(target: Path, *names: str) -> None:
 
 
 BOUNDARY_TAIL = (
-    "the host's zone, unpinned, so it follows /etc/localtime and moves if this "
-    "machine's zone does. A recorded day is a date, not an instant, so nothing "
-    "can re-cut it: rows written by a version that cut them at UTC keep a UTC "
-    'day. Set a top-level timezone = "Pacific/Auckland" in dudamel.toml to hold '
-    'this boundary, or timezone = "UTC" to restore the old one \u2014 that key is '
-    "also the scheduler's zone. Pinning any other zone moves the boundary too, "
-    "and this check cannot see that it did"
+    "the host's zone \u2014 unpinned, so it follows /etc/localtime. Set a "
+    'top-level timezone = "Pacific/Auckland" in dudamel.toml to hold it; see '
+    '"Upgrading" in the README if these apps have rows from a version that cut '
+    "days at UTC"
 )
 
 
@@ -964,7 +961,7 @@ def test_doctor_reports_an_unpinned_day_boundary_for_an_app_that_keys_days(
 
     assert cli.main(["doctor"]) == 0
     out = capsys.readouterr().out
-    assert f"\u2713 day boundary: habits cut days at Pacific/Auckland \u2014 {BOUNDARY_TAIL}" in out
+    assert f"\u2713 day boundary: habits cut days at Pacific/Auckland, {BOUNDARY_TAIL}" in out
 
 
 def test_doctor_names_every_enabled_app_that_keys_days(
@@ -982,8 +979,8 @@ def test_doctor_names_every_enabled_app_that_keys_days(
     assert cli.main(["doctor"]) == 0
     out = capsys.readouterr().out
     assert (
-        f"\u2713 day boundary: tasks and habits cut days at Pacific/Auckland "
-        f"\u2014 {BOUNDARY_TAIL}" in out
+        f"\u2713 day boundary: tasks and habits cut days at Pacific/Auckland, "
+        f"{BOUNDARY_TAIL}" in out
     )
 
 

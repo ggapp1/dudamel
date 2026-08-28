@@ -510,14 +510,10 @@ def _check_day_boundary(settings: Settings, resolution: Resolution) -> tuple[boo
     if str(zone) == "UTC":
         return None
     return True, (
-        f"{' and '.join(named)} cut days at {zone} \u2014 the host's zone, unpinned, "
-        "so it follows /etc/localtime and moves if this machine's zone does. A "
-        "recorded day is a date, not an instant, so nothing can re-cut it: rows "
-        "written by a version that cut them at UTC keep a UTC day. Set a top-level "
-        f'timezone = "{zone}" in dudamel.toml to hold this boundary, or '
-        'timezone = "UTC" to restore the old one \u2014 that key is also the '
-        "scheduler's zone. Pinning any other zone moves the boundary too, and this "
-        "check cannot see that it did"
+        f"{' and '.join(named)} cut days at {zone}, the host's zone \u2014 unpinned, "
+        "so it follows /etc/localtime. Set a top-level "
+        f'timezone = "{zone}" in dudamel.toml to hold it; see "Upgrading" in the '
+        "README if these apps have rows from a version that cut days at UTC"
     )
 
 
