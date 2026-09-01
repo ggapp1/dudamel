@@ -29,7 +29,7 @@ jobs:
         # the matrix jobs share one cache key and race to reserve it, which
         # fails the save and annotates the run. This workflow never cached
         # before and does not need to.
-        uses: astral-sh/setup-uv@v9.0.0
+        uses: astral-sh/setup-uv@v10.0.1
         with:
           enable-cache: false
 
