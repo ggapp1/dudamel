@@ -29,7 +29,7 @@ jobs:
       - name: Install uv
         # Pinned exactly: setup-uv stopped publishing floating major tags at
         # v8, so `@v9` does not resolve and must never be used here.
-        uses: astral-sh/setup-uv@v9.0.0
+        uses: astral-sh/setup-uv@v10.0.1
 
       - name: Check the tag matches the package version
         run: |
