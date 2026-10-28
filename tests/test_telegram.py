@@ -852,6 +852,24 @@ def test_an_expired_token_does_not_resolve() -> None:
     assert tokens.consume(token, user_id=7) is None
 
 
+@pytest.mark.parametrize(
+    ("age", "resolves"),
+    [(timedelta(minutes=59), True), (timedelta(minutes=61), False)],
+    ids=["59-minutes", "61-minutes"],
+)
+def test_a_token_lives_for_about_an_hour(age: timedelta, resolves: bool) -> None:
+    """An absolute check on the lifetime. The test above is written relative to
+    `_ACTION_TOKEN_TTL`, so it passes for any value of the constant -- including
+    a TTL of seconds (every button dead before anyone taps it) or of days (a
+    homescreen from last week still executing). The intended window is an hour."""
+    tokens = _ActionTokens()
+    token = tokens.issue("complete", {"id": 4}, user_id=7)
+    entry = tokens._entries[token]
+    tokens._entries[token] = (*entry[:3], entry[3] - age)
+    expected = ("complete", {"id": 4}) if resolves else None
+    assert tokens.consume(token, user_id=7) == expected
+
+
 def test_the_map_is_bounded_by_lru_eviction() -> None:
     """Age alone cannot bound the map: every entry issued inside the TTL
     window is fresh, so an age filter removes nothing. LRU eviction caps it
