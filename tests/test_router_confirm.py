@@ -1,4 +1,5 @@
-from datetime import timedelta
+from datetime import date, timedelta
+from enum import Enum
 
 import pytest
 from sqlalchemy import select
@@ -52,7 +53,28 @@ def make_app() -> App:
     return app
 
 
-def build(tmp_path, script, taint_mode: str = "turn"):
+class Level(Enum):
+    LOW = "low"
+    HIGH = "high"
+
+
+TYPED: list[tuple[object, object]] = []
+
+
+def make_typed_app() -> App:
+    app = App("planner", description="d")
+
+    @app.tool(confirm=True)
+    async def schedule(day: date, level: Level) -> str:
+        """Schedule something: typed arguments that only survive a JSON
+        round-trip as strings."""
+        TYPED.append((day, level))
+        return "scheduled"
+
+    return app
+
+
+def build(tmp_path, script, taint_mode: str = "turn", *, extra_apps=(), **router_kwargs):
     url = f"sqlite+aiosqlite:///{tmp_path}/cf.db"
     upgrade_core(url)
     db = Database(url)
@@ -62,14 +84,14 @@ def build(tmp_path, script, taint_mode: str = "turn"):
         db=db,
         budget=BudgetConfig(),
     )
-    registry = Registry([make_app()])
+    registry = Registry([make_app(), *extra_apps])
     convo = ConversationStore(db)
     router = Router(
         llm=llm,
         registry=registry,
         convo=convo,
         db=db,
-        config=RouterConfig(taint_mode=taint_mode),
+        config=RouterConfig(taint_mode=taint_mode, **router_kwargs),
     )
     return router, fp, db, convo, registry
 
@@ -79,6 +101,7 @@ def _clear():
     DELETED.clear()
     MUTATED.clear()
     READS.clear()
+    TYPED.clear()
 
 
 async def test_suspend_then_approve_executes_and_resumes(tmp_path) -> None:
@@ -562,4 +585,137 @@ async def test_a_model_chosen_argument_name_cannot_forge_a_line_in_the_confirm(t
     assert reply.pending_confirmation_id, "expected a confirm to be raised"
     assert "\n" not in reply.text, f"argument name forged a line break: {reply.text!r}"
     assert reply.text.count("Confirm: run") == 1
+    await db.dispose()
+
+
+# --- confirmation lifecycle: what each resolution leaves behind ----------------
+
+
+async def _only_row(db) -> PendingConfirmation:
+    async with db.session() as s:
+        return (await s.execute(select(PendingConfirmation))).scalar_one()
+
+
+async def test_approving_the_same_confirmation_twice_runs_the_tool_once(tmp_path) -> None:
+    """A double-tap (or a retried webhook) on Approve must not re-run a
+    destructive tool: the second resolution sees a row that is no longer
+    pending and says so, without executing or calling the model again."""
+    script = [fake_tool_call("wipe_log", {"reason": "once"}), fake_text("All wiped!")]
+    router, fp, db, convo, _ = build(tmp_path, script)
+    r1 = await router.handle(channel="t:1", text="wipe", user_id="u1")
+    first = await router.resolve_confirmation(
+        r1.pending_confirmation_id, approved=True, user_id="u1"
+    )
+    assert first.text == "All wiped!"
+
+    second = await router.resolve_confirmation(
+        r1.pending_confirmation_id, approved=True, user_id="u1"
+    )
+    assert second.text == "Unknown confirmation — already confirmed."
+    assert DELETED == ["once"]
+    assert len(fp.calls) == 2  # suspend turn + the one resume
+    await db.dispose()
+
+
+async def test_a_resolved_confirmation_is_left_alone_by_later_messages(tmp_path) -> None:
+    """The next user message sweeps PENDING confirmations only. A confirmation
+    already resolved must keep its status and must not have a second
+    "declined" tool result appended to the history on every later message."""
+    script = [
+        fake_tool_call("wipe_log", {"reason": "x"}),
+        fake_text("All wiped!"),
+        fake_text("one"),
+        fake_text("two"),
+    ]
+    router, fp, db, convo, _ = build(tmp_path, script)
+    r1 = await router.handle(channel="t:1", text="wipe", user_id="u1")
+    await router.resolve_confirmation(r1.pending_confirmation_id, approved=True, user_id="u1")
+    cid = await convo.get_or_create("t:1")
+    before = [m.role for m in await convo.recent(cid)]
+    assert before == ["user", "assistant", "tool", "assistant"]
+
+    await router.handle(channel="t:1", text="and now?", user_id="u1")
+    await router.handle(channel="t:1", text="anything else?", user_id="u1")
+
+    assert (await _only_row(db)).status == "confirmed"
+    after = [m.role for m in await convo.recent(cid)]
+    assert after == [*before, "user", "assistant", "user", "assistant"]
+    await db.dispose()
+
+
+async def test_a_new_confirmation_expires_after_the_configured_ttl(tmp_path) -> None:
+    """`confirm_ttl_seconds` is the lifetime actually written to the row (to
+    within the milliseconds between the two clock reads), not just a config
+    field nobody consults."""
+    router, fp, db, convo, _ = build(
+        tmp_path, [fake_tool_call("wipe_log", {"reason": "x"})], confirm_ttl_seconds=100
+    )
+    await router.handle(channel="t:1", text="wipe", user_id="u1")
+    row = await _only_row(db)
+    lifetime = (row.expires_at - row.created_at).total_seconds()
+    assert lifetime == pytest.approx(100, abs=5)
+    await db.dispose()
+
+
+async def test_declining_records_the_declined_status(tmp_path) -> None:
+    script = [fake_tool_call("wipe_log", {"reason": "x"}), fake_text("Okay.")]
+    router, fp, db, convo, _ = build(tmp_path, script)
+    r1 = await router.handle(channel="t:1", text="wipe", user_id="u1")
+    await router.resolve_confirmation(r1.pending_confirmation_id, approved=False, user_id="u1")
+    assert (await _only_row(db)).status == "declined"
+    assert DELETED == []
+    await db.dispose()
+
+
+async def test_a_confirmation_that_timed_out_is_swept_as_expired(tmp_path) -> None:
+    """The sweep run by the next message distinguishes a confirmation that
+    simply timed out (`expired`) from one the user superseded (`declined`)."""
+    script = [fake_tool_call("wipe_log", {"reason": "x"}), fake_text("hello!")]
+    router, fp, db, convo, _ = build(tmp_path, script)
+    await router.handle(channel="t:1", text="wipe", user_id="u1")
+    async with db.session() as s:
+        row = (await s.execute(select(PendingConfirmation))).scalar_one()
+        row.expires_at = _utcnow() - timedelta(seconds=1)
+
+    await router.handle(channel="t:1", text="hi", user_id="u1")
+    assert (await _only_row(db)).status == "expired"
+    await db.dispose()
+
+
+async def test_an_approved_call_is_revalidated_into_its_typed_arguments(tmp_path) -> None:
+    """loop_state stores the call's args as JSON, so a date and an enum come
+    back as plain strings. The tool must still receive a `date` and a `Level`
+    -- the resumed call goes through the schema again, not straight to `fn`."""
+    script = [
+        fake_tool_call("schedule", {"day": "2026-03-04", "level": "high"}),
+        fake_text("Scheduled."),
+    ]
+    router, fp, db, convo, _ = build(tmp_path, script, extra_apps=[make_typed_app()])
+    r1 = await router.handle(channel="t:1", text="book it", user_id="u1")
+    assert r1.pending_confirmation_id
+    await router.resolve_confirmation(r1.pending_confirmation_id, approved=True, user_id="u1")
+    assert TYPED == [(date(2026, 3, 4), Level.HIGH)]
+    await db.dispose()
+
+
+async def test_a_hallucinated_tool_in_a_batch_does_not_gate_a_native_write(tmp_path) -> None:
+    """A name the live registry does not know produces only the router's own
+    "unknown tool" error: nothing untrusted was fetched, so it must not make
+    the batch count as untrusted and drag a sibling native write into a
+    confirmation."""
+    both = Completion(
+        message=Message(
+            role="assistant",
+            tool_calls=[
+                ToolCall(id="g", name="no_such_tool", args={}),
+                ToolCall(id="w", name="set_pref", args={"value": "a"}),
+            ],
+        ),
+        usage=Usage(1, 1),
+        stop_reason="tool_calls",
+    )
+    router, fp, db, convo, _ = build(tmp_path, [both, fake_text("done")])
+    reply = await router.handle(channel="t:1", text="go", user_id="u1")
+    assert reply.pending_confirmation_id is None
+    assert MUTATED == ["a"]
     await db.dispose()
