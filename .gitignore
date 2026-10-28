@@ -5,6 +5,10 @@
 /SPEC.md
 /.superpowers/
 
+# --- local tooling: per-machine state that must never be committed or shipped ---
+/.claude/
+.DS_Store
+
 # --- python ---
 __pycache__/
 *.py[cod]

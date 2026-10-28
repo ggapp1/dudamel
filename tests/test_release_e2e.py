@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import hashlib
 import subprocess
+import tarfile
 import time
 import zipfile
 from pathlib import Path
@@ -264,3 +265,38 @@ def test_quickstart_runs_via_real_uv_run_subprocess_in_scaffolded_project(
         "--find-links lost to the package index, so the release candidate was never "
         "actually exercised"
     )
+
+
+@pytest.mark.slow
+def test_sdist_ships_only_the_allowlisted_top_level(tmp_path: Path) -> None:
+    """Hatchling's sdist default is "everything not VCS-ignored", so a stray
+    untracked file (an editor's `.claude/` settings, a lock file) used to ride
+    along in the published tarball. The sdist is an explicit allowlist now;
+    this pins both the exact top level and the absence of `.claude/`."""
+    dist_dir = tmp_path / "dist"
+    subprocess.run(
+        ["uv", "build", "--sdist", "-o", str(dist_dir)],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    (sdist,) = dist_dir.glob("dudamel-*.tar.gz")
+    with tarfile.open(sdist) as tar:
+        names = tar.getnames()
+    # Entries look like `dudamel-<version>/<path>`.
+    top_level = {name.split("/")[1] for name in names if "/" in name}
+    assert top_level == {
+        "src",
+        "tests",
+        "examples",
+        ".github",
+        ".gitignore",
+        "LICENSE",
+        "README.md",
+        "pyproject.toml",
+        "uv.lock",
+        "PKG-INFO",
+    }
+    assert not [n for n in names if "/.claude" in n]
