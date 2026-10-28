@@ -1,12 +1,16 @@
+from importlib.resources import files
 from pathlib import Path
 
 import pytest
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import create_engine, inspect, text
 
 from dudamel.exceptions import DudamelError
 from dudamel.migrate import (
     pending_migrations,
     suite_version_table,
+    sync_url,
     upgrade_all,
     upgrade_core,
     upgrade_suite_app,
@@ -228,3 +232,71 @@ def test_pending_migrations_names_each_lane(tmp_path) -> None:
     assert any("notes" in p for p in pending)
     upgrade_all(url, tmp_path, [("notes", notes)])
     assert pending_migrations(url, tmp_path, [("notes", notes)]) == []
+
+
+def test_pending_migrations_reports_a_lane_that_is_not_the_first_by_name(tmp_path) -> None:
+    """Every lane is checked, not just the alphabetically first: with `aaa`
+    current and `zzz` behind, `zzz` is what must be named."""
+    url = db_url_for(tmp_path)
+    upgrade_core(url)
+    aaa = make_lane(tmp_path, "aaa", body=CREATE_NOTES.replace("notes_note", "aaa_t"), rev="a1")
+    zzz = make_lane(tmp_path, "zzz", body=CREATE_TASKS.replace("tasks_task", "zzz_t"), rev="z1")
+    upgrade_suite_app(url, "aaa", aaa)
+
+    pending = pending_migrations(url, tmp_path, [("zzz", zzz), ("aaa", aaa)])
+
+    assert pending == ["app 'zzz' schema is behind head"]
+
+
+def test_pending_migrations_reports_a_core_that_is_behind_not_just_unapplied(tmp_path) -> None:
+    """Core with SOME revisions applied but not the newest is behind. (An
+    unmigrated database is the other case, covered in test_migrate.py.)"""
+    url = db_url_for(tmp_path)
+    cfg = Config()
+    cfg.set_main_option("script_location", str(files("dudamel") / "migrations"))
+    cfg.set_main_option("sqlalchemy.url", sync_url(url))
+    cfg.set_main_option("version_table", "alembic_version_core")
+    command.upgrade(cfg, "0001")
+    assert pending_migrations(url, tmp_path) == ["core schema is behind head"]
+
+    upgrade_core(url)
+    assert pending_migrations(url, tmp_path) == []
+
+
+def test_upgrade_all_applies_lanes_in_name_order_whatever_order_they_are_passed(tmp_path) -> None:
+    """Name order is the documented apply order, so the result cannot depend on
+    discovery order. Each revision appends its lane's name to a log as it runs."""
+    url = db_url_for(tmp_path)
+    upgrade_core(url)
+    log = tmp_path / "order.log"
+    lanes = [
+        (
+            name,
+            make_lane(
+                tmp_path,
+                name,
+                body=f"open({str(log)!r}, 'a').write({name!r} + '\\n')",
+                rev=f"{name}1",
+            ),
+        )
+        for name in ("bbb", "aaa", "ccc")
+    ]
+
+    upgrade_all(url, tmp_path, list(reversed(sorted(lanes))))
+
+    assert log.read_text().split() == ["aaa", "bbb", "ccc"]
+
+
+def test_upgrade_all_takes_a_backup_before_touching_a_lane(tmp_path) -> None:
+    """The single backup is the real undo for a lane that fails half-way (see
+    upgrade_all), so it must exist once upgrade_all has run."""
+    url = db_url_for(tmp_path)
+    upgrade_core(url)
+    backup = tmp_path / "x.db.bak"
+    assert not backup.exists()  # upgrade_core on a fresh file had nothing to back up
+
+    upgrade_all(
+        url, tmp_path, [("notes", make_lane(tmp_path, "notes", body=CREATE_NOTES, rev="n1"))]
+    )
+
+    assert backup.exists()
