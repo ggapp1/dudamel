@@ -68,7 +68,8 @@ def _clean_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
     """Mirrors test_cli.py's fixture of the same purpose: `new`/`db migrate`
     write/read a real .env, and `_load_dotenv_into_environ` loads it into the
     REAL process environment -- scrub first so a leftover host-env token
-    can't shadow the one this test generates and reads back."""
+    can't shadow the one this test generates and reads back. (Restoring what
+    the CLI writes afterwards is conftest's `_restore_environ`, not this.)"""
     for var in ("DUDAMEL_WEB_TOKEN", "DUDAMEL_TELEGRAM_TOKEN", "ANTHROPIC_API_KEY"):
         monkeypatch.delenv(var, raising=False)
 
