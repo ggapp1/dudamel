@@ -16,8 +16,9 @@ from dudamel.config import RouterConfig, Settings, TierConfig, WebConfig
 from dudamel.llm.testing import Completion, FakeProvider, fake_text, fake_tool_call
 from dudamel.models_core import Activity, PendingConfirmation
 from dudamel.router import _utcnow
+from dudamel.web import auth as web_auth
 from dudamel.web.api import create_api
-from dudamel.web.auth import CSRF_HEADER
+from dudamel.web.auth import CSRF_HEADER, SESSION_COOKIE, SESSION_TTL
 from dudamel.web.throttle import MAX_FAILURES
 
 TOKEN = "s3cr3t-token"  # noqa: S105 — test fixture, not a real credential
@@ -313,6 +314,74 @@ async def test_cookie_get_does_not_require_csrf(tmp_path: Path, token_env: str) 
         await c.post("/login", json={"token": token_env})
         resp = await c.get("/api/widgets")
     assert resp.status_code == 200
+    await rt.stop()
+
+
+async def test_cookie_post_with_a_wrong_csrf_token_is_403(tmp_path: Path, token_env: str) -> None:
+    """A PRESENT but wrong `X-CSRF-Token` must be refused, not merely an absent
+    one. The wrong value shares its first 16 characters with the real token, so
+    a prefix-only comparison cannot pass this either."""
+    rt, transport = await build(tmp_path, [fake_text("hello!")])
+    async with client(transport) as c:
+        login = await c.post("/login", json={"token": token_env})
+        csrf_token = login.json()["csrf_token"]
+        near_miss = csrf_token[:16] + ("A" if csrf_token[16:17] != "A" else "B") + csrf_token[17:]
+        assert near_miss != csrf_token
+
+        for wrong in ("not-the-token", near_miss, csrf_token + "x"):
+            resp = await c.post("/api/chat", json={"text": "hi"}, headers={CSRF_HEADER: wrong})
+            assert resp.status_code == 403, wrong
+
+        ok = await c.post("/api/chat", json={"text": "hi"}, headers={CSRF_HEADER: csrf_token})
+        assert ok.status_code == 200
+    await rt.stop()
+
+
+async def test_a_bogus_session_cookie_does_not_authenticate_a_get(
+    tmp_path: Path, token_env: str
+) -> None:
+    """GET is exempt from CSRF, but only for a session that EXISTS: an unknown
+    session id must still be a 401, not a free pass because no CSRF check ran."""
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        c.cookies.set(SESSION_COOKIE, "no-such-session")
+        resp = await c.get("/api/widgets")
+    assert resp.status_code == 401
+    await rt.stop()
+
+
+async def test_a_session_expires_after_the_ttl_and_is_forgotten(
+    tmp_path: Path, token_env: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The session lives for exactly SESSION_TTL (24h): still valid just inside
+    it, rejected just past it, and the expired entry is removed from the table
+    rather than left to accumulate."""
+    rt, transport = await build(tmp_path, [])
+    app = transport.app
+    start = web_auth._now()
+    clock = {"now": start}
+    monkeypatch.setattr(web_auth, "_now", lambda: clock["now"])
+    async with client(transport) as c:
+        await c.post("/login", json={"token": token_env})
+        assert len(app.state.sessions._sessions) == 1
+
+        clock["now"] = start + SESSION_TTL - timedelta(seconds=1)
+        assert (await c.get("/api/widgets")).status_code == 200
+
+        clock["now"] = start + SESSION_TTL + timedelta(seconds=1)
+        assert (await c.get("/api/widgets")).status_code == 401
+        assert app.state.sessions._sessions == {}
+    await rt.stop()
+
+
+async def test_a_bearer_token_with_extra_trailing_characters_is_rejected(
+    tmp_path: Path, token_env: str
+) -> None:
+    """The bearer must EQUAL the configured token, not merely start with it."""
+    rt, transport = await build(tmp_path, [])
+    async with client(transport) as c:
+        resp = await c.get("/api/widgets", headers={"Authorization": f"Bearer {token_env}x"})
+    assert resp.status_code == 401
     await rt.stop()
 
 
