@@ -6,4 +6,7 @@
 name = "{{PROJECT_NAME}}"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["dudamel"]
+# Floored at the dudamel that scaffolded this project: a bare "dudamel" would
+# resolve the latest *published* release, which can be older than the commands
+# this project's README uses.
+dependencies = ["dudamel>={{DUDAMEL_VERSION}}"]

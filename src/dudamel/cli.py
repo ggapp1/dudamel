@@ -38,6 +38,7 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
 from dudamel import apps as suite
+from dudamel._version import __version__
 from dudamel.apps import missing_requirements
 from dudamel.config import Settings, TierConfig, resolve_timezone, timezone_source
 from dudamel.contract.renderers import ACTION_LABEL_MAX
@@ -198,7 +199,11 @@ def cmd_new(args: argparse.Namespace) -> int:
 
     project_name = _sanitize_project_name(target.name)
     pyproject_path = target / "pyproject.toml"
-    pyproject_path.write_text(pyproject_path.read_text().replace("{{PROJECT_NAME}}", project_name))
+    pyproject_path.write_text(
+        pyproject_path.read_text()
+        .replace("{{PROJECT_NAME}}", project_name)
+        .replace("{{DUDAMEL_VERSION}}", __version__)
+    )
 
     _write_deploy_templates(target, project_name)
 

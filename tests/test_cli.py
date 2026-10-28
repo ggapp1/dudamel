@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from dudamel import cli
+from dudamel import __version__, cli
 from dudamel.orchestrator import Orchestrator
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -154,8 +154,28 @@ def test_new_scaffolds_pyproject_toml_so_uv_run_works_in_project(tmp_path: Path)
     pyproject = (target / "pyproject.toml").read_text()
     assert "{{PROJECT_NAME}}" not in pyproject
     assert 'name = "proj"' in pyproject
-    assert 'dependencies = ["dudamel"]' in pyproject
     assert 'requires-python = ">=3.12"' in pyproject
+
+
+def test_new_floors_the_dudamel_dependency_at_the_scaffolding_version(tmp_path: Path) -> None:
+    """A bare `dudamel` requirement resolves the latest PUBLISHED release,
+    which can be older than the one that scaffolded the project and lack the
+    commands its README tells the reader to run. The scaffold carries the
+    version that wrote it as a floor (not an exact pin: later releases stay
+    welcome)."""
+    target = scaffold(tmp_path)
+    data = tomllib.loads((target / "pyproject.toml").read_text())
+    assert data["project"]["dependencies"] == [f"dudamel>={__version__}"]
+
+
+def test_new_leaves_no_template_placeholder_anywhere_in_the_tree(tmp_path: Path) -> None:
+    target = scaffold(tmp_path)
+    leftovers = [
+        str(p.relative_to(target))
+        for p in target.rglob("*")
+        if p.is_file() and "{{" in p.read_text(errors="replace")
+    ]
+    assert leftovers == []
 
 
 def test_new_sanitizes_project_name_for_pyproject_toml(tmp_path: Path) -> None:
