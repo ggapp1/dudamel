@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import os
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -24,6 +25,23 @@ import pytest
 
 import dudamel.app
 from dudamel.db import Database
+
+
+@pytest.fixture(autouse=True)
+def _restore_environ():
+    """Give every test the process environment it started with, whatever it wrote.
+
+    `cli._load_dotenv_into_environ` writes `DUDAMEL_WEB_TOKEN` and friends into
+    the REAL `os.environ`. A `monkeypatch.delenv(var, raising=False)` guard does
+    NOT undo that: when the var is absent, pytest records nothing, so the later
+    write is never reverted and leaks into every following test (it silently
+    voided the "no token configured" precondition of web-auth tests that ran
+    after the CLI tests). A snapshot/restore covers writes however they happen.
+    """
+    snapshot = dict(os.environ)
+    yield
+    os.environ.clear()
+    os.environ.update(snapshot)
 
 
 def _freeze_app_clock(monkeypatch: pytest.MonkeyPatch, instant: str) -> None:

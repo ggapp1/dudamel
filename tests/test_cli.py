@@ -26,11 +26,10 @@ def _clean_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
     DUDAMEL_WEB_TOKEN, and `run`/`doctor` load that .env into the REAL
     process environment (see `cli._load_dotenv_into_environ` -- required
     because web/telegram token resolution reads `os.environ` directly, not
-    a `Settings` field). `monkeypatch.delenv` here registers each var's
-    CURRENT (absent-or-not) state for restoration, so whatever the CLI
-    later writes into `os.environ` is undone at teardown regardless -- this
-    keeps that mutation from leaking into unrelated tests later in the same
-    pytest process."""
+    a `Settings` field). The `delenv` below only CLEARS a host-set value so the
+    test starts without one; it does NOT undo later writes (for an absent var
+    pytest records nothing to restore). Undoing those is the job of the
+    session-wide `_restore_environ` fixture in conftest.py."""
     for var in ("DUDAMEL_WEB_TOKEN", "DUDAMEL_TELEGRAM_TOKEN", "ANTHROPIC_API_KEY"):
         monkeypatch.delenv(var, raising=False)
 

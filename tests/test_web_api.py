@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import timedelta
 from pathlib import Path
 
@@ -143,6 +144,7 @@ async def test_wrong_token_returns_401(tmp_path: Path, token_env: str) -> None:
 
 async def test_missing_configured_token_rejects_any_bearer(tmp_path: Path) -> None:
     """No DUDAMEL_WEB_TOKEN set at all: bearer auth can never succeed."""
+    assert "DUDAMEL_WEB_TOKEN" not in os.environ  # the precondition, self-checked
     rt, transport = await build(tmp_path, [])
     async with client(transport) as c:
         resp = await c.get("/api/widgets", headers={"Authorization": "Bearer anything"})
