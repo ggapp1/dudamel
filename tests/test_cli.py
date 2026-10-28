@@ -6,6 +6,7 @@ directory."""
 from __future__ import annotations
 
 import logging
+import sqlite3
 import subprocess
 import tomllib
 from pathlib import Path
@@ -337,6 +338,39 @@ def test_db_migrate_then_no_changes_cycle(
 
     assert cli.main(["db", "migrate", "-m", "again"]) == 0
     assert capsys.readouterr().out.strip() == "no changes"
+
+
+def test_db_migrate_on_a_fresh_clone_does_not_mint_a_duplicate_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Regression: revisions are committed but the db file is gitignored, so a
+    fresh clone has revisions on disk and an empty database. Autogenerate has
+    to diff against a db that is already at the project lane's head; diffing
+    against the empty one re-emitted CREATE TABLE as a new revision, which
+    then failed with `table already exists` -- and left that orphan file
+    behind, so every later `db migrate` failed the same way."""
+    target = scaffold_with_local_app(tmp_path)
+    monkeypatch.chdir(target)
+    capsys.readouterr()
+
+    assert cli.main(["db", "migrate", "-m", "init"]) == 0
+    capsys.readouterr()
+    versions = target / "migrations" / "versions"
+    assert len(list(versions.glob("*.py"))) == 1
+
+    # The fresh clone: committed revisions, no database.
+    for leftover in target.glob("dudamel.db*"):
+        leftover.unlink()
+
+    assert cli.main(["db", "migrate", "-m", "addfield"]) == 0
+    assert capsys.readouterr().out.strip() == "no changes"
+    assert len(list(versions.glob("*.py"))) == 1
+
+    # ...and the rebuilt db really is at head, with the app's table present.
+    with sqlite3.connect(target / "dudamel.db") as conn:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
+        assert "notebook_entries" in tables
+        assert conn.execute("SELECT count(*) FROM alembic_version_apps").fetchone()[0] == 1
 
 
 def test_db_migrate_on_a_fresh_project_has_nothing_to_generate(

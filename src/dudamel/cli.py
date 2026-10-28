@@ -280,6 +280,15 @@ def cmd_db_migrate(args: argparse.Namespace) -> int:
     project_dir = settings.project_dir
     # Apply core migrations first to ensure schema is ready for app autogenerate
     upgrade_core(settings.database_url)
+    # Autogenerate diffs the models against the live database, so the database
+    # has to already be at head for the project's lane (and every enabled suite
+    # lane) before we ask for a new revision. A fresh clone is the ordinary case
+    # where it is not: revisions are committed, the db file is gitignored. Diffing
+    # against that empty db re-emits CREATE TABLE as a fresh revision that then
+    # collides with the committed one -- and the orphan file stays on disk, so
+    # every later `db migrate` fails the same way. Safe with no `migrations/`
+    # yet: `upgrade_all` skips the project lane when there is none.
+    upgrade_all(settings.database_url, project_dir, resolution.suite_lanes)
     # LOCAL apps only. A suite app's revisions ship in the wheel, so its tables
     # must never enter the project's own autogenerate diff: otherwise every
     # user mints a private revision for shipped code, and the shipped lane's
@@ -291,10 +300,10 @@ def cmd_db_migrate(args: argparse.Namespace) -> int:
         project_dir,
         allow_destructive=args.allow_destructive,
     )
-    # Always bring the project db to head, whether or not this call produced
-    # a new revision -- a previously-generated-but-unapplied migration file
-    # must not require a second `db migrate` invocation to take effect. Each
-    # enabled suite app's own lane goes up with it.
+    # Second pass, now that the revision above exists: always bring the project
+    # db to head, whether or not this call produced a new revision -- the one
+    # just written must take effect without a second `db migrate`. Each enabled
+    # suite app's own lane goes up with it (a no-op if already at head).
     upgrade_all(settings.database_url, project_dir, resolution.suite_lanes)
     print(str(path) if path is not None else "no changes")
     return 0
