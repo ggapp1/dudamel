@@ -158,12 +158,14 @@ async def test_the_budget_day_rolls_over_in_the_framework_zone(db: Database, mon
     assert (await client.complete([Message(role="user", text="x")])).message.text == "ok"
 
 
-async def test_spend_inside_the_local_day_still_exhausts_the_budget(
-    db: Database, monkeypatch
-) -> None:
-    """The other half of the boundary. 06:00Z on 2026-01-16 IS 2026-01-16 in
-    New York, so it must count -- without this row, an implementation that
-    simply counts nothing satisfies the test above.
+async def test_the_budget_day_rolls_over_ahead_of_utc_too(db: Database, monkeypatch) -> None:
+    """The mirror image for a zone AHEAD of UTC, at an instant where the local
+    date (Jan 17, Tokyo) is later than the UTC one (Jan 16).
+
+    The Tokyo day began at 15:00Z on Jan 16, so spend at 14:59Z belongs to
+    yesterday and must not count; a day taken from the UTC date would start a
+    day too early and count it. (The New York test above cannot catch that: at
+    14:00Z both zones share a date.)
     """
     async with db.session() as s:
         s.add(
@@ -173,10 +175,54 @@ async def test_spend_inside_the_local_day_still_exhausts_the_budget(
                 model="m",
                 tokens_in=900,
                 tokens_out=200,
-                created_at=datetime(2026, 1, 16, 6, 0),
+                created_at=datetime(2026, 1, 16, 14, 59),
             )
         )
-    _freeze_client_clock(monkeypatch, datetime(2026, 1, 16, 14, 0, tzinfo=UTC))
+    _freeze_client_clock(monkeypatch, datetime(2026, 1, 16, 20, 0, tzinfo=UTC))
+    client = make_client(
+        db,
+        [fake_text("ok")],
+        budget=BudgetConfig(daily_tokens=1000),
+        timezone=ZoneInfo("Asia/Tokyo"),
+    )
+    assert (await client.complete([Message(role="user", text="x")])).message.text == "ok"
+
+
+@pytest.mark.parametrize(
+    "now",
+    [
+        datetime(2026, 1, 16, 14, 0, tzinfo=UTC),
+        # 21:00 on Jan 16 in New York but already Jan 17 in UTC. Here the local
+        # date and the UTC (or naive wall-clock) date DISAGREE, which is the only
+        # kind of instant at which "which date is today" can be told apart: at
+        # 14:00Z both zones say Jan 16 and any date source gives the same window.
+        datetime(2026, 1, 17, 2, 0, tzinfo=UTC),
+    ],
+    ids=["same-date-in-both-zones", "utc-is-already-tomorrow"],
+)
+async def test_spend_inside_the_local_day_still_exhausts_the_budget(
+    db: Database, monkeypatch, now: datetime
+) -> None:
+    """The other half of the boundary. 10:00Z on 2026-01-16 IS 2026-01-16 in
+    New York, so it must count -- without this row, an implementation that
+    simply counts nothing satisfies the test above.
+
+    Run at an instant where UTC has already rolled to Jan 17: the day the cap
+    measures must be the LOCAL one (Jan 16, which began 05:00Z), not the UTC or
+    wall-clock one, whose window would start at 00:00Z Jan 17 and miss the row.
+    """
+    async with db.session() as s:
+        s.add(
+            LlmCall(
+                tier="standard",
+                provider="fake",
+                model="m",
+                tokens_in=900,
+                tokens_out=200,
+                created_at=datetime(2026, 1, 16, 10, 0),
+            )
+        )
+    _freeze_client_clock(monkeypatch, now)
     client = make_client(
         db,
         [fake_text("should never run")],
