@@ -863,6 +863,62 @@ async def test_compaction_prepends_summary_once_per_turn_within_budget(tmp_path)
     await db.dispose()
 
 
+async def test_a_summary_that_swallowed_an_untrusted_call_is_written_tainted(tmp_path) -> None:
+    """The router -> compactor seam: the router decides, from the registry,
+    whether the span it is about to drop contains an untrusted (MCP) call and
+    hands that to the compactor as `dropped_tainted`. The compactor tests pass
+    that flag themselves, so only a router-level run proves the row comes out
+    tainted -- and that the next turn, whose window no longer shows the call,
+    still gates a native mutation."""
+    config = RouterConfig(window_tokens=60)
+    router, fp_standard, fp_compact, db, convo = make_router_with_compaction(
+        tmp_path,
+        [
+            fake_text("noted"),
+            fake_tool_call("log_workout", {"exercise": "bench", "reps": 5}),
+        ],
+        [fake_text("SUMMARY: one."), fake_text("SUMMARY: two."), fake_text("SUMMARY: three.")],
+        config=config,
+    )
+    router._registry.tools["serialized_probe"].origin = "mcp"
+    conv_id = await convo.get_or_create("t:1")
+    filler = "filler " * 20
+    # The untrusted call is the OLDEST thing in the history, so the window drops it.
+    await convo.append(conv_id, Message(role="user", text="look something up"))
+    await convo.append(
+        conv_id,
+        Message(
+            role="assistant",
+            tool_calls=[ToolCall(id="old", name="serialized_probe", args={})],
+        ),
+    )
+    await convo.append(conv_id, Message(role="tool", text="ok", tool_call_id="old"))
+    for i in range(5):
+        await convo.append(conv_id, Message(role="user", text=f"prior user {i} {filler}"))
+        await convo.append(conv_id, Message(role="assistant", text=f"prior assistant {i} {filler}"))
+
+    await router.handle(channel="t:1", text="hi", user_id="u1")
+    async with db.session() as s:
+        newest = (
+            (
+                await s.execute(
+                    select(Summary).where(Summary.conversation_id == conv_id).order_by(Summary.id)
+                )
+            )
+            .scalars()
+            .all()
+        )[-1]
+    assert newest.tainted is True
+    window_roles = [m.role for m in fp_standard.calls[0]["messages"]]
+    assert "tool" not in window_roles  # the call really is out of the window
+
+    reply = await router.handle(channel="t:1", text="log a set", user_id="u1")
+    assert reply.pending_confirmation_id is not None
+    assert "Confirm: run log_workout" in reply.text
+    assert CALLS == []
+    await db.dispose()
+
+
 async def test_initial_taint_seeded_from_newest_summary_in_default_turn_mode(tmp_path) -> None:
     """`_loop` seeds turn_tainted from the newest summary's flag under the
     default taint_mode="turn" -- not just "window" -- even when nothing
