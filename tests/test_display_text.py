@@ -6,7 +6,14 @@ button was not. Telegram stripped it (`telegram._plain`) and the web did not
 which is the same surface disagreement already fixed one field to the left.
 """
 
-from dudamel.contract.renderers import validate_widget_payload
+import pytest
+
+from dudamel.contract.renderers import (
+    DISPLAY_TEXT_MAX,
+    clean_action_label,
+    clean_display_text,
+    validate_widget_payload,
+)
 
 
 def _one(title: str = "t", subtitle: str | None = None):
@@ -114,3 +121,64 @@ def test_a_tables_headers_and_string_cells_are_cleaned():
     assert "‮" not in payload.columns[0]
     assert "‮" not in payload.rows[0][0]
     assert payload.rows[0][1:] == [5, 3.5, None]
+
+
+# Every range in UNSAFE_DISPLAY_CHARS, as (first, last): the codepoints at and
+# just inside each edge must go, the ones just outside each edge must stay.
+_STRIPPED = [
+    0x00,  # NUL, first of C0
+    0x09,  # TAB: inside the class even though str.strip() would also take it at an edge
+    0x1F,  # US, last of C0
+    0x7F,  # DEL
+    0x80,  # first of C1
+    0x9F,  # APC, last of C1
+    0x2028,  # LINE SEPARATOR
+    0x2029,  # PARAGRAPH SEPARATOR
+    0x202A,  # LRE, first of the embedding/override run
+    0x202D,
+    0x202E,  # RLO, last of the run
+    0x2066,  # LRI, first of the isolates
+    0x2069,  # PDI, last of the isolates
+]
+_SURVIVING = [
+    0x20,  # SPACE: one past the end of C0
+    0x7E,  # TILDE: one before DEL
+    0xA0,  # NBSP: one past the end of C1
+    0x2027,  # one before LINE SEPARATOR
+    0x202F,  # NARROW NBSP: one past RLO
+    0x2065,  # one before LRI
+    0x206A,  # one past PDI
+    0x200E,  # LRM -- deliberately NOT in the class (see the comment on it)
+    0x200F,  # RLM -- likewise
+]
+
+
+@pytest.mark.parametrize("cp", _STRIPPED, ids=lambda cp: f"U+{cp:04X}")
+@pytest.mark.parametrize("clean", [clean_action_label, clean_display_text])
+def test_every_edge_of_the_unsafe_class_is_stripped(cp: int, clean) -> None:
+    assert clean(f"Ar{chr(cp)}chive") == "Archive"
+
+
+@pytest.mark.parametrize("cp", _SURVIVING, ids=lambda cp: f"U+{cp:04X}")
+@pytest.mark.parametrize("clean", [clean_action_label, clean_display_text])
+def test_characters_just_outside_the_unsafe_class_survive(cp: int, clean) -> None:
+    """The other half of a boundary: an over-wide class would delete legitimate
+    text (a space between words, a non-breaking space in a price)."""
+    text = f"Ar{chr(cp)}chive"
+    assert clean(text) == text
+
+
+def test_overrides_are_removed_before_the_outer_whitespace_is_trimmed() -> None:
+    """Order matters: stripping first would leave the space that only becomes
+    outer once the override in front of it is gone."""
+    assert clean_action_label("\u202e Archive") == "Archive"
+    assert clean_display_text("\u202e Archive \u202e") == "Archive"
+
+
+def test_display_text_is_truncated_only_past_the_maximum() -> None:
+    exact = "x" * DISPLAY_TEXT_MAX
+    assert clean_display_text(exact) == exact
+
+    over = clean_display_text("x" * (DISPLAY_TEXT_MAX + 1))
+    assert over == "x" * (DISPLAY_TEXT_MAX - 1) + "\u2026"
+    assert len(over) == DISPLAY_TEXT_MAX

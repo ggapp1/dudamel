@@ -154,6 +154,21 @@ def test_list_item_rejects_unsafe_url_schemes(url: str) -> None:
         validate_widget_payload("list", [{"title": "t", "url": url}])
 
 
+@pytest.mark.parametrize("char", ["\x00", "\x1f", " ", "\x7f"])
+def test_list_item_rejects_a_url_with_a_control_character_or_space_anywhere(char: str) -> None:
+    """The class runs from NUL through the SPACE (U+0020) to DEL: a space is
+    whitespace a surface may split on, and an otherwise-valid prefix must not
+    launder one. The characters are placed mid-string, where the prefix check
+    cannot see them, and each end of the range is covered."""
+    with pytest.raises(ValueError, match="control characters or whitespace"):
+        validate_widget_payload("list", [{"title": "t", "url": f"https://example.com/a{char}b"}])
+
+
+def test_list_item_accepts_a_url_just_outside_the_control_range() -> None:
+    url = "https://example.com/!~"  # U+0021 and U+007E sit either side of the class
+    assert validate_widget_payload("list", [{"title": "t", "url": url}])[0].url == url
+
+
 @pytest.mark.parametrize(
     "url",
     [
