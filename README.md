@@ -66,7 +66,18 @@ model = "qwen3.5:1.5b"
 ```
 
 Point a tier at a hosted provider instead by setting `provider =
-"anthropic"` and an API key env var. `uv run dudamel doctor` checks every
+"anthropic"` and an API key env var. Two more keys apply to any tier:
+
+- `api_key_env` (string, no default) — the *name* of the environment variable
+  that holds the tier's API key; the key itself never goes in `dudamel.toml`.
+  For `provider = "anthropic"` it defaults to `ANTHROPIC_API_KEY`, and
+  `dudamel run` refuses to start if that variable is unset. For
+  `provider = "openai-compatible"` it is optional: leave it out for a local
+  server that needs no key (Ollama), set it for a hosted one.
+- `max_tokens` (integer, default `1024`) — the most tokens the model may
+  generate in one reply on this tier. Raise it if replies get cut off.
+
+`uv run dudamel doctor` checks every
 configured tier is actually reachable, along with the database, migration
 state, and web/Telegram token configuration.
 
@@ -324,6 +335,26 @@ machine it runs on. Two ways to reach it from elsewhere:
   answers "That button expired — send /home again". Telegram does not offer
   `/home` in its command menu unless you add it there yourself via BotFather.
 
+Telegram is configured under `[telegram]` in `dudamel.toml`:
+
+- `token_env` (string, default `"DUDAMEL_TELEGRAM_TOKEN"`) — the name of the
+  environment variable holding the bot token from BotFather. Unset means the
+  bot is simply off; `dudamel doctor` reports that as informational.
+- `allowed_user_ids` (list of integers, default `[]`) — the Telegram user ids
+  allowed to talk to the assistant. It is a deny-by-default allow-list, so
+  with it empty nobody can use the bot, and a message from anyone not on it
+  is answered with only their own numeric id (at most once an hour) so you can
+  find the id to add. It is also who scheduled notifications are sent to.
+- `allow_groups` (boolean, default `false`) — whether the bot answers in
+  group chats at all. With it off, group messages get no reply whatsoever.
+  Turning it on does not skip the allow-list: only listed users are served,
+  in a group as in private.
+
+```toml
+[telegram]
+allowed_user_ids = [123456789]
+```
+
 Nothing about `/home` widens who can reach the assistant: the command
 answers only the user ids already on the allow-list, and every button
 carries a one-shot token bound to the user it was issued to.
@@ -332,6 +363,10 @@ Forwarding a port on your router to expose the dashboard directly to the
 public internet is not recommended — it puts the dashboard's auth layer
 directly in front of arbitrary internet traffic, which Tailscale and
 Telegram's outbound polling both avoid needing to do at all.
+
+The dashboard's login token is read from the environment variable named by
+`[web] token_env` (default `"DUDAMEL_WEB_TOKEN"`, the one `dudamel new` writes
+to `.env`). Set `token_env` only if you keep the token under another name.
 
 Running a reverse proxy (nginx, Caddy) in front of the dashboard on the
 same host needs one more setting: list its address in `[web]
@@ -467,6 +502,15 @@ split them: migrations placed under `data_dir` are ignored.
   who clicked is the authority for that call. Judge such a tool by what it
   writes, the same as any other mutating tool, and mark whatever reads that
   content back `external=True`.
+- **Confirmation expiry**: `[router] confirm_ttl_seconds` (integer, default
+  `900`) is how long a pending confirmation stays approvable. After that it
+  expires and the action is not run; the user has to ask again. A shorter
+  value narrows the window in which a stale prompt can be approved by mistake.
+- **Step limit**: `[router] iteration_cap` (integer, default `8`) caps the
+  model round-trips in one turn — each pass lets the model call tools and read
+  their results. A turn that hits it stops with a "couldn't finish within the
+  step limit" reply (or, if an approved action had already run, says so), so a
+  model stuck in a tool loop cannot run indefinitely.
 - **Token budgets**: `[llm.budget] daily_tokens` in `dudamel.toml` sets a
   hard per-day ceiling on tokens spent across ALL tiers combined (it is one
   global budget, not one per tier), enforced before each call — a runaway
