@@ -31,13 +31,20 @@ async def make_db(tmp_path: Path) -> Database:
 async def poll_job_runs(
     db: Database, job_id: str, *, count: int = 1, timeout: float = 5.0
 ) -> list[JobRun]:
-    """Poll job_runs for `job_id` until at least `count` rows exist or the
-    timeout elapses -- never a single sleep-and-hope."""
+    """Poll job_runs for `job_id` until at least `count` FINISHED rows exist or
+    the timeout elapses -- never a single sleep-and-hope. A `running` row exists
+    from the instant a run starts, so it is not an outcome yet."""
     deadline = time.monotonic() + timeout
     while True:
         async with db.session() as s:
             rows = list(
-                (await s.execute(select(JobRun).where(JobRun.job_id == job_id))).scalars().all()
+                (
+                    await s.execute(
+                        select(JobRun).where(JobRun.job_id == job_id, JobRun.status != "running")
+                    )
+                )
+                .scalars()
+                .all()
             )
         if len(rows) >= count:
             return rows
@@ -578,3 +585,173 @@ async def test_the_runtime_hands_its_scheduler_the_framework_zone(
         )
     finally:
         await rt.stop()
+
+
+# --- job_runs: a run that starts leaves a row, and downtime is accounted for --
+
+
+async def _rows(db: Database, job_id: str) -> list[JobRun]:
+    async with db.session() as s:
+        return list(
+            (await s.execute(select(JobRun).where(JobRun.job_id == job_id).order_by(JobRun.id)))
+            .scalars()
+            .all()
+        )
+
+
+async def test_a_row_exists_with_status_running_while_the_job_executes(tmp_path) -> None:
+    app = App("stats", description="d")
+    inside, release = asyncio.Event(), asyncio.Event()
+
+    @app.job(interval_seconds=3600)
+    async def slow() -> None:
+        inside.set()
+        await release.wait()
+
+    orc = Orchestrator(apps=[app])
+    db = await make_db(tmp_path)
+    sched = JobScheduler(orc.registry, db, timezone=ZoneInfo("UTC"))
+    try:
+        run = asyncio.create_task(sched._run_job(orc.registry.jobs[0]))
+        await asyncio.wait_for(inside.wait(), 5)
+        mid = await _rows(db, "stats.slow")
+        assert [(r.status, r.finished_at) for r in mid] == [("running", None)]
+        release.set()
+        await run
+        # The same row is updated in place: one run, one row.
+        done = await _rows(db, "stats.slow")
+        assert [r.status for r in done] == ["ok"]
+        assert done[0].id == mid[0].id
+        assert done[0].finished_at is not None
+    finally:
+        await db.dispose()
+
+
+async def test_a_running_row_left_by_a_dead_process_becomes_interrupted(tmp_path) -> None:
+    app = App("stats", description="d")
+
+    @app.job(interval_seconds=3600)
+    async def poll() -> None:
+        return None
+
+    orc = Orchestrator(apps=[app])
+    db = await make_db(tmp_path)
+    async with db.session() as s:
+        s.add(JobRun(job_id="stats.poll", status="running", started_at=_naive(2026, 1, 1, 10)))
+    sched = JobScheduler(orc.registry, db, timezone=ZoneInfo("UTC"))
+    await sched.start()
+    try:
+        rows = await _rows(db, "stats.poll")
+    finally:
+        await sched.shutdown()
+        await db.dispose()
+    assert rows[0].status == "interrupted"
+    assert "process" in rows[0].detail
+    assert rows[0].finished_at is not None
+
+
+def _naive(*args: int) -> datetime:
+    return datetime(*args)
+
+
+async def _cron_hourly_sched(tmp_path: Path, monkeypatch, now: datetime):
+    app = App("stats", description="d")
+
+    @app.job(cron="0 * * * *")
+    async def hourly() -> None:
+        return None
+
+    orc = Orchestrator(apps=[app])
+    db = await make_db(tmp_path)
+    monkeypatch.setattr("dudamel.scheduler._utcnow", lambda: now)
+    return JobScheduler(orc.registry, db, timezone=ZoneInfo("UTC")), db
+
+
+async def test_fires_missed_during_downtime_record_one_misfired_row_with_the_count(
+    tmp_path, monkeypatch
+) -> None:
+    # Last run 10:30; down until 13:30 -> the 11:00, 12:00 and 13:00 fires.
+    sched, db = await _cron_hourly_sched(tmp_path, monkeypatch, _naive(2026, 1, 1, 13, 30))
+    async with db.session() as s:
+        s.add(JobRun(job_id="stats.hourly", status="ok", started_at=_naive(2026, 1, 1, 10, 30)))
+    try:
+        await sched._reconcile_history()
+        rows = await _rows(db, "stats.hourly")
+    finally:
+        await db.dispose()
+    assert [r.status for r in rows] == ["ok", "misfired"]
+    assert "3 " in rows[1].detail
+
+
+async def test_no_fire_in_the_downtime_window_records_nothing(tmp_path, monkeypatch) -> None:
+    sched, db = await _cron_hourly_sched(tmp_path, monkeypatch, _naive(2026, 1, 1, 10, 50))
+    async with db.session() as s:
+        s.add(JobRun(job_id="stats.hourly", status="ok", started_at=_naive(2026, 1, 1, 10, 30)))
+    try:
+        await sched._reconcile_history()
+        rows = await _rows(db, "stats.hourly")
+    finally:
+        await db.dispose()
+    assert [r.status for r in rows] == ["ok"]
+
+
+async def test_a_job_with_no_history_records_no_misfire(tmp_path, monkeypatch) -> None:
+    sched, db = await _cron_hourly_sched(tmp_path, monkeypatch, _naive(2026, 1, 1, 13, 30))
+    try:
+        await sched._reconcile_history()
+        assert await _rows(db, "stats.hourly") == []
+    finally:
+        await db.dispose()
+
+
+async def test_the_missed_count_is_bounded(tmp_path, monkeypatch) -> None:
+    sched, db = await _cron_hourly_sched(tmp_path, monkeypatch, _naive(2026, 12, 1))
+    async with db.session() as s:
+        s.add(JobRun(job_id="stats.hourly", status="ok", started_at=_naive(2026, 1, 1)))
+    try:
+        await sched._reconcile_history()
+        rows = await _rows(db, "stats.hourly")
+    finally:
+        await db.dispose()
+    assert "1000+" in rows[1].detail
+
+
+async def test_interval_downtime_counts_whole_intervals_since_the_last_run(
+    tmp_path, monkeypatch
+) -> None:
+    app = App("stats", description="d")
+
+    @app.job(interval_seconds=600)
+    async def poll() -> None:
+        return None
+
+    orc = Orchestrator(apps=[app])
+    db = await make_db(tmp_path)
+    monkeypatch.setattr("dudamel.scheduler._utcnow", lambda: _naive(2026, 1, 1, 11, 5))
+    sched = JobScheduler(orc.registry, db, timezone=ZoneInfo("UTC"))
+    async with db.session() as s:
+        s.add(JobRun(job_id="stats.poll", status="ok", started_at=_naive(2026, 1, 1, 10, 0)))
+    try:
+        await sched._reconcile_history()
+        rows = await _rows(db, "stats.poll")
+    finally:
+        await db.dispose()
+    assert [r.status for r in rows] == ["ok", "misfired"]
+    assert "6 " in rows[1].detail
+
+
+async def test_a_normal_run_through_the_scheduler_is_one_ok_row(tmp_path) -> None:
+    app = App("stats", description="d")
+
+    @app.job(interval_seconds=3600)
+    async def poll() -> None:
+        return None
+
+    orc = Orchestrator(apps=[app])
+    db = await make_db(tmp_path)
+    sched = JobScheduler(orc.registry, db, timezone=ZoneInfo("UTC"))
+    try:
+        await sched._run_job(orc.registry.jobs[0])
+        assert [r.status for r in await _rows(db, "stats.poll")] == ["ok"]
+    finally:
+        await db.dispose()
