@@ -887,21 +887,61 @@ spend out of the window and acts as a partial reset. It settles the next day.
 ## Testing your apps
 
 `dudamel.llm.testing.FakeProvider` scripts a model's responses so tool
-flows can be tested deterministically, without a real model running:
+flows can be tested deterministically, without a real model running. Hand it
+to `Runtime` as `providers={"<tier name>": provider}` — a dict keyed by tier,
+not a bare provider — and mark that tier `provider="fake"` in the settings:
 
 ```python
+import asyncio
+import tempfile
+from pathlib import Path
+
+from dudamel import App, Orchestrator, Runtime
+from dudamel.config import Settings, TierConfig
 from dudamel.llm.testing import FakeProvider, fake_text, fake_tool_call
+
+app = App("gym", description="Workout logging")
+logged: list[str] = []
+
+
+@app.tool
+async def log_workout(exercise: str, sets: int, reps: int, weight_kg: float) -> str:
+    """Record one exercise from today's session."""
+    logged.append(exercise)
+    return f"Logged: {exercise} {sets}x{reps} @ {weight_kg}kg"
+
 
 provider = FakeProvider([
     fake_tool_call("log_workout", {"exercise": "bench", "sets": 3, "reps": 5, "weight_kg": 100}),
     fake_text("Logged it."),
 ])
+
+
+async def main() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        settings = Settings(
+            database_url=f"sqlite+aiosqlite:///{tmp}/test.db",
+            data_dir=Path(tmp),
+            # `provider="fake"` marks the tier as test-only; the real object is
+            # handed in through `providers=`, keyed by tier name.
+            llm_tiers={"standard": TierConfig(provider="fake", model="fake")},
+        )
+        runtime = Runtime(Orchestrator(apps=[app]), settings, providers={"standard": provider})
+        await runtime.start()
+        reply = await runtime.chat("web:test", "log 3x5 bench at 100kg", user_id="me")
+        print(reply.text, logged)
+        await runtime.stop()
+
+
+asyncio.run(main())
 ```
 
-Hand `provider` to `Runtime`/`serve()` in place of a real one and drive
-your app's tools, widgets, and jobs against a real database (typically
-`tmp_path` and SQLite) — no network calls, no model, fully deterministic
-output to assert against.
+This prints `Logged it. ['bench']`: the scripted tool call was coerced to
+typed arguments and run against your real app code, then the scripted text
+came back as the reply. It uses a throwaway SQLite file; use `tmp_path` the
+same way in a pytest fixture. The same `Runtime` drives your widgets and jobs,
+so they can be tested against a real database too — no network calls, no
+model, fully deterministic output to assert against.
 
 ## Why "dudamel"?
 
