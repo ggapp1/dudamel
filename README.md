@@ -755,7 +755,11 @@ zone it actually resolved, which is how you confirm the key landed.
 Leave it unset and dudamel uses the host's zone. That is what the scheduler has
 always done — despite what earlier versions of this file said — so an existing
 install's jobs keep firing at the same moment. `dudamel doctor` prints the zone
-it resolved and whether it came from your config or from the host.
+it resolved and whether it came from your config or from the host. If `$TZ` is
+set in the shell you ran doctor from, the host zone comes from it and doctor
+warns: the shipped service units do not set `$TZ`, so the service reads
+`/etc/localtime` and may use a different zone. Pin `timezone` to remove the
+doubt.
 
 **Daylight saving.** A cron job scheduled inside the hour that repeats on a
 fall-back day fires twice. One scheduled inside the hour that is skipped on a
