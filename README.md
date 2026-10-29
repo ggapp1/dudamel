@@ -10,12 +10,15 @@ when the model doesn't.
 dudamel splits an assistant into two planes. The **command plane** is the
 chat loop: a message comes in, the model picks tools to call, dudamel runs
 them and feeds results back until it has an answer. The **data plane** —
-the dashboard, widgets, scheduled jobs, database migrations — does not
-depend on the model at all. If your LLM endpoint is down, the dashboard
-still renders, because widgets are plain `async def` functions that read
-the database directly; nothing about them calls the model, and the framework
-enforces it — `app.llm()` raises inside a widget. To show model output, have a
-job or tool compute it, store it, and let the widget read the stored result.
+the dashboard, widgets, database migrations — does not depend on the model at
+all. If your LLM endpoint is down, the dashboard still renders, because widgets
+are plain `async def` functions that read the database directly; nothing about
+them calls the model, and the framework enforces it — `app.llm()` raises inside
+a widget. Scheduled jobs sit beside the data plane rather than in it: they run
+without the chat loop but may call the model. If that call fails the job
+records a failed run and the scheduler carries on, and the dashboard keeps
+rendering whatever was last stored. To show model output, have a job or tool
+compute it, store it, and let the widget read the stored result.
 
 Apps are code, not configuration:
 
