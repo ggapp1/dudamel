@@ -268,15 +268,34 @@ def _suite_lane_config(db_url: str, app_name: str, versions_dir: Path) -> Config
     return cfg
 
 
-def _lane_heads(versions_dir: Path) -> set[str]:
+def _lane_heads(app_name: str, versions_dir: Path) -> set[str]:
     """Heads of one lane's revisions. They live in `version_locations`, not in
-    the shared script directory, so `script_heads` cannot read them."""
-    return set(ScriptDirectory.from_config(_lane_script_config(versions_dir)).get_heads())
+    the shared script directory, so `script_heads` cannot read them.
+
+    Raises for a lane with no revisions at all. Every suite lane is first-party:
+    its revisions ship in the wheel, and each shipped app has at least its
+    initial one. So an empty head set is never "nothing to apply" -- it is a
+    packaging error (the versions directory missing from the wheel, or a path
+    that resolves to nothing), and reading it as "up to date" would start the
+    app against tables that were never created. Alembic does not distinguish
+    a missing directory from an empty one here, so the message names the
+    directory and says which."""
+    heads = set(ScriptDirectory.from_config(_lane_script_config(versions_dir)).get_heads())
+    if not heads:
+        state = "does not exist" if not versions_dir.is_dir() else "contains no revisions"
+        raise DudamelError(
+            f"suite app {app_name!r} has no migration revisions: its versions "
+            f"directory {versions_dir} {state}. A bundled app always ships at least "
+            "its initial revision, so this is a packaging problem (reinstall dudamel)"
+        )
+    return heads
 
 
 def upgrade_suite_app(db_url: str, app_name: str, versions_dir: Path) -> None:
     """Bring one suite app's lane to head. No backup here -- upgrade_all takes
     a single backup before touching any lane."""
+    # Fail loudly rather than "upgrade" a lane that resolves to no revisions.
+    _lane_heads(app_name, versions_dir)
     command.upgrade(_suite_lane_config(db_url, app_name, versions_dir), "head")
 
 
@@ -489,12 +508,11 @@ def suite_lane_pending(db_url: str, app_name: str, versions_dir: Path) -> bool:
 
     The per-lane comparison `pending_migrations` reports on, exposed on its own
     so `dudamel apps list`'s per-app column cannot disagree with the startup
-    gate about whether that lane is behind. An app that ships no revisions at
-    all is never pending.
+    gate about whether that lane is behind. A lane with no revisions is not
+    "never pending": see `_lane_heads` -- it raises, so doctor and the startup
+    gate report the packaging error instead of calling the app up to date.
     """
-    lane_scripts = _lane_heads(versions_dir)
-    if not lane_scripts:
-        return False
+    lane_scripts = _lane_heads(app_name, versions_dir)
     return current_heads(db_url, suite_version_table(app_name)) != lane_scripts
 
 

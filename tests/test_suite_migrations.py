@@ -212,18 +212,6 @@ def test_upgrade_all_without_a_project_lane(tmp_path) -> None:
     assert not (tmp_path / "migrations").exists()
 
 
-def test_app_with_no_revisions_is_a_harmless_no_op(tmp_path) -> None:
-    """An app that ships no versions directory (no tables of its own) must
-    neither fail its lane nor be reported as pending."""
-    url = db_url_for(tmp_path)
-    upgrade_core(url)
-    empty = tmp_path / "noschema" / "versions"
-    upgrade_all(url, tmp_path, [("noschema", empty)])
-    assert pending_migrations(url, tmp_path, [("noschema", empty)]) == []
-    upgrade_all(url, tmp_path, [("noschema", empty)])  # still a no-op on rerun
-    assert pending_migrations(url, tmp_path, [("noschema", empty)]) == []
-
-
 def test_pending_migrations_names_each_lane(tmp_path) -> None:
     url = db_url_for(tmp_path)
     upgrade_core(url)
@@ -299,3 +287,35 @@ def test_upgrade_all_takes_a_backup_before_touching_a_lane(tmp_path) -> None:
     )
 
     assert len(list(tmp_path.glob("x.db.bak-*"))) == 1
+
+
+@pytest.mark.parametrize("shape", ["missing", "empty"])
+def test_a_lane_that_resolves_to_no_revisions_is_an_error_not_up_to_date(tmp_path, shape) -> None:
+    """Every suite lane is first-party and ships at least its initial revision,
+    so no heads means a packaging error (versions dir lost from the wheel) --
+    reporting it as up to date would start the app with its tables never made."""
+    from dudamel.migrate import suite_lane_pending
+
+    url = db_url_for(tmp_path)
+    upgrade_core(url)
+    versions = tmp_path / "ghost_versions"
+    if shape == "empty":
+        versions.mkdir()
+
+    match = "ghost.*does not exist" if shape == "missing" else "ghost.*no revisions"
+    with pytest.raises(DudamelError, match=match) as exc:
+        suite_lane_pending(url, "ghost", versions)
+    assert str(versions) in str(exc.value)
+    # The startup gate and doctor both go through pending_migrations ...
+    with pytest.raises(DudamelError, match="ghost"):
+        pending_migrations(url, tmp_path, [("ghost", versions)])
+    # ... and applying must not silently apply nothing either.
+    with pytest.raises(DudamelError, match="ghost"):
+        upgrade_all(url, tmp_path, [("ghost", versions)])
+
+
+def test_every_shipped_suite_lane_has_revisions() -> None:
+    """The rule above is only safe because no shipped app is legitimately empty."""
+    for app in ("habits", "notes", "tasks"):
+        versions = Path(str(files("dudamel") / "apps" / app / "migrations" / "versions"))
+        assert list(versions.glob("0*.py")), app
