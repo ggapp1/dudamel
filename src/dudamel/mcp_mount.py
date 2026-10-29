@@ -314,6 +314,28 @@ def _redact_url_label(url: str) -> str:
         return "<unparseable url>"
 
 
+# Runs to whitespace, a quote or an angle bracket and NOTHING narrower:
+# brackets open an IPv6 host (`http://[::1]:8000/...`) and parentheses are
+# legal in a query, so stopping at either left the rest of the URL -- the
+# token included -- outside the match and in the log. Over-matching a trailing
+# `)` of surrounding prose is harmless: it lands in the path, which is kept.
+_URL_IN_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"<>]+")
+
+
+def _redact_exception(e: BaseException) -> str:
+    """An exception's text with every URL in it cut down to scheme/host/path.
+
+    The server's `label` is redacted before it is logged, but the exception
+    beside it is not ours: `httpx.HTTPStatusError.__str__` embeds the full
+    request URL, so a server configured as `https://host/mcp?token=...` wrote
+    its token to the log on any auth failure. The message is kept (what failed
+    is what the operator needs), only the URLs inside it are reduced with the
+    same helper the label uses. Credentials NOT shaped like a URL cannot be
+    found this way; this closes the one shape the transport itself produces.
+    """
+    return _URL_IN_TEXT.sub(lambda m: _redact_url_label(m.group(0)), str(e))
+
+
 @dataclass(frozen=True)
 class MCPServerConfig:
     """One configured MCP server: either a stdio `command` or an HTTP `url`.
@@ -653,7 +675,9 @@ def _make_call_fn(
         Letting one escape `Tool.fn` would tear down the Router's task
         instead of producing an error tool-result the model can read.
         """
-        return RuntimeError(f"mcp tool {local_name} failed: {type(e).__name__}: {e}")
+        return RuntimeError(
+            f"mcp tool {local_name} failed: {type(e).__name__}: {_redact_exception(e)}"
+        )
 
     async def call(**kwargs: Any) -> str:
         # Resolved per call, never captured: Registry stores these Tool
@@ -1290,7 +1314,7 @@ class _MountedServer:
                 "mcp: error closing server %r (%s: %s) -- ignoring, best-effort",
                 self.config.label,
                 type(e).__name__,
-                e,
+                _redact_exception(e),
             )
 
     async def _open_transport(self, stack: AsyncExitStack) -> tuple[Any, Any]:
@@ -1450,7 +1474,7 @@ class _MountedServer:
                     budget,
                     self.config.label,
                     type(error).__name__,
-                    error,
+                    _redact_exception(error),
                 )
                 delay = self.reconnect_backoff_seconds * (2**attempt)
             cooldown = self.reconnect_cooldown_seconds
@@ -1564,7 +1588,7 @@ class _MountedServer:
                 "mcp: server %r did not shut down cleanly (%s: %s) -- ignoring, best-effort",
                 self.config.label,
                 type(error).__name__,
-                error,
+                _redact_exception(error),
             )
         if not supervisor.done():
             # It answered "stop" but has not finished unwinding. Give it a
@@ -1792,7 +1816,7 @@ class MCPMount:
                     "mcp: server %r failed to mount (%s: %s) -- skipping; core unaffected",
                     label,
                     type(e).__name__,
-                    e,
+                    _redact_exception(e),
                 )
                 if server is not None:
                     await server.close()

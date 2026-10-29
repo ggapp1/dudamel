@@ -226,3 +226,61 @@ async def test_per_server_env_reaches_the_subprocess(monkeypatch: pytest.MonkeyP
         assert await read_env.fn(name="DUDAMEL_TEST_VAR") == "per-server-value"
     finally:
         await mount.close()
+
+
+async def test_a_query_string_token_in_a_failure_never_reaches_the_logs(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`HTTPStatusError.__str__` embeds the full request URL, `?token=...`
+    included. The label was redacted but the exception text beside it was not,
+    so any 401 from a token-in-URL server wrote the secret to the log."""
+    import httpx2
+
+    secret_url = "https://host.example/mcp?token=SECRET-QUERY-TOKEN"
+
+    async def unauthorized(self: object, stack: object) -> None:
+        response = httpx2.Response(401, request=httpx2.Request("GET", secret_url))
+        response.raise_for_status()
+
+    monkeypatch.setattr(mcp_mount._MountedServer, "_open_transport", unauthorized)
+    caplog.set_level("DEBUG")
+    mount = MCPMount(
+        [MCPServerConfig(url=secret_url)], reconnect_attempts=1, reconnect_backoff_seconds=0
+    )
+    assert await mount.mount() == []
+    await mount.close()
+
+    assert any("failed to mount" in r.getMessage() for r in caplog.records)
+    for record in caplog.records:
+        assert "SECRET-QUERY-TOKEN" not in record.getMessage()
+        assert "SECRET-QUERY-TOKEN" not in (record.exc_text or "")
+    assert "SECRET-QUERY-TOKEN" not in caplog.text
+    # The message is redacted, not dropped: the operator still sees what failed.
+    assert any("401 Unauthorized" in r.getMessage() for r in caplog.records)
+
+
+def test_redact_exception_text_keeps_the_prose_and_drops_url_secrets() -> None:
+    err = RuntimeError(
+        "boom for url 'https://u:pw@h.example:8443/mcp?token=S#frag' (see http://x/y)"
+    )
+    assert mcp_mount._redact_exception(err) == (
+        "boom for url 'https://h.example:8443/mcp' (see http://x/y)"
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://[::1]:8000/mcp?token=SECRET",
+        "https://h.example/mcp?token=ab(SECRET)",
+        "https://h.example/mcp?token=ab[SECRET]",
+        "https://h.example/mcp?token=SECRET",
+    ],
+    ids=["ipv6-host", "parens-in-query", "brackets-in-query", "bare-unquoted"],
+)
+def test_redact_exception_text_drops_the_query_whatever_the_url_contains(url: str) -> None:
+    """The match must cover the whole URL, not stop at the first bracket or
+    parenthesis: an IPv6 host starts with `[`, and both are legal in a query,
+    so a narrower class left the token outside the match and in the log."""
+    for text in (f"Client error '401' for url '{url}'", f"failed: {url}"):
+        assert "SECRET" not in mcp_mount._redact_exception(RuntimeError(text))
