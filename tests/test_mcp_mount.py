@@ -27,6 +27,7 @@ from dudamel.exceptions import RegistryError, ToolValidationError
 from dudamel.llm.testing import FakeProvider, fake_text, fake_tool_call
 from dudamel.mcp_mount import (
     CALL_TIMEOUT,
+    MAX_TOOLS_PER_SERVER,
     ROUTER_TIMEOUT_MARGIN_SECONDS,
     MCPMount,
     MCPServerConfig,
@@ -797,6 +798,49 @@ def test_dropped_oversized_tool_does_not_burn_its_name(
             seen_names=seen,
         )
     assert seen == set()
+
+
+def test_a_server_advertising_too_many_tools_is_capped_with_one_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Per-tool caps are defeated by sheer count: thousands of tiny tools still
+    flood every request. Excess tools are dropped, with ONE warning naming the
+    server and the counts (not one per tool)."""
+    extra = 25
+    advertised = [_mcp_tool(f"t{i}") for i in range(MAX_TOOLS_PER_SERVER + extra)]
+    seen: set[str] = set()
+    with caplog.at_level(logging.WARNING):
+        tools = _collect_server_tools(
+            _MountedServer(MCPServerConfig(command="unused")),
+            server_name="flood",
+            command="cmd",
+            mcp_tools=advertised,
+            seen_names=seen,
+        )
+    assert len(tools) == MAX_TOOLS_PER_SERVER
+    assert tools[0].name == "flood__t0"  # the first ones win, in order
+    warnings = [r for r in caplog.records if "tool cap" in r.getMessage()]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "'flood'" in message
+    assert str(MAX_TOOLS_PER_SERVER + extra) in message
+    assert f"dropping {extra}" in message
+    assert len(seen) == MAX_TOOLS_PER_SERVER  # dropped tools claim no name
+
+
+def test_a_server_at_the_tool_cap_is_not_warned_about(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        tools = _collect_server_tools(
+            _MountedServer(MCPServerConfig(command="unused")),
+            server_name="exact",
+            command="cmd",
+            mcp_tools=[_mcp_tool(f"t{i}") for i in range(MAX_TOOLS_PER_SERVER)],
+            seen_names=set(),
+        )
+    assert len(tools) == MAX_TOOLS_PER_SERVER
+    assert "tool cap" not in caplog.text
 
 
 def test_oversized_description_is_truncated_not_dropped() -> None:
