@@ -621,7 +621,8 @@ def test_doctor_does_not_call_layout_ids_dead_when_the_assistant_cannot_import(
     monkeypatch.chdir(target)
     capsys.readouterr()
 
-    assert cli.main(["doctor"]) == 0
+    # An assistant that cannot import is a failure: `dudamel run` stops there.
+    assert cli.main(["doctor"]) == 1
     out = capsys.readouterr().out
     assert "raised on import" in out
     assert "is not a registered widget" not in out
@@ -712,37 +713,96 @@ def test_doctor_reports_missing_web_token(
     (target / ".env").write_text("")
     monkeypatch.chdir(target)
 
+    # Loopback: `run` starts and only logs that login is impossible -- a warning.
     assert cli.main(["doctor"]) == 0
     out = capsys.readouterr().out
-    assert "✗ web token" in out
+    assert "⚠ web token" in out
 
 
-def test_doctor_on_non_project_dir_reports_app_import_failure_not_crash(
+def test_doctor_outside_a_project_says_so_once_and_exits_1(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """No dudamel.toml: one clear line with the remedy, not a cascade of
+    unrelated checks against defaults."""
     monkeypatch.chdir(tmp_path)
-    assert cli.main(["doctor"]) == 0
-    out = capsys.readouterr().out
-    assert "✗ app import" in out
+    assert cli.main(["doctor"]) == 1
+    captured = capsys.readouterr()
+    assert "no dudamel.toml" in captured.err
+    assert "dudamel new <name>" in captured.err
+    assert "✗" not in captured.out + captured.err
+    assert captured.out == ""
+    assert not list(tmp_path.glob("*.db"))
 
 
-def test_doctor_in_non_project_dir_does_not_create_database(
+def test_doctor_does_not_create_a_database_in_a_fresh_project(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Regression test: doctor in non-project dir should not create .db file."""
-    monkeypatch.chdir(tmp_path)
+    """Regression test: doctor must not be what creates the .db file, and a
+    database `run` has yet to create is a state (ℹ), not a failure."""
+    target = scaffold(tmp_path)
+    monkeypatch.chdir(target)
+    capsys.readouterr()
 
-    # Run doctor in empty temp dir
     assert cli.main(["doctor"]) == 0
     out = capsys.readouterr().out
 
-    # Verify output mentions database not created
-    assert "✗ database" in out
-    assert "not created yet" in out
+    assert "ℹ database connection: not created yet" in out
+    assert not list(target.glob("*.db")), "doctor must not create the database"
 
-    # Verify no .db file was created
-    db_files = list(tmp_path.glob("*.db"))
-    assert len(db_files) == 0, f"doctor should not create .db file, but found: {db_files}"
+
+def test_doctor_telegram_disabled_is_informational_and_keeps_exit_0(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target = scaffold(tmp_path)
+    monkeypatch.chdir(target)
+    monkeypatch.delenv("DUDAMEL_TELEGRAM_TOKEN", raising=False)
+    capsys.readouterr()
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "ℹ telegram:" in out
+    assert "✗" not in out
+
+
+def test_doctor_exits_1_on_pending_migrations_when_auto_migrate_is_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With `auto_migrate` off the startup gate refuses to start on a pending
+    tier, so doctor must fail; with it on (the default) `run` applies them
+    itself and doctor only informs."""
+    target = scaffold_with_local_app(tmp_path)
+    monkeypatch.chdir(target)
+    assert cli.main(["db", "migrate", "-m", "init"]) == 0
+    # a new model -> a revision that exists on disk but is not applied
+    (target / "apps" / "notebook.py").write_text(
+        LOCAL_APP + '\n\nclass Extra(app.Model, table="extras"):\n    name: str\n'
+    )
+    capsys.readouterr()
+    # Put the db behind head by deleting the applied lane's version row.
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine(f"sqlite:///{target / 'dudamel.db'}")
+    with engine.begin() as conn:
+        tables = [
+            r[0]
+            for r in conn.execute(
+                text("SELECT name FROM sqlite_master WHERE name LIKE 'alembic_version%'")
+            )
+        ]
+        lane = next(t for t in tables if t != "alembic_version_core")
+        conn.execute(text(f"DELETE FROM {lane}"))
+    engine.dispose()
+
+    assert cli.main(["doctor"]) == 0  # auto_migrate on: run would apply it
+    out = capsys.readouterr().out
+    assert "ℹ pending migrations: app schema is behind head" in out
+
+    config = target / "dudamel.toml"
+    config.write_text("auto_migrate = false\n" + config.read_text())
+    assert cli.main(["doctor"]) == 1
+    out = capsys.readouterr().out
+    assert "✗ pending migrations: app schema is behind head" in out
+    assert "refuse to start" in out
 
 
 def test_doctor_without_probe_tools_does_not_call_the_backend(
@@ -783,7 +843,8 @@ def test_doctor_probe_tools_runs_probe_per_tier_and_reports_the_remedy(
 
     monkeypatch.setattr(cli, "_probe_tier_tool_calling", _fake_probe)
 
-    assert cli.main(["doctor", "--probe-tools"]) == 0
+    # A failed probe is a configured feature that does not work: exit 1.
+    assert cli.main(["doctor", "--probe-tools"]) == 1
     out = capsys.readouterr().out
     assert sorted(calls) == ["fast", "standard"]
     remedy = 'no usable native tool calling — set tool_calling = "prompted"'
@@ -1014,7 +1075,7 @@ def test_doctor_reports_an_unpinned_day_boundary_for_an_app_that_keys_days(
 
     assert cli.main(["doctor"]) == 0
     out = capsys.readouterr().out
-    assert f"\u2713 day boundary: habits cut days at Pacific/Auckland, {BOUNDARY_TAIL}" in out
+    assert f"\u2139 day boundary: habits cut days at Pacific/Auckland, {BOUNDARY_TAIL}" in out
 
 
 def test_doctor_names_every_enabled_app_that_keys_days(
@@ -1032,7 +1093,7 @@ def test_doctor_names_every_enabled_app_that_keys_days(
     assert cli.main(["doctor"]) == 0
     out = capsys.readouterr().out
     assert (
-        f"\u2713 day boundary: tasks and habits cut days at Pacific/Auckland, "
+        f"\u2139 day boundary: tasks and habits cut days at Pacific/Auckland, "
         f"{BOUNDARY_TAIL}" in out
     )
 

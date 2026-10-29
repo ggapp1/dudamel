@@ -336,7 +336,7 @@ def test_doctor_reports_app_errors_without_dying(
     register(monkeypatch)
     project = write_project(tmp_path, "[apps.ghost]\nenabled = true\n")
     monkeypatch.chdir(project)
-    assert main(["doctor"]) == 0
+    assert main(["doctor"]) == 1
     out = capsys.readouterr().out
     assert "ghost" in out
     assert "app resolution" in out
@@ -378,12 +378,12 @@ def test_doctor_sees_a_pending_suite_lane(
     """The startup gate refuses to start on a pending suite lane, so doctor
     has to report the same lane rather than a clean bill of health."""
     versions = install_papers(tmp_path, monkeypatch, revision=True)
-    project = write_project(tmp_path, "[apps.papers]\nenabled = true\n")
+    project = write_project(tmp_path, "auto_migrate = false\n[apps.papers]\nenabled = true\n")
     url = db_url_for(project)
     upgrade_core(url)  # core is current; only the app lane is not
     monkeypatch.chdir(project)
 
-    assert main(["doctor"]) == 0
+    assert main(["doctor"]) == 1
     out = capsys.readouterr().out
     assert "pending migrations" in out
     assert "app 'papers' schema is behind head" in out
@@ -417,7 +417,7 @@ def test_doctor_survives_an_assistant_that_raises(
     register(monkeypatch)
     project = write_project(tmp_path, "", assistant="raise ValueError('boom')\n")
     monkeypatch.chdir(project)
-    assert main(["doctor"]) == 0
+    assert main(["doctor"]) == 1
     out = capsys.readouterr().out
     assert "boom" in out
     assert "database connection" in out
@@ -432,7 +432,7 @@ def test_doctor_reads_the_project_lane_from_settings_project_dir(
     would let doctor report a green schema on a project whose unapplied lane
     the startup gate then refuses to start on."""
     register(monkeypatch)
-    project = write_project(tmp_path, 'project_dir = "sub"\n')
+    project = write_project(tmp_path, 'auto_migrate = false\nproject_dir = "sub"\n')
     sub = project / "sub"
     sub.mkdir()
     url = db_url_for(project)
@@ -442,7 +442,7 @@ def test_doctor_reads_the_project_lane_from_settings_project_dir(
     assert not (project / "migrations").exists()
     monkeypatch.chdir(project)
 
-    assert main(["doctor"]) == 0
+    assert main(["doctor"]) == 1
     out = capsys.readouterr().out
     assert "✗ pending migrations: app schema is behind head" in out
     assert "✓ app migrations dir: present (1 revision)" in out
@@ -474,7 +474,7 @@ def test_db_migrate_writes_the_lane_doctor_asks_for(
     (project / "sub").mkdir()
     monkeypatch.chdir(project)
 
-    assert main(["doctor"]) == 0
+    assert main(["doctor"]) == 1
     assert "✗ app migrations dir: migrations/ not found" in capsys.readouterr().out
 
     assert main(["db", "migrate", "-m", "init"]) == 0
@@ -532,7 +532,7 @@ def test_doctor_reports_a_cross_app_tool_collision_instead_of_dying(
         tmp_path, "[apps.papers]\nenabled = true\n", assistant=COLLIDING_ASSISTANT
     )
     monkeypatch.chdir(project)
-    assert main(["doctor"]) == 0
+    assert main(["doctor"]) == 1
     out = capsys.readouterr().out
     assert "app resolution: 2 enabled" in out
     assert "✗ tool table" in out

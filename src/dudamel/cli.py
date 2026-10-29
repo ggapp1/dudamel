@@ -32,6 +32,7 @@ from functools import partial
 from importlib.resources import files
 from pathlib import Path
 from types import ModuleType
+from typing import Literal
 
 import httpx
 from dotenv import load_dotenv
@@ -66,7 +67,7 @@ from dudamel.resolve import Resolution, resolve_apps
 from dudamel.resolve import _is_enabled as _suite_app_enabled
 from dudamel.runtime import build_provider
 from dudamel.serve import serve
-from dudamel.web.api import resolve_cookie_secure
+from dudamel.web.api import is_loopback_host, resolve_cookie_secure
 from dudamel.web.auth import resolve_token as resolve_web_token
 
 __all__ = ["main"]
@@ -324,8 +325,22 @@ def cmd_db_migrate(args: argparse.Namespace) -> int:
 # --- doctor ------------------------------------------------------------------
 
 
-def _line(ok: bool, label: str, detail: str) -> str:
-    return f"{'✓' if ok else '✗'} {label}: {detail}"
+# A doctor line's severity. `True` is a pass and `False` is a FAILURE: the one
+# state that makes `doctor` exit 1, so it is reserved for what would stop
+# `dudamel run` from starting or leave a configured feature broken. "warn" is a
+# real problem that does not stop anything (a typo'd layout id is skipped at
+# render time; an LLM backend that is merely not up yet) and "info" is a normal
+# state that only wants a sentence (Telegram not configured, no Tailscale, a
+# database `run` has yet to create). Neither moves the exit code -- otherwise
+# every fresh checkout would exit non-zero and CI could not tell "broken" from
+# "not set up yet".
+Status = bool | Literal["warn", "info"]
+
+_GLYPHS = {True: "✓", False: "✗", "warn": "⚠", "info": "ℹ"}
+
+
+def _line(status: Status, label: str, detail: str) -> str:
+    return f"{_GLYPHS[status]} {label}: {detail}"
 
 
 def _sqlite_file_path(db_url: str) -> Path | None:
@@ -339,11 +354,13 @@ def _sqlite_file_path(db_url: str) -> Path | None:
         return None  # :memory: / path-less sqlite -- nothing on disk to check
 
 
-def _check_db_connect(db_url: str) -> tuple[bool, str]:
-    # For SQLite, check if the database file exists before trying to connect
+def _check_db_connect(db_url: str) -> tuple[Status, str]:
+    # For SQLite, check if the database file exists before trying to connect.
+    # Informational, not a failure: `dudamel run` creates the file, so its
+    # absence on a fresh project is the normal state, not a fault.
     path = _sqlite_file_path(db_url)
     if path is not None and not path.exists():
-        return False, "not created yet (run `dudamel run` first)"
+        return "info", "not created yet (run `dudamel run` first)"
     try:
         engine = create_engine(sync_url(db_url))
         try:
@@ -356,13 +373,24 @@ def _check_db_connect(db_url: str) -> tuple[bool, str]:
     return True, f"connected to {db_url!r}"
 
 
-def _check_core_migrations(db_url: str) -> tuple[bool, str]:
+def _behind_status(auto_migrate: bool) -> Status:
+    """How serious an unapplied migration is, judged the way startup judges it.
+
+    With `auto_migrate` (the default) `dudamel run` applies whatever is pending
+    itself, so a schema that is behind is just the next run's work: info. With
+    it off the startup gate REFUSES to start on a pending tier -- that is the
+    failure doctor exists to catch before a restart does."""
+    return "info" if auto_migrate else False
+
+
+def _check_core_migrations(db_url: str, *, auto_migrate: bool = True) -> tuple[Status, str]:
+    behind = _behind_status(auto_migrate)
     # For SQLite, check if database file exists before trying to connect
     # (avoid creating an empty database file when just running doctor)
     path = _sqlite_file_path(db_url)
     if path is not None and not path.exists():
         return (
-            False,
+            behind,
             "not yet applied — run `dudamel run` or `dudamel db migrate -m <msg>` once",
         )
     try:
@@ -375,14 +403,17 @@ def _check_core_migrations(db_url: str) -> tuple[bool, str]:
     if current == heads:
         return True, "at head"
     if not current:
-        return False, "not yet applied — run `dudamel run` or `dudamel db migrate -m <msg>` once"
-    return False, f"behind head ({sorted(current)} != {sorted(heads)})"
+        return behind, "not yet applied — run `dudamel run` or `dudamel db migrate -m <msg>` once"
+    return behind, f"behind head ({sorted(current)} != {sorted(heads)})"
 
 
-def _check_app_migrations_dir(project_dir: Path, *, any_local_apps: bool) -> tuple[bool, str]:
+def _check_app_migrations_dir(project_dir: Path, *, any_local_apps: bool) -> tuple[Status, str]:
     mig_dir = project_dir / "migrations"
     if not mig_dir.exists():
-        return False, "migrations/ not found — run `dudamel db migrate -m init` to create it"
+        # A failure only when a local app has models that need a lane; with
+        # none there is nothing the directory would hold.
+        status: Status = False if any_local_apps else "info"
+        return status, "migrations/ not found — run `dudamel db migrate -m init` to create it"
     revisions = list((mig_dir / "versions").glob("*.py")) if (mig_dir / "versions").exists() else []
     if not revisions:
         # LOCAL apps, not every resolved app: `cmd_db_migrate` autogenerates
@@ -398,8 +429,12 @@ def _check_app_migrations_dir(project_dir: Path, *, any_local_apps: bool) -> tup
 
 
 def _check_pending_migrations(
-    db_url: str, project_dir: Path, suite_lanes: Sequence[tuple[str, Path]]
-) -> tuple[bool, str]:
+    db_url: str,
+    project_dir: Path,
+    suite_lanes: Sequence[tuple[str, Path]],
+    *,
+    auto_migrate: bool = True,
+) -> tuple[Status, str]:
     """Every tier the startup gate would refuse to start on.
 
     Deliberately the SAME call the gate makes (`migrate.pending_migrations`
@@ -411,17 +446,31 @@ def _check_pending_migrations(
     if path is not None and not path.exists():
         # Connecting would CREATE the file; doctor must not be what creates a
         # project's database (`_check_db_connect` already reported this).
-        return False, "not created yet — run `dudamel run` or `dudamel db migrate -m <msg>` once"
+        return (
+            _behind_status(auto_migrate),
+            "not created yet — run `dudamel run` or `dudamel db migrate -m <msg>` once",
+        )
     try:
         pending = pending_migrations(db_url, project_dir, suite_lanes)
     except Exception as e:
         return False, f"could not read migration state ({e})"
     if pending:
-        return False, "; ".join(pending) + " — run `dudamel db migrate -m <msg>`"
+        detail = "; ".join(pending)
+        if auto_migrate:
+            return "info", detail + " — `dudamel run` will apply them (auto_migrate is on)"
+        return (
+            False,
+            detail + " — auto_migrate is off, so `dudamel run` would refuse to start; "
+            "run `dudamel db migrate -m <msg>`",
+        )
     return True, "none — every lane is at head"
 
 
-def _check_tier(cfg: TierConfig) -> tuple[bool, str]:
+def _check_tier(cfg: TierConfig) -> tuple[Status, str]:
+    # Misconfiguration (no base_url, key env unset) is a failure -- the Runtime
+    # refuses to build the tier. A backend that does not answer is only a
+    # warning: `run` starts without it, and the usual reason is that the local
+    # server (Ollama) has not been started yet.
     if cfg.provider == "openai-compatible":
         if not cfg.base_url:
             return False, "no base_url configured"
@@ -429,10 +478,10 @@ def _check_tier(cfg: TierConfig) -> tuple[bool, str]:
         try:
             resp = httpx.get(url, timeout=2.0)
         except httpx.HTTPError as e:
-            return False, f"{url} unreachable ({e.__class__.__name__})"
+            return "warn", f"{url} unreachable ({e.__class__.__name__})"
         if resp.status_code < 400:
             return True, f"{url} reachable"
-        return False, f"{url} returned HTTP {resp.status_code}"
+        return "warn", f"{url} returned HTTP {resp.status_code}"
     if cfg.provider == "anthropic":
         env = cfg.api_key_env or "ANTHROPIC_API_KEY"
         if os.environ.get(env):
@@ -454,19 +503,23 @@ def _probe_tier_tool_calling(name: str, cfg: TierConfig) -> tuple[bool, str]:
         return False, f"probe could not run ({type(e).__name__}: {e})"
 
 
-def _check_telegram(settings: Settings) -> tuple[bool, str]:
+def _check_telegram(settings: Settings) -> tuple[Status, str]:
     token = resolve_telegram_token(settings)
     if not token:
-        return False, f"{settings.telegram.token_env} not set — disabled (optional)"
+        return "info", f"{settings.telegram.token_env} not set — disabled (optional)"
     n = len(settings.telegram.allowed_user_ids)
     groups = "allowed" if settings.telegram.allow_groups else "blocked"
     return True, f"token configured, {n} allowed user id(s), groups {groups}"
 
 
-def _check_web_token(settings: Settings) -> tuple[bool, str]:
+def _check_web_token(settings: Settings) -> tuple[Status, str]:
     token = resolve_web_token(settings)
     if not token:
-        return False, f"{settings.web.token_env} not set — dashboard login impossible"
+        # Judged the way `create_api` judges it: off-box without a token it
+        # REFUSES to start (a failure); on loopback it starts and only logs
+        # that the dashboard cannot be logged into (a warning).
+        status: Status = "warn" if is_loopback_host(settings.web.host) else False
+        return status, f"{settings.web.token_env} not set — dashboard login impossible"
     return True, f"{settings.web.token_env} is set"
 
 
@@ -490,7 +543,7 @@ def _check_timezone(settings: Settings) -> tuple[bool, str]:
 _DAY_KEYED_APPS = ("tasks", "habits")
 
 
-def _check_day_boundary(settings: Settings, resolution: Resolution) -> tuple[bool, str] | None:
+def _check_day_boundary(settings: Settings, resolution: Resolution) -> tuple[Status, str] | None:
     """Report an unpinned, host-derived day boundary under the apps that store
     days -- what is true and checkable from config, and nothing more.
 
@@ -530,7 +583,7 @@ def _check_day_boundary(settings: Settings, resolution: Resolution) -> tuple[boo
     zone = resolve_timezone(settings)
     if str(zone) == "UTC":
         return None
-    return True, (
+    return "info", (
         f"{' and '.join(named)} cut days at {zone}, the host's zone \u2014 unpinned, "
         "so it follows /etc/localtime. Set a top-level "
         f'timezone = "{zone}" in dudamel.toml to hold it; see "Upgrading" in the '
@@ -538,7 +591,7 @@ def _check_day_boundary(settings: Settings, resolution: Resolution) -> tuple[boo
     )
 
 
-def _check_cookie_secure(settings: Settings) -> tuple[bool, str]:
+def _check_cookie_secure(settings: Settings) -> tuple[Status, str]:
     """Report the RESOLVED session-cookie `Secure` posture against the scheme
     doctor actually prints (always `http://` — see `_check_tailscale`).
 
@@ -561,7 +614,10 @@ def _check_cookie_secure(settings: Settings) -> tuple[bool, str]:
         )
         return True, f"{value} (explicit) — {flags}"
     if secure:
-        return False, (
+        # A warning, not a failure: doctor cannot tell a plain-HTTP tailnet
+        # (login loops) from a TLS proxy in front of this bind (correct as
+        # derived), and a heuristic that guesses wrong must not fail the run.
+        return "warn", (
             f"true (derived from non-loopback bind host {settings.web.host!r}) — "
             "dashboard URLs above are http://, and a browser will not store a Secure "
             "cookie on a plain-HTTP origin (the login page just loops); for plain-HTTP "
@@ -595,8 +651,8 @@ def _check_tailscale(settings: Settings) -> str:
         return _line(True, "tailscale", f"connected — dashboard: {dashboard}")
     if Path("/Applications/Tailscale.app").exists():
         detail = f"installed but not running — dashboard: {dashboard} (loopback only)"
-        return _line(False, "tailscale", detail)
-    return _line(False, "tailscale", f"not detected — dashboard: {dashboard} (loopback only)")
+        return _line("info", "tailscale", detail)
+    return _line("info", "tailscale", f"not detected — dashboard: {dashboard} (loopback only)")
 
 
 def _render_tool_table(orchestrator: Orchestrator) -> str:
@@ -653,6 +709,16 @@ def _load_orchestrator_for_diagnosis(
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     project_dir = Path.cwd()
+    # Without a dudamel.toml this is not a project, and every check below would
+    # report on defaults for a directory `dudamel run` could never start in --
+    # a cascade of unrelated lines that buries the one thing wrong. Say it once.
+    if not (project_dir / "dudamel.toml").exists():
+        print(
+            f"dudamel: no dudamel.toml in {project_dir} -- this is not a dudamel project. "
+            "Create one with `dudamel new <name>`, or cd into an existing project.",
+            file=sys.stderr,
+        )
+        return 1
     _load_dotenv_into_environ(project_dir)
     settings = Settings.load(project_dir)
     # Resolved up front, non-strict: the migration check below needs the
@@ -661,11 +727,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     orchestrator, import_error = _load_orchestrator_for_diagnosis(project_dir, debug=args.debug)
     resolution = resolve_apps(orchestrator, settings, strict=False)
 
-    ok, detail = _check_db_connect(settings.database_url)
-    lines = [_line(ok, "database connection", detail)]
+    # Every ✗ (and only a ✗) is a failure that makes doctor exit 1; see `Status`.
+    # Lines are collected through `emit` so the verdict cannot drift from what
+    # was printed.
+    failed = False
+    lines: list[str] = []
 
-    ok, detail = _check_core_migrations(settings.database_url)
-    lines.append(_line(ok, "core migrations", detail))
+    def emit(status: Status, label: str, detail: str) -> None:
+        nonlocal failed
+        failed = failed or status is False
+        lines.append(_line(status, label, detail))
+
+    ok, detail = _check_db_connect(settings.database_url)
+    emit(ok, "database connection", detail)
+
+    ok, detail = _check_core_migrations(settings.database_url, auto_migrate=settings.auto_migrate)
+    emit(ok, "core migrations", detail)
 
     # `settings.project_dir`, not the cwd: an explicit `project_dir` in
     # dudamel.toml wins, and the runtime resolves the project's own migration
@@ -674,52 +751,55 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     ok, detail = _check_app_migrations_dir(
         settings.project_dir, any_local_apps=bool(resolution.local_apps)
     )
-    lines.append(_line(ok, "app migrations dir", detail))
+    emit(ok, "app migrations dir", detail)
 
-    lines.append(
-        _line(
-            not resolution.errors,
-            "app resolution",
-            f"{len(resolution.apps)} enabled, {len(resolution.errors)} error(s)",
-        )
+    emit(
+        not resolution.errors,
+        "app resolution",
+        f"{len(resolution.apps)} enabled, {len(resolution.errors)} error(s)",
     )
     for err in resolution.errors:
-        lines.append(_line(False, f"  app {err.app}", err.message))
+        emit(False, f"  app {err.app}", err.message)
 
     ok, detail = _check_pending_migrations(
-        settings.database_url, settings.project_dir, resolution.suite_lanes
+        settings.database_url,
+        settings.project_dir,
+        resolution.suite_lanes,
+        auto_migrate=settings.auto_migrate,
     )
-    lines.append(_line(ok, "pending migrations", detail))
+    emit(ok, "pending migrations", detail)
 
     if settings.llm_tiers:
         for name, cfg in settings.llm_tiers.items():
             ok, detail = _check_tier(cfg)
-            lines.append(_line(ok, f"llm tier {name!r}", detail))
+            emit(ok, f"llm tier {name!r}", detail)
         if args.probe_tools:
             for name, cfg in settings.llm_tiers.items():
                 ok, detail = _probe_tier_tool_calling(name, cfg)
-                lines.append(_line(ok, f"llm tier {name!r} tool calling", detail))
+                emit(ok, f"llm tier {name!r} tool calling", detail)
     else:
-        lines.append(_line(False, "llm tiers", "none configured in dudamel.toml"))
+        # `run` starts without a tier (the assistant just cannot answer), so
+        # this is a state to know about, not a fault.
+        emit("info", "llm tiers", "none configured in dudamel.toml")
 
     ok, detail = _check_telegram(settings)
-    lines.append(_line(ok, "telegram", detail))
+    emit(ok, "telegram", detail)
 
     ok, detail = _check_web_token(settings)
-    lines.append(_line(ok, "web token", detail))
+    emit(ok, "web token", detail)
 
     ok, detail = _check_timezone(settings)
-    lines.append(_line(ok, "timezone", detail))
+    emit(ok, "timezone", detail)
     boundary = _check_day_boundary(settings, resolution)
     if boundary is not None:
-        lines.append(_line(boundary[0], "day boundary", boundary[1]))
+        emit(boundary[0], "day boundary", boundary[1])
 
-    lines.append(_check_tailscale(settings))
+    lines.append(_check_tailscale(settings))  # informational only, never a failure
 
     # Last, so it reads against the dashboard URL the tailscale line just
     # printed -- that URL's scheme is what the cookie posture is judged by.
     ok, detail = _check_cookie_secure(settings)
-    lines.append(_line(ok, "cookie_secure", detail))
+    emit(ok, "cookie_secure", detail)
 
     print("\n".join(lines))
     print()
@@ -727,6 +807,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     configured = [wid for section in settings.home.section for wid in section.widgets]
 
     if import_error is not None:
+        failed = True  # `dudamel run` imports the same module and stops here
         print(_line(False, f"app import ({_DEFAULT_MODULE})", import_error))
     else:
         # Rendered from the RESOLVED apps, not from the project's own object:
@@ -752,6 +833,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             # message names the tool but not the apps' import sites.
             if args.debug:
                 raise
+            failed = True  # the same collision stops `dudamel run`
             table = _line(False, "tool table", str(e))
         print(table)
         # `doctor` never starts the orchestrator, so MCP-mounted tools (only
@@ -770,8 +852,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         # once at its first mention), which is the right runtime behaviour and
         # exactly why they need a voice here: otherwise a typo in
         # `[[home.section]]` is indistinguishable from a widget that never ran.
-        # Reported, never fatal -- doctor's exit code says nothing about a
-        # layout, the same as every other ✗ line it prints.
+        # Reported as a warning, never fatal -- doctor's exit code says nothing
+        # about a layout: `run` starts fine and the dashboard just skips the id.
         #
         # Inside the `else`, and for the same reason the tool table is: with no
         # importable assistant there are no resolved apps, so EVERY configured
@@ -790,16 +872,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         registered = {w.qualified_id for app in resolution.apps for w in app.widgets.values()}
         for wid in configured:
             if wid not in registered:
-                print(_line(False, "home layout", f"{wid} is not a registered widget"))
+                print(_line("warn", "home layout", f"{wid} is not a registered widget"))
 
     # Second half, unguarded: this one reads config against itself and needs no
     # registry at all, so a broken assistant.py does not make it unanswerable.
     seen: set[str] = set()
     for wid in configured:
         if wid in seen:
-            print(_line(False, "home layout", f"{wid} is listed more than once"))
+            print(_line("warn", "home layout", f"{wid} is listed more than once"))
         seen.add(wid)
-    return 0
+    return 1 if failed else 0
 
 
 # --- apps list ---------------------------------------------------------------
