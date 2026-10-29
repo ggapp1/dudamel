@@ -150,6 +150,26 @@ def test_persona_default_keeps_the_original_identity_line(tmp_path) -> None:
     assert "Use the available tools" in msg.text
 
 
+async def test_unknown_tool_error_is_bounded_however_many_tools_are_registered(tmp_path) -> None:
+    """The error used to list every registered tool and echo the invented name
+    whole, and was the one tool result no cap applied to."""
+    long_name = "g" * 5000
+    script = [fake_tool_call(long_name, {}), fake_text("sorry")]
+    router, fp, db = make_router(tmp_path, script)
+    for i in range(300):
+        router._registry.tools[f"mcp_tool_{i:03d}"] = _mcp_tool(f"mcp_tool_{i:03d}", "d")
+    total = len(router._registry.tools)
+
+    await router.handle(channel="t:1", text="x", user_id="u1")
+    err = [m for m in fp.calls[1]["messages"] if m.role == "tool"][0]
+    assert err.is_error and "unknown tool" in err.text
+    assert f"and {total - 20} more" in err.text
+    assert err.text.count("mcp_tool_") <= 20
+    assert "g" * 100 not in err.text
+    assert len(err.text) < 1000
+    await db.dispose()
+
+
 async def test_unknown_tool_fed_back(tmp_path) -> None:
     script = [fake_tool_call("ghost_tool", {}), fake_text("sorry")]
     router, fp, db = make_router(tmp_path, script)

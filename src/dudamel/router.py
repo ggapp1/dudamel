@@ -39,6 +39,11 @@ from dudamel.models_core import PendingConfirmation
 from dudamel.registry import Registry
 from dudamel.window import build_window, estimate_tokens, truncate_tool_result
 
+# How much of the registry an "unknown tool" error spells out, and how much of
+# the model's invented name it echoes back.
+_UNKNOWN_TOOL_LISTED = 20
+_UNKNOWN_TOOL_NAME_CHARS = 64
+
 logger = logging.getLogger("dudamel.router")
 
 
@@ -812,13 +817,24 @@ class Router:
             if action == "run":
                 outcome.results.append(await tasks[idx])
             elif action == "unknown":
-                available = ", ".join(sorted(self._registry.tools))
+                # Bounded twice over, because both halves are open-ended: the
+                # name is whatever the model invented (and it can be as long as
+                # it likes), and the registry can hold hundreds of MCP tools.
+                # This was the one tool result nothing truncated.
+                names = sorted(self._registry.tools)
+                available = ", ".join(names[:_UNKNOWN_TOOL_LISTED])
+                if len(names) > _UNKNOWN_TOOL_LISTED:
+                    available += f" and {len(names) - _UNKNOWN_TOOL_LISTED} more"
                 outcome.results.append(
-                    Message(
-                        role="tool",
-                        text=f"unknown tool {call.name!r}; available tools: {available}",
-                        tool_call_id=call.id,
-                        is_error=True,
+                    truncate_tool_result(
+                        Message(
+                            role="tool",
+                            text=f"unknown tool {call.name[:_UNKNOWN_TOOL_NAME_CHARS]!r}; "
+                            f"available tools: {available}",
+                            tool_call_id=call.id,
+                            is_error=True,
+                        ),
+                        self._config.tool_result_cap,
                     )
                 )
             elif action == "skip":
