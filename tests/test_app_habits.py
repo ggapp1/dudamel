@@ -123,6 +123,31 @@ async def test_tick_reports_already_for_a_row_it_did_not_write(habits_app, monke
     assert await _tick_count(habits_app) == 1
 
 
+async def test_tick_race_backstop_reports_already_instead_of_raising(habits_app, monkeypatch):
+    """The IntegrityError branch: the read guard misses (a concurrent tick
+    landed after it) and the unique constraint catches the insert. The branch
+    rolls back, which expires ORM objects -- reading `habit.name` afterwards
+    lazy-loads on an AsyncSession and raises MissingGreenlet. The guard is
+    blinded here so the backstop, not the guard, is what answers."""
+    from dudamel.apps import habits as habits_module
+    from dudamel.apps.habits import Tick, tick_habit
+
+    habit_id = await _habit_id(habits_app, "floss")
+    _freeze_app_clock(monkeypatch, TODAY_AT_MIDDAY)
+    async with habits_app.db() as session:
+        session.add(Tick(habit_id=habit_id, day=TODAY))
+
+    async def guard_misses(session, habit_id, day):
+        return None
+
+    monkeypatch.setattr(habits_module, "_tick_for", guard_misses)
+
+    reply = await tick_habit(habit_id)
+
+    assert reply == "Already ticked today: floss"
+    assert await _tick_count(habits_app) == 1
+
+
 async def test_ticking_a_missing_habit_reports_instead_of_raising(habits_app):
     from dudamel.apps.habits import tick_habit
 

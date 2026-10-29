@@ -70,8 +70,13 @@ async def tick_habit(habit_id: int) -> str:
         if habit is None:
             return f"No habit with id {habit_id}."
         day = app.today()
+        # Read once, up front: the backstop below rolls back, and a rollback
+        # expires every ORM object in the session, so touching `habit.name`
+        # afterwards would lazy-load on an AsyncSession and raise
+        # MissingGreenlet instead of giving the answer.
+        name = habit.name
         if await _tick_for(session, habit_id, day) is not None:
-            return f"Already ticked today: {habit.name}"
+            return f"Already ticked today: {name}"
         session.add(Tick(habit_id=habit_id, day=day))
         try:
             # Flushing here, rather than letting the commit raise on the way
@@ -82,8 +87,8 @@ async def tick_habit(habit_id: int) -> str:
             await session.flush()
         except IntegrityError:
             await session.rollback()
-            return f"Already ticked today: {habit.name}"
-        return f"Ticked: {habit.name}"
+            return f"Already ticked today: {name}"
+        return f"Ticked: {name}"
 
 
 @app.tool(action="Undo")
