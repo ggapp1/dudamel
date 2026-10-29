@@ -242,6 +242,13 @@ MAX_SCOPE_RECOVERIES = 2 * MAX_RECONNECT_ATTEMPTS
 # 8000, so a schema that wants a higher cap is already unusable here.
 MAX_SCHEMA_BYTES = 16384
 MAX_DESCRIPTION_CHARS = 1024
+# The same two channels again, multiplied: every tool a server advertises costs
+# its (capped) schema and description in every request, so a server listing
+# thousands of tiny tools defeats the per-tool caps above and floods the prompt
+# with attacker-chosen text before any call (and any taint). 64 is generous for
+# a real server -- the largest in common use ship a few dozen -- and, at the
+# per-tool caps, still bounds the advertised surface to a few hundred KiB.
+MAX_TOOLS_PER_SERVER = 64
 
 _REFUSAL = "MCP server-initiated callbacks are not supported in dudamel v1"
 
@@ -1630,7 +1637,13 @@ def _collect_server_tools(
     able to trigger.)
     """
     tools: list[Tool] = []
+    over_cap = 0
     for mcp_tool in mcp_tools:
+        if len(tools) >= MAX_TOOLS_PER_SERVER:
+            # Counted, not logged per tool: a hostile server could make the
+            # warnings themselves the flood.
+            over_cap += 1
+            continue
         name = mcp_tool_name(server_name, mcp_tool.name)
         if not TOOL_NAME_RE.match(name):
             logger.warning(
@@ -1694,6 +1707,17 @@ def _collect_server_tools(
                 confirm=destructive,
                 call_timeout=call_timeout,
             )
+        )
+    if over_cap:
+        logger.warning(
+            "mcp: server %r (%s) advertised %d tools, over the %d-tool cap -- "
+            "mounting the first %d and dropping %d",
+            server_name,
+            command,
+            len(tools) + over_cap,
+            MAX_TOOLS_PER_SERVER,
+            len(tools),
+            over_cap,
         )
     return tools
 
