@@ -327,6 +327,18 @@ class App:
         self._timezone = timezone
 
     def db(self) -> AbstractAsyncContextManager[AsyncSession]:
+        """A session that commits on a clean exit and rolls back on an exception.
+
+        It does NOT isolate reads from concurrent writers. SQLAlchemy's pysqlite
+        driver only emits `BEGIN` before the first DML statement, so a SELECT
+        inside this block runs in autocommit: another task's write can land
+        between your read and your write, and a read-modify-write built on
+        what you read loses updates (ten concurrent "read v, write v + 1" calls
+        ended at `v = 1`). For a read-modify-write, make the write atomic
+        (`update(T).where(...).values(v=T.v + 1)`, so the database does the
+        arithmetic) or put a unique constraint behind a check-then-insert and
+        handle the `IntegrityError`.
+        """
         if self._database is None:
             raise RuntimeNotBoundError(
                 f"app {self.name!r} has no database bound; Orchestrator binds it at run time"
