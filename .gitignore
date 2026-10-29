@@ -1,6 +1,12 @@
 # --- docs policy: only README.md ships with the repo ---
 *.md
 !README.md
+# Release-facing files that GitHub and PyPI look for by name. Allowed so they
+# can be added when wanted -- none of them exists yet, and /docs/ and the
+# planning ignores below stay exactly as they are.
+!CHANGELOG.md
+!SECURITY.md
+!CONTRIBUTING.md
 /docs/
 /SPEC.md
 /.superpowers/
