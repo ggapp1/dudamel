@@ -66,7 +66,9 @@ class JobRun(CoreBase):
     __tablename__ = "job_runs"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     job_id: Mapped[str] = mapped_column(String(255), index=True)
-    status: Mapped[str] = mapped_column(String(32))  # ok|error|timeout|skipped|misfired|cancelled
+    status: Mapped[str] = mapped_column(
+        String(32)
+    )  # running|ok|error|timeout|skipped|misfired|cancelled|interrupted
     started_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
