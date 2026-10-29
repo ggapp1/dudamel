@@ -330,3 +330,43 @@ def test_an_unknown_settings_key_is_refused(tasks_app):
 
     with pytest.raises(AppSettingsError):
         tasks_app.bind_settings({"horizon_dayz": 3})
+
+
+async def test_concurrent_completions_all_succeed_and_leave_the_task_done(tasks_app):
+    """complete_task is a read-then-write, but the write is idempotent (it sets
+    `done` to True, not "flip it"), so losing the race changes only which reply
+    each caller gets, never the data. `app.db()` gives no read isolation, so this
+    is the property the tool relies on -- pinned so it cannot become a toggle."""
+    import asyncio
+
+    from dudamel.apps.tasks import Task, add_task, complete_task
+
+    await add_task("race me")
+    async with tasks_app.db() as session:
+        task_id = (await session.execute(select(Task.id))).scalar_one()
+
+    replies = await asyncio.gather(*(complete_task(task_id) for _ in range(10)))
+
+    assert all(r.startswith(("Done:", "Already done:")) for r in replies)
+    async with tasks_app.db() as session:
+        assert (await session.get(Task, task_id)).done is True
+
+
+async def test_concurrent_deletes_do_not_raise(tasks_app):
+    """Two deletes of one row can both pass the read; the second DELETE matches
+    nothing. That must stay a harmless no-op, not an error surfaced to the model."""
+    import asyncio
+
+    from dudamel.apps.tasks import Task, add_task, delete_task
+
+    await add_task("doomed")
+    async with tasks_app.db() as session:
+        task_id = (await session.execute(select(Task.id))).scalar_one()
+
+    replies = await asyncio.gather(
+        *(delete_task(task_id, "doomed") for _ in range(5)), return_exceptions=True
+    )
+
+    assert not [r for r in replies if isinstance(r, BaseException)]
+    async with tasks_app.db() as session:
+        assert await session.get(Task, task_id) is None

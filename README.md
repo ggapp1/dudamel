@@ -129,6 +129,17 @@ picks the model up automatically — no separate schema file. Save a file
 like this under your project's `apps/` and add it to the list in
 `assistant.py` to run it.
 
+**Reads inside `app.db()` are not isolated.** `async with app.db() as db:`
+commits when the block exits cleanly and rolls back on an exception, but it
+gives you no isolation for reads: SQLAlchemy's SQLite driver only starts a
+transaction at the first write, so a `SELECT` runs outside any transaction and
+another request's write can land between your read and your write. A
+read-modify-write built on what you read (`row.n = row.n + 1`) therefore loses
+updates under concurrency. Do the arithmetic in the database instead, with an
+atomic statement such as `await db.execute(update(Counter).where(Counter.id ==
+1).values(n=Counter.n + 1))`, and back any check-then-insert with a unique
+constraint, catching the `IntegrityError` it raises for the loser of the race.
+
 **Dates inside an app.** `app.now()` is a column default and stores UTC. When
 you need *the operator's* day — a "due today", a streak, anything a person reads
 as a date — use `app.today()`, never `date.today()`: the server's clock is not
