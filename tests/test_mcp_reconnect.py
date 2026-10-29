@@ -8,11 +8,13 @@ second half drives the real reconnect path: a server is mounted, its
 process is `SIGKILL`ed out from under a live session, and the tool call
 that trips over the corpse is expected to rebuild the connection.
 
-Killing is done by pid, found with `pgrep` against a per-test server name,
-rather than through the fixture's own `die()` tool. `die()` is itself a
-tool call, so calling it would trigger the very reconnect the test is
-trying to observe; an external kill leaves the mount believing it is still
-healthy, which is the real-world shape of a server that crashes.
+Killing is done by pid, found with `pgrep` against a per-test server name
+and scoped to direct children of this pytest process (`pgrep -P`, so
+concurrent runs cannot kill each other's servers), rather than through the
+fixture's own `die()` tool. `die()` is itself a tool call, so calling it
+would trigger the very reconnect the test is trying to observe; an
+external kill leaves the mount believing it is still healthy, which is the
+real-world shape of a server that crashes.
 
 They spawn a real subprocess per `MCPMount`, same as `test_mcp_mount.py`.
 
@@ -250,8 +252,19 @@ async def test_flaky_fixture_advertises_all_five_tools_by_default(
 
 
 def _pids(pattern: str) -> list[int]:
-    """Pids whose full command line contains `pattern`, via `pgrep -f`."""
-    proc = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True)
+    """Pids of this process's own children whose command line contains `pattern`.
+
+    `pgrep -P <our pid>` restricts the search to direct children. A bare
+    `pgrep -f` searches the whole machine, so two pytest runs going at once
+    (two worktrees, a watcher beside a manual run) find each other's fixture
+    servers with the same name pattern and `SIGKILL` them mid-test; three
+    concurrent runs produced 25 spurious failures.
+    """
+    proc = subprocess.run(
+        ["pgrep", "-P", str(os.getpid()), "-f", pattern],
+        capture_output=True,
+        text=True,
+    )
     return [int(line) for line in proc.stdout.split() if line.strip()]
 
 
