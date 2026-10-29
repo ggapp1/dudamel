@@ -288,15 +288,14 @@ def test_upgrade_all_applies_lanes_in_name_order_whatever_order_they_are_passed(
 
 
 def test_upgrade_all_takes_a_backup_before_touching_a_lane(tmp_path) -> None:
-    """The single backup is the real undo for a lane that fails half-way (see
-    upgrade_all), so it must exist once upgrade_all has run."""
+    """The backup is the real undo for a lane that fails half-way (see
+    upgrade_all), so it must exist once upgrade_all has applied something."""
     url = db_url_for(tmp_path)
     upgrade_core(url)
-    backup = tmp_path / "x.db.bak"
-    assert not backup.exists()  # upgrade_core on a fresh file had nothing to back up
+    assert not list(tmp_path.glob("x.db.bak*"))  # fresh file: nothing to back up
 
     upgrade_all(
         url, tmp_path, [("notes", make_lane(tmp_path, "notes", body=CREATE_NOTES, rev="n1"))]
     )
 
-    assert backup.exists()
+    assert len(list(tmp_path.glob("x.db.bak-*"))) == 1

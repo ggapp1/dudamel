@@ -395,6 +395,17 @@ start instead of upgrading, and tells you to run `dudamel db migrate -m
 <message>` — which both autogenerates the pending migration and applies
 it (core and app schemas), not apply-only.
 
+**Backups.** On SQLite, whenever a migration is actually about to be applied
+(core, a built-in app's tables, or yours), dudamel first copies the database
+with SQLite's online backup API (safe in WAL mode) to
+`<database>.bak-<UTC timestamp>` next to the database file, e.g.
+`dudamel.db.bak-20261029T101500123456Z`. A start or `db migrate` with nothing
+to apply takes no backup, a run takes at most one, and earlier backups are
+never overwritten; the newest five are kept and older ones are deleted
+(only files with exactly that name pattern for this database). To restore
+one: stop the instance, copy the chosen backup over the database file, and
+delete the database's `-wal` and `-shm` sidecar files if present.
+
 App migrations resolve from `project_dir` (a `dudamel.toml`/`Settings` key,
 default the current directory) — the same `migrations/` that `dudamel db
 migrate` writes — not from `data_dir` (where the SQLite database and other
