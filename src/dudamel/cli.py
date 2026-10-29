@@ -55,8 +55,7 @@ from dudamel.migrate import (
     script_heads,
     suite_lane_pending,
     sync_url,
-    upgrade_all,
-    upgrade_core,
+    upgrade_database,
 )
 from dudamel.orchestrator import Orchestrator
 
@@ -283,8 +282,6 @@ def cmd_db_migrate(args: argparse.Namespace) -> int:
     # into a directory nothing else ever looks at and its own remedy line
     # ("run `dudamel db migrate -m init`") can never be satisfied.
     project_dir = settings.project_dir
-    # Apply core migrations first to ensure schema is ready for app autogenerate
-    upgrade_core(settings.database_url)
     # Autogenerate diffs the models against the live database, so the database
     # has to already be at head for the project's lane (and every enabled suite
     # lane) before we ask for a new revision. A fresh clone is the ordinary case
@@ -292,8 +289,10 @@ def cmd_db_migrate(args: argparse.Namespace) -> int:
     # against that empty db re-emits CREATE TABLE as a fresh revision that then
     # collides with the committed one -- and the orphan file stays on disk, so
     # every later `db migrate` fails the same way. Safe with no `migrations/`
-    # yet: `upgrade_all` skips the project lane when there is none.
-    upgrade_all(settings.database_url, project_dir, resolution.suite_lanes)
+    # yet: `upgrade_all` skips the project lane when there is none. Core goes up
+    # first, in the same call, so the schema is ready for autogenerate. One
+    # backup covers this whole pass, and only if something is pending.
+    backup = upgrade_database(settings.database_url, project_dir, resolution.suite_lanes)
     # LOCAL apps only. A suite app's revisions ship in the wheel, so its tables
     # must never enter the project's own autogenerate diff: otherwise every
     # user mints a private revision for shipped code, and the shipped lane's
@@ -308,8 +307,16 @@ def cmd_db_migrate(args: argparse.Namespace) -> int:
     # Second pass, now that the revision above exists: always bring the project
     # db to head, whether or not this call produced a new revision -- the one
     # just written must take effect without a second `db migrate`. Each enabled
-    # suite app's own lane goes up with it (a no-op if already at head).
-    upgrade_all(settings.database_url, project_dir, resolution.suite_lanes)
+    # suite app's own lane goes up with it (a no-op if already at head). If the
+    # first pass already took a backup, that is the run's pre-migration snapshot
+    # and the generated revision rides on it; otherwise this pass backs up
+    # (only if the new revision is actually pending), so a run makes at most one.
+    upgrade_database(
+        settings.database_url,
+        project_dir,
+        resolution.suite_lanes,
+        backup=backup is None,
+    )
     print(str(path) if path is not None else "no changes")
     return 0
 

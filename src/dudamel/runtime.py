@@ -37,7 +37,7 @@ from dudamel.llm.prompted_tools import PromptedToolsProvider
 from dudamel.llm.provider import Provider
 from dudamel.llm.types import Message
 from dudamel.mcp_mount import MCPMount
-from dudamel.migrate import pending_migrations, upgrade_all, upgrade_core
+from dudamel.migrate import pending_migrations, upgrade_database
 from dudamel.models_core import Activity, Conversation, JobRun, PendingConfirmation
 from dudamel.orchestrator import Orchestrator
 from dudamel.router import ChatReply, Router
@@ -237,15 +237,12 @@ class Runtime:
                 project_dir,
             )
         if self._settings.auto_migrate:
-            await asyncio.to_thread(upgrade_core, url)
-            # Not gated on migrations/ alone: a project with no lane of its own
-            # can still have enabled suite apps whose lanes must be applied.
-            # Skipped entirely when there is nothing to apply: `upgrade_core`
-            # above already took a backup, and `upgrade_all` takes a second one
-            # of its own, so a project with no lane at all would otherwise pay
-            # for a redundant backup on every start.
-            if self._suite_lanes or (project_dir / "migrations").exists():
-                await asyncio.to_thread(upgrade_all, url, project_dir, self._suite_lanes)
+            # One entry point so a start that applies core AND lane changes
+            # takes a single pre-migration backup (and none when nothing is
+            # pending, so a crash-restart loop never churns snapshots). Not
+            # gated on migrations/: a project with no lane of its own can
+            # still have enabled suite apps whose lanes must be applied.
+            await asyncio.to_thread(upgrade_database, url, project_dir, self._suite_lanes)
         else:
             pending = await asyncio.to_thread(
                 pending_migrations, url, project_dir, self._suite_lanes

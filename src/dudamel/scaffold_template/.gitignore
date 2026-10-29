@@ -2,6 +2,7 @@
 .env
 *.db
 *.db.bak
+*.db.bak-*
 *.db-wal
 *.db-shm
 .dudamel.lock

@@ -3,7 +3,8 @@ from __future__ import annotations
 import re
 import shutil
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
@@ -75,16 +76,95 @@ def _sqlite_path(db_url: str) -> Path | None:
     return Path(raw_path)
 
 
-def _backup_sqlite(db_url: str) -> None:
+# How many timestamped backups of one database file are kept. A backup is only
+# taken when a migration is about to be applied, so five is the last five
+# schema changes -- enough to step back past a bad one without the directory
+# filling with copies of a database that can be large.
+BACKUPS_KEPT = 5
+
+_BACKUP_SUFFIX = ".bak-"
+
+
+def _backup_name_re(db_name: str) -> re.Pattern[str]:
+    """Matches exactly the backups `_backup_sqlite` makes for the database file
+    called `db_name` and nothing else: another database's backups in the same
+    directory, or a file the operator parked next to this one, never match."""
+    return re.compile(re.escape(db_name + _BACKUP_SUFFIX) + r"\d{8}T\d{12}Z")
+
+
+def _backups_of(path: Path) -> list[Path]:
+    """This database's backups, oldest first (the UTC timestamp sorts lexically
+    in chronological order)."""
+    pattern = _backup_name_re(path.name)
+    return sorted(p for p in path.parent.iterdir() if pattern.fullmatch(p.name))
+
+
+def _prune_backups(path: Path) -> None:
+    for old in _backups_of(path)[:-BACKUPS_KEPT]:
+        old.unlink()
+
+
+def _migration_state(path: Path) -> list[tuple[str, str]]:
+    """Every (version table, revision) row in one SQLite file: which revision
+    each tier -- core, every suite lane, the project lane -- is recorded at."""
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        tables = [
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name LIKE 'alembic_version%'"
+            )
+        ]
+        return sorted(
+            (table, r[0]) for table in tables for r in conn.execute(f'SELECT * FROM "{table}"')
+        )
+    finally:
+        conn.close()
+
+
+def _newest_backup_is_current(path: Path) -> bool:
+    """Whether the newest backup already holds this database's migration state.
+
+    The crash loop this exists for: a migration that fails on every attempt,
+    under the shipped unit's `Restart=always` (every 5s, forever -- below
+    systemd's start-rate limit). Each start is still pending, so without this
+    every start takes a backup, and within BACKUPS_KEPT restarts the prune has
+    deleted the only pre-migration copy -- the very loss timestamped names were
+    meant to stop. While anything is pending the startup gate refuses to run,
+    so nothing writes app data in between: an unchanged migration state means
+    an unchanged database, and a repeat snapshot is pure loss. A failure that
+    applied some revisions before stopping DOES change the state, so that
+    half-migrated copy is taken once, beside (never over) the clean one.
+    """
+    backups = _backups_of(path)
+    if not backups:
+        return False
+    try:
+        return _migration_state(backups[-1]) == _migration_state(path)
+    except sqlite3.Error:
+        # An unreadable backup is no reason to skip a fresh one.
+        return False
+
+
+def _backup_sqlite(db_url: str) -> Path | None:
     """Back up a SQLite file with the sqlite3 online backup API rather than a
     plain file copy: `Connection.backup()` goes through SQLite itself, so it
-    is safe against a source database that is mid-write or in WAL mode —
+    is safe against a source database that is mid-write or in WAL mode --
     unlike `shutil.copy2`, which can copy an inconsistent snapshot of the
-    main file while the real data still lives in the `-wal` sidecar."""
+    main file while the real data still lives in the `-wal` sidecar.
+
+    Each call writes a NEW file, `<db>.bak-<UTC timestamp>`, and never touches
+    an earlier one: a fixed `<db>.bak` was overwritten by the next backup, so a
+    restart after a bad partial migration re-backed-up the half-migrated state
+    over the only good copy. Only the newest `BACKUPS_KEPT` are retained.
+    Returns the new backup's path, or None when there is no file to back up.
+    """
     path = _sqlite_path(db_url)
     if path is None or not path.exists():
-        return
-    backup_path = path.with_name(path.name + ".bak")
+        return None
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    backup_path = path.with_name(f"{path.name}{_BACKUP_SUFFIX}{stamp}")
     src = sqlite3.connect(path)
     try:
         dst = sqlite3.connect(backup_path)
@@ -94,16 +174,44 @@ def _backup_sqlite(db_url: str) -> None:
             dst.close()
     finally:
         src.close()
+    _prune_backups(path)
+    return backup_path
 
 
-def upgrade_core(db_url: str) -> None:
-    """Apply framework-bundled core migrations (backup first on SQLite)."""
-    _backup_sqlite(db_url)
+def _backup_if_pending(db_url: str, pending: Callable[[], bool], backup: bool) -> Path | None:
+    """Back up only when `pending()` says something is about to be applied.
+    The caller passes the same pending predicates doctor and the startup gate
+    use, so "about to apply" cannot drift from what they report. The file's
+    existence is checked first: the pending checks open the database, which
+    would otherwise create an empty file just to decide there is nothing to
+    back up. A database whose newest backup already records its migration
+    state is not backed up again (see `_newest_backup_is_current`)."""
+    if not backup:
+        return None
+    path = _sqlite_path(db_url)
+    if path is None or not path.exists() or not pending():
+        return None
+    if _newest_backup_is_current(path):
+        return None
+    return _backup_sqlite(db_url)
+
+
+def core_pending(db_url: str) -> bool:
+    """Whether the core schema is behind the scripts shipped in the wheel."""
+    core_scripts = script_heads(str(files("dudamel") / "migrations"))
+    return bool(core_scripts) and current_heads(db_url, "alembic_version_core") != core_scripts
+
+
+def upgrade_core(db_url: str, *, backup: bool = True) -> Path | None:
+    """Apply framework-bundled core migrations (backup first on SQLite, but only
+    if the core schema is actually behind). Returns the backup taken, if any."""
+    taken = _backup_if_pending(db_url, lambda: core_pending(db_url), backup)
     cfg = Config()
     cfg.set_main_option("script_location", str(files("dudamel") / "migrations"))
     cfg.set_main_option("sqlalchemy.url", sync_url(db_url))
     cfg.set_main_option("version_table", "alembic_version_core")
     command.upgrade(cfg, "head")
+    return taken
 
 
 def ensure_app_migrations(project_dir: Path) -> Path:
@@ -172,7 +280,13 @@ def upgrade_suite_app(db_url: str, app_name: str, versions_dir: Path) -> None:
     command.upgrade(_suite_lane_config(db_url, app_name, versions_dir), "head")
 
 
-def upgrade_all(db_url: str, project_dir: Path, suite_lanes: Sequence[tuple[str, Path]]) -> None:
+def upgrade_all(
+    db_url: str,
+    project_dir: Path,
+    suite_lanes: Sequence[tuple[str, Path]],
+    *,
+    backup: bool = True,
+) -> Path | None:
     """Apply every suite lane in name order, then the project's own lane.
 
     Sequential, not atomic. A lane that fails leaves earlier lanes applied and
@@ -183,9 +297,16 @@ def upgrade_all(db_url: str, project_dir: Path, suite_lanes: Sequence[tuple[str,
     transactional_ddl=False, so a lane whose second revision fails keeps the
     first one applied and recorded. That is why a rerun must resume rather than
     restart -- it picks up from the recorded revision, and the single backup
-    taken above is the real undo.
+    taken below is the real undo. It is taken only when some lane is actually
+    behind, and it is a new timestamped file that no later backup overwrites, so
+    a crash-restart that re-runs this after a partial failure cannot replace the
+    pre-migration copy with the half-migrated state. Returns the backup taken.
     """
-    _backup_sqlite(db_url)
+    taken = _backup_if_pending(
+        db_url,
+        lambda: _lanes_pending(db_url, project_dir, suite_lanes),
+        backup,
+    )
     for app_name, versions_dir in sorted(suite_lanes):
         try:
             upgrade_suite_app(db_url, app_name, versions_dir)
@@ -198,6 +319,34 @@ def upgrade_all(db_url: str, project_dir: Path, suite_lanes: Sequence[tuple[str,
     # revision; a project with no migrations/ directory has nothing to apply.
     if (project_dir / "migrations").exists():
         command.upgrade(_app_config(db_url, project_dir), "head")
+    return taken
+
+
+def upgrade_database(
+    db_url: str,
+    project_dir: Path,
+    suite_lanes: Sequence[tuple[str, Path]],
+    *,
+    backup: bool = True,
+) -> Path | None:
+    """Bring core, every suite lane and the project lane to head under ONE
+    backup, taken only if `pending_migrations` reports anything. The entry
+    point for callers that apply everything (startup, `db migrate`): calling
+    `upgrade_core` then `upgrade_all` separately would back up once per tier.
+    `backup=False` lets a caller that already holds a pre-migration snapshot
+    from this same run skip a second one. Returns the backup taken, if any."""
+    taken = _backup_if_pending(
+        db_url, lambda: bool(pending_migrations(db_url, project_dir, suite_lanes)), backup
+    )
+    upgrade_core(db_url, backup=False)
+    upgrade_all(db_url, project_dir, suite_lanes, backup=False)
+    return taken
+
+
+def _lanes_pending(db_url: str, project_dir: Path, suite_lanes: Sequence[tuple[str, Path]]) -> bool:
+    return any(
+        suite_lane_pending(db_url, name, versions) for name, versions in sorted(suite_lanes)
+    ) or project_lane_pending(db_url, project_dir)
 
 
 def _combined_metadata(orc: Orchestrator) -> MetaData:
@@ -327,10 +476,12 @@ def downgrade() -> None:
     return path
 
 
-def upgrade_apps(db_url: str, project_dir: Path) -> None:
-    """Apply the project's app migrations (version table alembic_version_apps)."""
-    _backup_sqlite(db_url)
+def upgrade_apps(db_url: str, project_dir: Path, *, backup: bool = True) -> Path | None:
+    """Apply the project's app migrations (version table alembic_version_apps),
+    with a backup first only if the project lane is actually behind."""
+    taken = _backup_if_pending(db_url, lambda: project_lane_pending(db_url, project_dir), backup)
     command.upgrade(_app_config(db_url, project_dir), "head")
+    return taken
 
 
 def suite_lane_pending(db_url: str, app_name: str, versions_dir: Path) -> bool:
@@ -381,8 +532,7 @@ def pending_migrations(
     """
     pending: list[str] = []
 
-    core_scripts = script_heads(str(files("dudamel") / "migrations"))
-    if core_scripts and current_heads(db_url, "alembic_version_core") != core_scripts:
+    if core_pending(db_url):
         pending.append("core schema is behind head")
 
     for app_name, versions_dir in sorted(suite_lanes):

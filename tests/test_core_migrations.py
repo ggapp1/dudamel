@@ -1,4 +1,3 @@
-import sqlite3
 from pathlib import Path
 
 import pytest
@@ -31,28 +30,11 @@ def test_upgrade_core_creates_tables(tmp_path: Path):
     assert "alembic_version_core" in insp.get_table_names()
 
 
-def test_upgrade_core_is_idempotent_and_backs_up(tmp_path: Path):
+def test_upgrade_core_is_idempotent_and_a_noop_takes_no_backup(tmp_path: Path):
     url = f"sqlite+aiosqlite:///{tmp_path}/core.db"
     upgrade_core(url)
-    upgrade_core(url)  # second run: no error, and a backup exists
-    assert (tmp_path / "core.db.bak").exists()
-
-
-def test_backup_is_a_valid_readable_sqlite_db(tmp_path: Path):
-    """The backup is produced via sqlite3's online Connection.backup() API
-    rather than a raw file copy, so it must be a fully consistent, directly
-    openable SQLite database on its own -- not just a byte-identical file."""
-    url = f"sqlite+aiosqlite:///{tmp_path}/core.db"
-    upgrade_core(url)
-    upgrade_core(url)  # triggers the backup on the second call
-    backup = tmp_path / "core.db.bak"
-    conn = sqlite3.connect(backup)
-    try:
-        rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = {row[0] for row in rows}
-    finally:
-        conn.close()
-    assert CORE_TABLES <= tables
+    upgrade_core(url)  # second run: no error, and nothing was pending
+    assert list(tmp_path.glob("core.db.bak*")) == []
 
 
 def test_sqlite_path_strips_query_string(tmp_path: Path):
