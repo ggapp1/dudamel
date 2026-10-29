@@ -157,6 +157,12 @@ class _LockEntry:
 class ChatReply:
     text: str
     pending_confirmation_id: str | None = None
+    # True only when `resolve_confirmation` turned a caller away for not being
+    # the requester. The prose says so too, but an interface cannot tell that
+    # from a success by reading text -- and the difference matters: a refusal
+    # leaves the requester's confirmation pending, so the prompt (and its
+    # buttons) must be left alone rather than rewritten with the refusal.
+    refused: bool = False
 
 
 @dataclass
@@ -966,7 +972,9 @@ class Router:
                 if row.status != "pending":
                     return ChatReply(text=f"Unknown confirmation — already {row.status}.")
                 if row.user_id != user_id:
-                    return ChatReply(text="Only the requester can resolve this confirmation.")
+                    return ChatReply(
+                        text="Only the requester can resolve this confirmation.", refused=True
+                    )
                 if row.expires_at < _utcnow():
                     row.status = "expired"
                     expired = True

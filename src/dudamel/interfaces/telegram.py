@@ -573,6 +573,15 @@ class TelegramInterface:
         reply = await self._runtime.resolve_confirmation(
             confirmation_id, approved=(action == "yes"), user_id=str(user.id)
         )
+        if reply.refused:
+            # Another allow-listed user tapped the requester's prompt. The
+            # confirmation is still pending and still theirs, so the message
+            # and its buttons stay exactly as they are -- editing it would
+            # strip the requester's keyboard, the same authorization-failure-
+            # into-denial-of-service the action tokens refuse to allow (see
+            # `_ActionTokens.consume`). Only the tapper hears about it.
+            await self._answer(query.id, reply.text, alert=True)
+            return
         if message is not None:
             if reply.pending_confirmation_id is not None:
                 # Resolving this confirmation resumed the turn, whose model

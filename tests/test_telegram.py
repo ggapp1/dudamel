@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from sqlalchemy import select
 from telegram import CallbackQuery, Chat, InlineKeyboardMarkup, Message, Update, User
 from telegram.error import BadRequest
 
@@ -30,6 +31,7 @@ from dudamel.interfaces.telegram import (
     resolve_token,
 )
 from dudamel.llm.testing import FakeProvider, fake_text, fake_tool_call
+from dudamel.models_core import PendingConfirmation
 
 TOKEN = "123456:FAKETOKENFAKETOKENFAKETOKENFAKETOK"  # noqa: S105 — test fixture, not a real secret
 
@@ -677,6 +679,54 @@ async def test_confirm_button_from_unauthorized_user_does_not_resolve(
     assert resolve_calls == []
     assert bot.edited == []
     assert bot.answered == [{"id": "cbq2", "text": "Not authorized.", "show_alert": True}]
+    await rt.stop()
+
+
+async def test_foreign_user_tapping_a_confirmation_does_not_strip_the_requesters_buttons(
+    tmp_path: Path, token_env: str
+) -> None:
+    """Two allow-listed users share a group. B tapping A's prompt is refused,
+    and that refusal must neither edit the message (which drops the keyboard
+    off A's still-pending confirmation) nor consume it."""
+    rt, interface = await build(
+        tmp_path,
+        [fake_tool_call("wipe", {"reason": "clean"}), fake_text("All done")],
+        telegram=TelegramConfig(allowed_user_ids=[111, 222], allow_groups=True),
+    )
+    group = make_chat(id=-500, type="group")
+    msg = make_message("wipe it", chat=group, from_user=make_user(id=111))
+    await interface._on_message(make_update(message=msg), None)
+    bot: FakeBot = interface._app.bot
+    callback_data = bot.sent[0]["reply_markup"].inline_keyboard[0][0].callback_data
+    prompt = make_message(None, chat=group, from_user=make_user(id=111), message_id=99)
+
+    intruder = CallbackQuery(
+        id="cbqB",
+        from_user=make_user(id=222),
+        chat_instance="ci",
+        message=prompt,
+        data=callback_data,
+    )
+    await interface._on_callback(make_update(callback_query=intruder, update_id=2), None)
+
+    assert bot.edited == []
+    assert len(bot.answered) == 1
+    assert bot.answered[0]["id"] == "cbqB" and bot.answered[0]["show_alert"] is True
+    assert "requester" in bot.answered[0]["text"]
+    async with rt._db.session() as s:
+        row = (await s.execute(select(PendingConfirmation))).scalar_one()
+    assert row.status == "pending"
+
+    # The requester can still approve afterwards.
+    owner = CallbackQuery(
+        id="cbqA",
+        from_user=make_user(id=111),
+        chat_instance="ci",
+        message=prompt,
+        data=callback_data,
+    )
+    await interface._on_callback(make_update(callback_query=owner, update_id=3), None)
+    assert [e["text"] for e in bot.edited] == ["All done"]
     await rt.stop()
 
 
