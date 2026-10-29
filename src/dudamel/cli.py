@@ -700,6 +700,53 @@ def _render_tool_table(orchestrator: Orchestrator) -> str:
     return "\n".join(rows)
 
 
+# A module-level `name = App(...)` -- what makes a file in apps/ an app rather
+# than a helper. Matched on source, not by importing, because the files that
+# matter here are exactly the ones nothing imports.
+_APP_DEFINITION = re.compile(r"^\w+\s*=\s*App\(", re.MULTILINE)
+
+
+def _unregistered_app_modules(project_dir: Path, orchestrator: Orchestrator) -> list[str]:
+    """Modules under `<project>/apps/` that define an `App` the project's
+    orchestrator does not contain.
+
+    An app dropped into `apps/` but never added to `assistant.py` is invisible:
+    it imports nowhere, registers nothing, and `app resolution` happily reports
+    `0 enabled, 0 error(s)`. This is the line that says it is sitting there.
+
+    Judged by identity, after `assistant.py` was imported (which is when every
+    module it uses landed in `sys.modules`): a module counts as registered when
+    one of its `App` objects is one of the orchestrator's. A file that was never
+    imported cannot be registered, whatever its name.
+    """
+    apps_dir = project_dir / "apps"
+    if not apps_dir.is_dir():
+        return []
+    registered = list(orchestrator.registry.apps.values())
+    found: list[str] = []
+    for path in sorted(apps_dir.iterdir()):
+        if path.name.startswith("_"):
+            continue
+        if path.is_dir():
+            source, module_name = path / "__init__.py", f"apps.{path.name}"
+        elif path.suffix == ".py":
+            source, module_name = path, f"apps.{path.stem}"
+        else:
+            continue
+        try:
+            if not _APP_DEFINITION.search(source.read_text()):
+                continue
+        except OSError:
+            continue
+        module = sys.modules.get(module_name)
+        if module is not None and any(
+            candidate is app for candidate in vars(module).values() for app in registered
+        ):
+            continue
+        found.append(module_name.removeprefix("apps."))
+    return found
+
+
 def _load_orchestrator_for_diagnosis(
     project_dir: Path, *, debug: bool = False
 ) -> tuple[Orchestrator, str | None]:
@@ -860,6 +907,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             failed = True  # the same collision stops `dudamel run`
             table = _line(False, "tool table", str(e))
         print(table)
+        for name in _unregistered_app_modules(settings.project_dir, orchestrator):
+            print(
+                _line(
+                    "warn",
+                    "unregistered app",
+                    f"apps/{name} defines an App that assistant.py does not register -- "
+                    "add it to `Orchestrator(apps=[...])`, or it never runs",
+                )
+            )
         # `doctor` never starts the orchestrator, so MCP-mounted tools (only
         # discovered by actually connecting to each server -- see
         # mcp_mount.py) aren't in the table above yet; this makes that gap
