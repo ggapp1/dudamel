@@ -138,9 +138,28 @@ async def test_wrong_user_cannot_resolve(tmp_path) -> None:
         r1.pending_confirmation_id, approved=True, user_id="intruder"
     )
     assert "requester" in r2.text and DELETED == []
+    # Machine-readable: an interface must not infer a refusal from the prose.
+    assert r2.refused is True
     async with db.session() as s:
         row = (await s.execute(select(PendingConfirmation))).scalar_one()
     assert row.status == "pending"  # untouched
+    r3 = await router.resolve_confirmation(r1.pending_confirmation_id, approved=True, user_id="u1")
+    assert r3.refused is False and DELETED == ["x"]
+    await db.dispose()
+
+
+async def test_unknown_and_settled_confirmations_are_not_refusals(tmp_path) -> None:
+    """Only the foreign-user branch is a refusal: for an unknown or already
+    settled id the prompt really is stale, so stripping its buttons is right."""
+    script = [fake_tool_call("wipe_log", {"reason": "y"}), fake_text("ok")]
+    router, fp, db, convo, _ = build(tmp_path, script)
+    assert (await router.resolve_confirmation("nope", approved=True, user_id="u1")).refused is False
+    r1 = await router.handle(channel="t:1", text="wipe", user_id="u1")
+    await router.resolve_confirmation(r1.pending_confirmation_id, approved=False, user_id="u1")
+    again = await router.resolve_confirmation(
+        r1.pending_confirmation_id, approved=True, user_id="u1"
+    )
+    assert again.refused is False
     await db.dispose()
 
 
