@@ -16,7 +16,12 @@ from typing import Any
 from pydantic import BaseModel, ValidationError
 
 from dudamel.activity import json_safe
-from dudamel.contract.renderers import ItemAction, ResolvedAction, validate_widget_payload
+from dudamel.contract.renderers import (
+    ItemAction,
+    ResolvedAction,
+    clean_display_text,
+    validate_widget_payload,
+)
 from dudamel.contract.types import Tool, Widget
 
 logger = logging.getLogger("dudamel.widgets")
@@ -66,13 +71,23 @@ def _resolve(spec: ItemAction, app_actions: Mapping[str, Tool]) -> dict[str, Any
     ).model_dump()
 
 
+def _card_title(widget: Widget) -> str:
+    """The title both surfaces show, cleaned once here. Telegram strips it on
+    its own, but the web renders the card as served, and HTML escaping does
+    not remove a bidi override. Falls back to the id if nothing printable is
+    left, so a card never has a blank header."""
+    return clean_display_text(widget.title) or widget.id
+
+
 def _error_card(widget: Widget, message: str) -> dict[str, Any]:
     return {
         "id": widget.id,
         "qualified_id": widget.qualified_id,
-        "title": widget.title,
+        "title": _card_title(widget),
         "renderer": widget.renderer,
-        "error": message,
+        # An exception's text is app- or library-authored and can echo
+        # synced-in data; cleaned here for the same reason as the title.
+        "error": clean_display_text(message),
         "actions": [],
     }
 
@@ -127,7 +142,7 @@ async def run_widget(
     return {
         "id": widget.id,
         "qualified_id": widget.qualified_id,
-        "title": widget.title,
+        "title": _card_title(widget),
         "renderer": widget.renderer,
         "data": data,
         "actions": card_actions,

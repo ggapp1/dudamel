@@ -110,6 +110,18 @@ ACTION_LABEL_MAX = 32
 # comment in the first place.
 UNSAFE_DISPLAY_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
 _UNSAFE_LABEL_CHARS = UNSAFE_DISPLAY_CHARS  # retained: read by tests and by app.py
+# The same class for a markdown body, which is a multi-line document: UNSAFE_
+# DISPLAY_CHARS minus \n (0x0a) and \t (0x09), the two characters that ARE the
+# document's layout. Everything else in it -- the bidi overrides and isolates,
+# U+2028/2029, the other C0/C1 controls -- goes, so the body reads the same on
+# the web as on Telegram. A bare \r is in the class too; `\r\n` is folded to
+# `\n` first (see `clean_markdown`), so Windows line endings survive. Spelled
+# out rather than computed because a regex class cannot be subtracted from; the
+# test sweeping every codepoint against UNSAFE_DISPLAY_CHARS is what stops the
+# two drifting.
+UNSAFE_MARKDOWN_CHARS = re.compile(
+    r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]"
+)
 
 
 # A title is not a label: it holds a sentence, not a button caption. Aligned
@@ -126,6 +138,15 @@ def clean_action_label(value: str) -> str:
     return "" -- each caller raises its own error type for that.
     """
     return _UNSAFE_LABEL_CHARS.sub("", value).strip()
+
+
+def clean_markdown(value: str) -> str:
+    """A markdown body with unrenderable characters gone and its layout intact.
+
+    No length bound: unlike a title, a document's length is its content, and
+    nothing else in the contract caps it.
+    """
+    return UNSAFE_MARKDOWN_CHARS.sub("", value.replace("\r\n", "\n"))
 
 
 def clean_display_text(value: str) -> str:
@@ -251,18 +272,17 @@ def validate_widget_payload(renderer: str, data: Any) -> Any:
             return TablePayload.model_validate(data)
         if renderer == "list":
             return _LIST_ADAPTER.validate_python(data)
-        # NOT sanitized, deliberately -- recorded rather than left ambiguous.
-        # UNSAFE_DISPLAY_CHARS spans \x00-\x1f, which includes newline and tab.
-        # Removing those from a title is the point (it stops a one-line field
-        # forging a second line); removing them from a markdown document would
-        # destroy the document. A markdown card also carries no per-row action,
-        # so its text does not sit beside a one-tap control the way a list
-        # item's title does. Sanitizing it needs a different character class --
-        # a separate decision.
+        # Sanitized with a markdown-specific class, not the one-line one:
+        # UNSAFE_DISPLAY_CHARS spans \x00-\x1f, newline and tab included, and
+        # removing those would destroy the document. A markdown card can still
+        # carry card-level actions (`actions=[...]`), so its body can sit right
+        # under a live button -- an unstripped U+202E there would draw on the web
+        # (Telegram strips it) next to a one-tap control. `clean_markdown`
+        # removes the same characters minus \n and \t.
         if renderer == "markdown":
             if not isinstance(data, str):
                 raise ValueError("markdown renderer expects a str")
-            return data
+            return clean_markdown(data)
     except ValidationError as e:
         raise ValueError(f"widget payload does not match renderer {renderer!r}: {e}") from e
     raise ValueError(f"unknown renderer {renderer!r}")

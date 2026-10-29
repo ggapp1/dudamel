@@ -182,3 +182,76 @@ def test_display_text_is_truncated_only_past_the_maximum() -> None:
     over = clean_display_text("x" * (DISPLAY_TEXT_MAX + 1))
     assert over == "x" * (DISPLAY_TEXT_MAX - 1) + "\u2026"
     assert len(over) == DISPLAY_TEXT_MAX
+
+
+# --- markdown bodies, widget titles and errors -----------------------------------
+
+
+def test_a_markdown_body_loses_its_bidi_controls_but_keeps_its_layout():
+    """A markdown card can carry a card-level button (`actions=[...]`), so its
+    body sits beside a live control like any list title does. Newlines and tabs
+    ARE the document and must survive; a bare CR must not become a line break."""
+    body = validate_widget_payload("markdown", "# Wipe ‮etelp\n\n- a\tb\r\n- c\rd\x00e f")
+
+    assert body == "# Wipe etelp\n\n- a\tb\n- cde" + "f"
+
+
+def test_the_markdown_class_is_the_display_class_minus_layout_whitespace():
+    """Held in lockstep with UNSAFE_DISPLAY_CHARS by sweeping every codepoint,
+    so widening the display class cannot silently leave markdown behind."""
+    from dudamel.contract.renderers import UNSAFE_DISPLAY_CHARS, UNSAFE_MARKDOWN_CHARS
+
+    layout = {"\n", "\t"}
+    mismatched = [
+        hex(cp)
+        for cp in range(0x110000)
+        if bool(UNSAFE_MARKDOWN_CHARS.fullmatch(chr(cp)))
+        != (bool(UNSAFE_DISPLAY_CHARS.fullmatch(chr(cp))) and chr(cp) not in layout)
+    ]
+
+    assert mismatched == []
+
+
+async def test_widget_title_and_error_are_cleaned_for_both_surfaces():
+    """The card the web API serves and the one Telegram renders are the same
+    dict, so cleaning at the producer is the one place that covers both."""
+    from dudamel.contract.types import Widget
+    from dudamel.widgets import run_widget
+
+    async def boom() -> str:
+        raise RuntimeError("bad ‮noitelet")
+
+    async def fine() -> str:
+        return "ok"
+
+    for fn, key in ((boom, "error"), (fine, "data")):
+        widget = Widget(
+            id="w", app_name="a", title="Ar‮hcive", renderer="markdown", fn=fn, timeout=5.0
+        )
+        card = await run_widget(widget)
+        assert key in card
+        assert "‮" not in card["title"] and card["title"] == "Arhcive"
+        if key == "error":
+            assert "‮" not in card["error"]
+
+
+async def test_web_and_telegram_drop_the_same_characters_from_a_markdown_card():
+    from dudamel.contract.types import Widget
+    from dudamel.interfaces.telegram import _card_lines
+    from dudamel.widgets import run_widget
+
+    hostile = "a‮b⁦c\x07d e"
+
+    async def fn() -> str:
+        return f"line1\n{hostile}"
+
+    card = await run_widget(
+        Widget(id="w", app_name="a", title="T", renderer="markdown", fn=fn, timeout=5.0)
+    )
+    web_text = card["data"]
+    telegram_text = "".join(_card_lines(card))
+
+    for ch in "‮⁦\x07 ":
+        assert ch not in web_text and ch not in telegram_text
+    assert "\n" in web_text
+    assert telegram_text == web_text.replace("\n", "")
