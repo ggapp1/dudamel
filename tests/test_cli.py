@@ -422,6 +422,37 @@ def test_db_migrate_on_a_fresh_clone_does_not_mint_a_duplicate_revision(
         assert conn.execute("SELECT count(*) FROM alembic_version_apps").fetchone()[0] == 1
 
 
+def test_db_migrate_says_what_it_applied_without_touching_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The first `db migrate -m init` creates the whole schema; reporting only
+    `no changes` hid that. The summary goes to stderr so stdout stays what
+    scripts parse (a revision path, or `no changes`)."""
+    target = scaffold_with_local_app(tmp_path)
+    monkeypatch.chdir(target)
+    capsys.readouterr()
+
+    assert cli.main(["db", "migrate", "-m", "init"]) == 0
+    first = capsys.readouterr()
+    assert first.err.strip() == "applied: core"
+    assert "migrations" in first.out  # the generated revision's path, alone
+    assert len(first.out.strip().splitlines()) == 1
+
+    # Fresh clone: committed revision, no database -> core AND the project lane.
+    for leftover in target.glob("dudamel.db*"):
+        leftover.unlink()
+    assert cli.main(["db", "migrate", "-m", "again"]) == 0
+    second = capsys.readouterr()
+    assert second.err.strip() == "applied: core, project"
+    assert second.out.strip() == "no changes"
+
+    # Nothing pending: nothing to announce.
+    assert cli.main(["db", "migrate", "-m", "again"]) == 0
+    third = capsys.readouterr()
+    assert third.err == ""
+    assert third.out.strip() == "no changes"
+
+
 def test_db_migrate_on_a_fresh_project_has_nothing_to_generate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

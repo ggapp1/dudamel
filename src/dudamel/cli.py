@@ -279,6 +279,13 @@ def cmd_run(args: argparse.Namespace) -> int:
 # --- db migrate ------------------------------------------------------------
 
 
+def _lane_label(pending: str) -> str:
+    """A `migrate.pending_migrations` entry as a short lane name: `core`,
+    `app 'tasks'` (a suite app's lane) or `project` (the project's own)."""
+    label = pending.removesuffix(" schema is behind head")
+    return "project" if label == "app" else label
+
+
 def cmd_db_migrate(args: argparse.Namespace) -> int:
     cwd = Path.cwd()
     settings = Settings.load(cwd)
@@ -301,7 +308,16 @@ def cmd_db_migrate(args: argparse.Namespace) -> int:
     # yet: `upgrade_all` skips the project lane when there is none. Core goes up
     # first, in the same call, so the schema is ready for autogenerate. One
     # backup covers this whole pass, and only if something is pending.
+    # Read BEFORE the upgrade so the command can say what it applied: a first
+    # `db migrate -m init` creates every table of the core schema and each
+    # enabled suite app, then reports `no changes` because it generated no
+    # revision of its own -- true, and baffling next to 16 new tables.
+    already_pending = pending_migrations(settings.database_url, project_dir, resolution.suite_lanes)
     backup = upgrade_database(settings.database_url, project_dir, resolution.suite_lanes)
+    if already_pending:
+        # stderr, so stdout stays exactly what scripts parse: the new
+        # revision's path, or `no changes`.
+        print(f"applied: {', '.join(_lane_label(p) for p in already_pending)}", file=sys.stderr)
     # LOCAL apps only. A suite app's revisions ship in the wheel, so its tables
     # must never enter the project's own autogenerate diff: otherwise every
     # user mints a private revision for shipped code, and the shipped lane's
