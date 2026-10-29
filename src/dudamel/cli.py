@@ -216,8 +216,7 @@ def cmd_new(args: argparse.Namespace) -> int:
     _write_deploy_templates(target, project_name)
 
     env_path = target / ".env"
-    env_path.write_text(f"DUDAMEL_WEB_TOKEN={secrets.token_urlsafe(32)}\n")
-    os.chmod(env_path, 0o600)
+    _write_private(env_path, f"DUDAMEL_WEB_TOKEN={secrets.token_urlsafe(32)}\n")
 
     # Ships the migrations/ scaffolding (env.py + script.py.mako + an empty
     # versions/) but deliberately no pre-generated revision -- see the
@@ -1089,6 +1088,32 @@ def cmd_apps_list(args: argparse.Namespace) -> int:
 # --- token rotate ------------------------------------------------------------
 
 
+def _write_private(path: Path, text: str) -> None:
+    """Write `text` to `path` so the file is NEVER readable by anyone else.
+
+    `write_text` then `chmod` leaves a window in which a secret-bearing file
+    exists at the umask default (typically 0o644), and an existing file wider
+    than 0o600 keeps that width until the chmod. So: create a sibling temp file
+    with mode 0o600 from the first instant (`O_EXCL`, so a pre-placed file or
+    symlink is refused rather than followed), write it, and `os.replace` it
+    over `path` -- which also tightens an existing file that was wider, and
+    means a crash mid-write cannot leave a truncated `.env` behind.
+    """
+    # Through any symlink, so a `.env` linked to a secrets store is rewritten
+    # where it lives instead of being silently replaced by a regular file.
+    path = path.resolve()
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+
+
 def _rewrite_env_var(path: Path, key: str, value: str) -> None:
     """Rewrite `key=...` in place, preserving every other line byte-for-byte
     (comments, blank lines, unrelated vars) -- appends the line if `key`
@@ -1108,7 +1133,7 @@ def _rewrite_env_var(path: Path, key: str, value: str) -> None:
         if out and not out[-1].endswith("\n"):
             out[-1] += "\n"
         out.append(new_line)
-    path.write_text("".join(out))
+    _write_private(path, "".join(out))
 
 
 def cmd_token_rotate(args: argparse.Namespace) -> int:
@@ -1118,7 +1143,6 @@ def cmd_token_rotate(args: argparse.Namespace) -> int:
     if not env_path.exists():
         raise CliError(f"{env_path} not found — is {project_dir} a dudamel project?")
     _rewrite_env_var(env_path, settings.web.token_env, secrets.token_urlsafe(32))
-    os.chmod(env_path, 0o600)
     print(f"rotated {settings.web.token_env} in {env_path}")
     # Not revoked yet: the web auth compares against the environment captured
     # when the process started, and this command only rewrites the file. Said
