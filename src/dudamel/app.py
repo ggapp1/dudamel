@@ -359,7 +359,10 @@ class App:
         return self.Model.metadata
 
     @staticmethod
-    def now() -> object:
+    def now() -> Any:
+        # `Any`, not `object`: this is a field DEFAULT (`logged_at: datetime =
+        # app.now()`), so a checker must accept it where a `datetime` is
+        # declared. It is a sentinel the model sugar swaps for a column default.
         from dudamel.modelsugar import NOW
 
         return NOW
