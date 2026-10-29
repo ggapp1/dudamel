@@ -546,17 +546,28 @@ def _check_web_token(settings: Settings) -> tuple[Status, str]:
     return True, f"{settings.web.token_env} is set"
 
 
-def _check_timezone(settings: Settings) -> tuple[bool, str]:
+def _check_timezone(settings: Settings) -> tuple[Status, str]:
     """Report the RESOLVED framework zone and where it came from.
 
-    Always OK -- an unusable zone is rejected by validation long before this
-    runs. It is printed because unset means the host's zone, so the answer
+    OK unless the zone is the host's AND `$TZ` is set: tzlocal honours `$TZ`
+    over /etc/localtime, but the shipped systemd and launchd units do not set
+    it, so the running service may resolve a different zone than the one printed
+    here. That is a warning rather than a failure -- the service still runs, on
+    a zone the operator may not expect -- and pinning `timezone` removes the
+    ambiguity. An unusable zone is rejected by validation long before this runs.
+    It is printed because unset means the host's zone, so the answer
     depends on /etc/localtime, and because a misspelled top-level key is dropped
     in silence: this line is where an operator sees that `timezome` did nothing.
     """
     zone = resolve_timezone(settings)
     if timezone_source(settings) == "config":
         return True, f"{zone} (from `timezone` in dudamel.toml)"
+    if os.environ.get("TZ"):
+        return "warn", (
+            f"{zone} (from $TZ in this shell; the service units do not set $TZ, "
+            "so the service may use a different zone -- set a top-level "
+            f'`timezone = "{zone}"` in dudamel.toml to pin it)'
+        )
     return True, f"{zone} (from the host; set a top-level `timezone` to pin it)"
 
 

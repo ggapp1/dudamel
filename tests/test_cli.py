@@ -1138,7 +1138,11 @@ def _pin_host_zone(monkeypatch: pytest.MonkeyPatch, zone: str) -> None:
 
     Never read the real host zone to build an expectation: CI runs on UTC
     runners, where an implementation that simply printed `UTC` would pass every
-    assertion below while telling a Sao Paulo operator the wrong thing."""
+    assertion below while telling a Sao Paulo operator the wrong thing.
+
+    Also clears `$TZ`: doctor warns when the host zone came from it, and a
+    developer's shell may well export one."""
+    monkeypatch.delenv("TZ", raising=False)
     monkeypatch.setattr("dudamel.config.get_localzone", lambda: ZoneInfo(zone))
 
 
@@ -1185,6 +1189,44 @@ def test_doctor_reports_the_host_zone_when_unset(
         "\u2713 timezone: America/Sao_Paulo "
         "(from the host; set a top-level `timezone` to pin it)" in out
     )
+
+
+def test_doctor_warns_when_the_host_zone_came_from_tz(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """tzlocal honours `$TZ`, but the shipped systemd and launchd units do not
+    set it, so the service resolves /etc/localtime and can land on a different
+    zone than the one doctor just printed. That is a warning, not a failure: the
+    exit code stays 0."""
+    _pin_host_zone(monkeypatch, "Pacific/Auckland")
+    monkeypatch.setenv("TZ", "Pacific/Auckland")
+    target = scaffold(tmp_path)
+    monkeypatch.chdir(target)
+    capsys.readouterr()  # drain `new`'s output
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert (
+        "\u26a0 timezone: Pacific/Auckland (from $TZ in this shell; the service "
+        "units do not set $TZ, so the service may use a different zone -- set a "
+        'top-level `timezone = "Pacific/Auckland"` in dudamel.toml to pin it)' in out
+    )
+
+
+def test_doctor_stays_ok_for_a_pinned_zone_even_with_tz_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A pinned zone is what the service uses whatever `$TZ` says, so there is
+    nothing to warn about."""
+    monkeypatch.setenv("TZ", "America/Sao_Paulo")
+    target = scaffold(tmp_path)
+    _set_top_level(target, 'timezone = "Pacific/Auckland"\n')
+    monkeypatch.chdir(target)
+    capsys.readouterr()  # drain `new`'s output
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "\u2713 timezone: Pacific/Auckland (from `timezone` in dudamel.toml)" in out
 
 
 def _enable_suite_apps(target: Path, *names: str) -> None:
