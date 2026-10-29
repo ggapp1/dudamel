@@ -32,6 +32,9 @@ def test_wheel_contains_scaffold_template_and_web_assets(tmp_path: Path) -> None
     def has_prefix(prefix: str) -> bool:
         return any(n.startswith(prefix) for n in names)
 
+    # PEP 561: without this marker a type checker treats the package as untyped
+    # and ignores every annotation the README advertises.
+    assert "dudamel/py.typed" in names, names
     assert has_prefix("dudamel/scaffold_template/"), names
     assert "dudamel/scaffold_template/apps/__init__.py" in names
     assert "dudamel/scaffold_template/pyproject.toml" in names
