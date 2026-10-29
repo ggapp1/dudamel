@@ -866,6 +866,39 @@ def test_doctor_exits_1_on_pending_migrations_when_auto_migrate_is_off(
     assert "refuse to start" in out
 
 
+def test_doctor_names_an_app_module_that_assistant_py_never_registers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An app dropped into apps/ but absent from `Orchestrator(apps=[...])` is
+    invisible -- `app resolution` says `0 enabled, 0 error(s)` -- so doctor
+    names it. A warning, not a failure, and a registered app stays quiet."""
+    target = scaffold_with_local_app(tmp_path)  # registers apps/notebook.py
+    (target / "apps" / "orphan.py").write_text(
+        'from dudamel import App\n\napp = App("orphan", description="never registered")\n'
+    )
+    (target / "apps" / "helpers.py").write_text("X = 1\n")  # not an app
+    monkeypatch.chdir(target)
+    capsys.readouterr()
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "⚠ unregistered app: apps/orphan defines an App" in out
+    assert "apps/notebook" not in out.split("unregistered app", 1)[-1].splitlines()[0]
+    assert "helpers" not in out
+    assert out.count("unregistered app") == 1
+
+
+def test_doctor_is_quiet_when_every_app_module_is_registered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target = scaffold_with_local_app(tmp_path)
+    monkeypatch.chdir(target)
+    capsys.readouterr()
+
+    assert cli.main(["doctor"]) == 0
+    assert "unregistered app" not in capsys.readouterr().out
+
+
 def test_doctor_without_probe_tools_does_not_call_the_backend(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
