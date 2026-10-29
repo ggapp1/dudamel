@@ -1,6 +1,7 @@
 """Widget execution: turns a registered Widget into dashboard-ready JSON.
 
-Thin runner — zero business logic, zero LLM calls. A widget that raises,
+Thin runner — zero business logic, zero LLM calls, and no way for a widget to
+make one: `App.llm()` refuses while `IN_WIDGET` is set. A widget that raises,
 times out its own fn(), or returns a payload its renderer rejects must never
 take down the whole dashboard: it degrades to an error entry instead of
 propagating.
@@ -11,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Mapping
+from contextvars import ContextVar
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
@@ -25,6 +27,21 @@ from dudamel.contract.renderers import (
 from dudamel.contract.types import Tool, Widget
 
 logger = logging.getLogger("dudamel.widgets")
+
+# True for exactly the duration of a widget's fn(). `App.llm()` reads it and
+# refuses: the dashboard must render with every model tier dead, and "widgets
+# don't call the model" is only a guarantee if the framework enforces it. Lives
+# here (not in app.py) because widgets.py is the one place that knows when a
+# widget is running; app.py imports it, never the reverse.
+#
+# A ContextVar rather than a plain flag so concurrent renders (the dashboard
+# runs widgets in parallel) cannot see each other's state. Because a context is
+# copied into any task created from it, a task the widget spawns INHERITS the
+# flag -- intended: spawning a task must not be a way around the rule. A thread
+# started via `app.to_thread` also copies the context (asyncio.to_thread does),
+# but a thread the widget starts by other means does not; that is outside what
+# a runtime guard can see.
+IN_WIDGET: ContextVar[bool] = ContextVar("in_widget", default=False)
 
 
 def _to_jsonable(value: Any) -> Any:
@@ -117,7 +134,13 @@ async def run_widget(
         # the generic handler below and reports its real message, not a
         # fabricated "widget timed out after Ns".
         async with asyncio.timeout(widget.timeout) as cm:
-            raw = await widget.fn()
+            # Reset through the token in `finally` so the flag cannot outlive
+            # the widget, on success, raise or timeout alike.
+            token = IN_WIDGET.set(True)
+            try:
+                raw = await widget.fn()
+            finally:
+                IN_WIDGET.reset(token)
     except TimeoutError as e:
         if not cm.expired():
             logger.warning("widget %s (app %s) failed: %s", widget.id, widget.app_name, e)

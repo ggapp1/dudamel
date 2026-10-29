@@ -13,7 +13,9 @@ them and feeds results back until it has an answer. The **data plane** —
 the dashboard, widgets, scheduled jobs, database migrations — does not
 depend on the model at all. If your LLM endpoint is down, the dashboard
 still renders, because widgets are plain `async def` functions that read
-the database directly; nothing about them calls the model.
+the database directly; nothing about them calls the model, and the framework
+enforces it — `app.llm()` raises inside a widget. To show model output, have a
+job or tool compute it, store it, and let the widget read the stored result.
 
 Apps are code, not configuration:
 

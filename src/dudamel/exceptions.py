@@ -55,6 +55,17 @@ class RuntimeNotBoundError(DudamelError):
     """A runtime capability (db/llm/notify) used before the run phase bound it."""
 
 
+class LLMNotAllowedInWidgetError(DudamelError):
+    """`app.llm()` was called from inside a widget.
+
+    The dashboard is the part of the system that keeps working when every
+    model tier is down, so a widget that could reach the model would make that
+    claim depend on every app author's discipline. Enforced instead of
+    documented. The message is shown to the operator on the widget's error
+    card, so it names the rule and the way out.
+    """
+
+
 class AppSettingsError(DudamelError):
     """An app's [apps.<name>] config block has an unknown key or fails the
     app's own settings model."""

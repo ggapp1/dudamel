@@ -383,3 +383,70 @@ async def test_a_blank_item_label_is_rejected_like_a_blank_registered_one() -> N
     card = await run_widget(app.widgets["today"], _actions_of(app))
     assert "error" in card
     assert "must not be empty" in card["error"]
+
+
+# --- widgets cannot reach the model ------------------------------------------
+# The positioning claim is that the dashboard works with every tier dead. These
+# bind a counting stand-in for the Runtime's `app._llm`, so "the provider is
+# never called" is observed rather than inferred from the error text.
+
+
+def _app_with_counting_llm() -> tuple[App, list[str]]:
+    app = App("gym", description="d")
+    calls: list[str] = []
+
+    async def fake_llm(prompt, **kw):
+        calls.append(prompt)
+        return "answer"
+
+    app._llm = fake_llm
+    return app, calls
+
+
+async def test_widget_calling_app_llm_gets_an_error_card_and_never_reaches_the_model() -> None:
+    app, calls = _app_with_counting_llm()
+
+    async def fn() -> dict:
+        await app.llm("summarize")
+        return {"label": "x", "value": 1}
+
+    out = await run_widget(make_widget(fn))
+    assert calls == []
+    assert "data" not in out
+    assert "widget" in out["error"] and "scheduled job" in out["error"]
+
+
+async def test_llm_outside_a_widget_still_works() -> None:
+    app, calls = _app_with_counting_llm()
+    assert await app.llm("from a job or tool") == "answer"
+    assert calls == ["from a job or tool"]
+
+
+async def test_widget_flag_does_not_leak_after_success_or_error() -> None:
+    from dudamel.widgets import IN_WIDGET
+
+    async def ok() -> dict:
+        assert IN_WIDGET.get() is True
+        return {"label": "x", "value": 1}
+
+    async def boom() -> dict:
+        raise RuntimeError("nope")
+
+    assert IN_WIDGET.get() is False
+    await run_widget(make_widget(ok))
+    assert IN_WIDGET.get() is False
+    await run_widget(make_widget(boom))
+    assert IN_WIDGET.get() is False
+
+
+async def test_a_task_a_widget_spawns_cannot_reach_the_model_either() -> None:
+    app, calls = _app_with_counting_llm()
+
+    async def fn() -> dict:
+        # The task copies the context at creation, so it inherits the flag.
+        await asyncio.create_task(app.llm("sneaky"))
+        return {"label": "x", "value": 1}
+
+    out = await run_widget(make_widget(fn))
+    assert calls == []
+    assert "error" in out

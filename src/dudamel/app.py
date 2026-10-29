@@ -13,7 +13,13 @@ from pydantic import AliasChoices, AliasPath, BaseModel, ValidationError
 from dudamel.contract.renderers import ACTION_LABEL_MAX, RENDERERS, clean_action_label
 from dudamel.contract.schema import ToolSchema
 from dudamel.contract.types import TOOL_NAME_RE, Job, Tool, Widget
-from dudamel.exceptions import AppSettingsError, RegistryError, RuntimeNotBoundError
+from dudamel.exceptions import (
+    AppSettingsError,
+    LLMNotAllowedInWidgetError,
+    RegistryError,
+    RuntimeNotBoundError,
+)
+from dudamel.widgets import IN_WIDGET
 
 if TYPE_CHECKING:
     from zoneinfo import ZoneInfo
@@ -199,6 +205,11 @@ class App:
         actions: Sequence[str] = (),
         timeout: float = 15.0,
     ) -> Callable:
+        """Register a dashboard widget: an `async def` with no required
+        arguments that returns the payload `renderer` expects. Widgets read
+        stored data; they cannot call `app.llm()` (it raises
+        `LLMNotAllowedInWidgetError`), so the dashboard renders with every
+        model tier down."""
         if renderer not in RENDERERS:
             raise RegistryError(f"unknown renderer {renderer!r}; choose one of {sorted(RENDERERS)}")
 
@@ -269,6 +280,14 @@ class App:
 
     # --- runtime capabilities ------------------------------------------------
     async def llm(self, *args: Any, **kwargs: Any) -> Any:
+        """Ask the model. Available to tools and jobs; refused inside a widget,
+        which must render with every model tier down."""
+        if IN_WIDGET.get():
+            raise LLMNotAllowedInWidgetError(
+                "widgets cannot call app.llm(): the dashboard must render when the model "
+                "is down. Compute the result in a scheduled job or tool, store it, and "
+                "have the widget read the stored result."
+            )
         if self._llm is None:
             raise RuntimeNotBoundError(
                 "app.llm is bound at run time by Runtime; not in tests/import"
