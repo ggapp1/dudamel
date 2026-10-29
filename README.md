@@ -213,8 +213,9 @@ button.
 
 ### Grouping the dashboard: `[[home.section]]`
 
-By default the dashboard renders every widget in one flat grid, in
-registration order. `[[home.section]]` in `dudamel.toml` groups them into
+By default the dashboard renders every widget in one flat grid: enabled
+first-party apps first (alphabetically), then your own apps (alphabetically),
+each app's widgets in declaration order. `[[home.section]]` in `dudamel.toml` groups them into
 titled sections instead, addressing each widget as `<app>.<widget>`:
 
 ```toml
@@ -786,6 +787,58 @@ spend out of the window and acts as a partial reset. It settles the next day.
   optionally preceded by an `h2.section-title`, so cards now sit one level
   deeper. A selector like `#widget-grid > .card` needs to become
   `#widget-grid .card`.
+- A `timezone` setting on a `tasks` or `habits` block now stops startup with an
+  error: the key moved to one top-level `timezone` in `dudamel.toml`. The
+  choice it forces — and what it does to existing streaks, cron times and the
+  token-budget window — is spelled out in "Upgrading from 0.1.x" above.
+- The taint rule now covers MCP mutations. A mutating MCP tool (one the server
+  does not annotate `readOnlyHint: true`) is held at the confirm gate once the
+  turn has seen untrusted output, and also when the same batch of tool calls
+  contains another untrusted call — two calls to MCP tools, say, or one to an
+  `external=True` tool. Before, only a *native* mutating tool was gated; an MCP
+  write ran unconfirmed. A workflow that chains an MCP read into an MCP write
+  in one turn now asks first.
+- `POST /api/chat` accepts only channels that start with `web:` and answers
+  `400` for any other. The `channel` field used to be an arbitrary string, so a
+  client posting to e.g. `telegram:<id>` reached that user's conversation.
+  The dashboard itself only ever sends `web:default`.
+- Text that reaches a card is now cleaned, and a title is capped. Widget
+  titles, stat labels, units and string values, table columns and string cells,
+  list-item titles and subtitles, and a widget's error text have C0/C1 control
+  characters, `U+2028`/`U+2029` and the bidi overrides stripped, and are
+  truncated to 256 characters with a trailing `…`. Markdown widget bodies lose
+  the same characters but are not truncated. A list-item title that is empty
+  after stripping is rejected; an empty subtitle is dropped.
+- Local apps may not take the name of a first-party app. `tasks`, `notes` and
+  `habits` are reserved (as `dudamel` and `core` already were): a project that
+  defines its own `App("tasks", ...)` now fails to resolve with a "name
+  reserved by the first-party suite" error. Rename your app — its tables are
+  prefixed with its name, so a shared name would also collide in the database.
+- Widget order on the dashboard and in Telegram's `/home` no longer follows
+  the order of your `assistant.py` list. Enabled first-party apps come first,
+  alphabetically by name, then your own apps, alphabetically by name; widgets
+  keep their declaration order within an app. Pin the order you want with
+  `[[home.section]]`.
+- Dependency floors went up, and `mcp` moved a major. `mcp` must now be `>=2,<3`
+  (1.x is no longer supported: 2.0 renamed the client request context and
+  moved attributes to snake_case). Other floors: `pydantic>=2.12` (was 2.7),
+  `pydantic-settings>=2.3` (2.2), `sqlalchemy>=2.0.31` (2.0.30), `alembic>=1.16`
+  (1.13), `apscheduler>=3.10.2,<4` (3.10), `python-telegram-bot>=21.4` (21).
+  `tzlocal>=5` is a new direct dependency. If you pin any of these in a project
+  that depends on dudamel, loosen the pin or move it.
+- Database backups are now written as `<database>.bak-<UTC timestamp>` and the
+  newest five are kept. They used to be a single `<database>.bak`, overwritten
+  each time. A `.bak` left by an older version is no longer written to or
+  pruned; delete it by hand once you no longer need it.
+- `dudamel doctor` now exits `1` when a check shows `dudamel run` would not
+  start or a configured feature is broken (an app that fails to resolve, an
+  `assistant.py` that cannot import, a missing migration lane, pending
+  migrations with `auto_migrate = false`, an LLM tier with no `base_url` or
+  unset API-key variable, and so on), and also when run outside a project
+  (no `dudamel.toml`). It always exited `0` before, so a script or CI step that
+  ran it for its output alone will now fail on those. States that are normal
+  (Telegram not configured, no Tailscale, a database `run` has yet to create)
+  print `ℹ` and a warning prints `⚠`; neither changes the exit code.
 
 ## Testing your apps
 
