@@ -47,9 +47,12 @@ async def add_note(title: str, body: str) -> str:
 async def search_notes(query: str) -> str:
     """Find notes whose title or body contains `query`.
 
-    Plain substring matching, case-insensitive. There is no ranking and no
-    stemming, and a multi-word query matches the whole phrase rather than the
-    individual words.
+    Plain substring matching. Case is ignored for ASCII letters only
+    ("Cafe" finds "cafe"); accented and other non-ASCII letters must match
+    their case exactly ("école" does not find "École"), so for those try the
+    query in more than one case. There is no ranking and no stemming,
+    and a multi-word query matches the whole phrase rather than the individual
+    words.
     """
     pattern = _like_pattern(query)
     async with app.db() as session:
