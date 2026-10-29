@@ -1111,6 +1111,27 @@ async def test_a_failing_action_is_reported_on_the_callback(tmp_path: Path, toke
     await rt.stop()
 
 
+async def test_a_failing_actions_alert_carries_no_bidi_override(
+    tmp_path: Path, token_env: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The alert is rendered natively, so an exception message that echoes
+    synced-in text could reorder it. Stripped with the digest's own class."""
+    rt, interface = await build(tmp_path, [], telegram=TelegramConfig(allowed_user_ids=[111]))
+    await _home(interface)
+    bot: FakeBot = interface._app.bot
+    data = _first_button_data(bot)
+
+    async def hostile(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("note \u202eetelet\u2066 missing\x07")
+
+    monkeypatch.setattr(rt, "run_action", hostile)
+    await interface._on_callback(_tap(data, query_id="cbq10"), None)
+
+    assert bot.answered[-1]["text"] == "Failed: note etelet missing"
+    assert bot.answered[-1]["show_alert"] is True
+    await rt.stop()
+
+
 async def test_a_vanished_action_is_not_reported_as_a_failure(
     tmp_path: Path, token_env: str
 ) -> None:

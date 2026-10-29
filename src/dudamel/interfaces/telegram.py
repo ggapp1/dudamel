@@ -552,7 +552,13 @@ class TelegramInterface:
                 await self._answer(query.id, "That action is no longer available.", alert=True)
                 return
             except Exception as e:
-                await self._answer(query.id, f"Failed: {e}", alert=True)
+                # The exception text is app-authored and can echo synced-in
+                # data; an alert is drawn natively, so a bidi override in it
+                # would reorder what the operator reads. Same class the digest
+                # strips.
+                await self._answer(
+                    query.id, f"Failed: {_UNSAFE_DIGEST_CHARS.sub('', str(e))}", alert=True
+                )
                 return
             # The digest is deliberately not edited. Editing adds failure modes
             # (message too old, edit rejected) for something /home regenerates,
