@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import AliasChoices, AliasPath, BaseModel, ValidationError
 
+from dudamel.config import to_zone
 from dudamel.contract.renderers import ACTION_LABEL_MAX, RENDERERS, clean_action_label
 from dudamel.contract.schema import ToolSchema
 from dudamel.contract.types import TOOL_NAME_RE, Job, Tool, Widget
@@ -411,20 +412,11 @@ class App:
         in Auckland is dated the previous day everywhere its raw stored value is
         printed, which puts one card a day behind the rest of the homescreen.
 
-        The conversion is `value.replace(tzinfo=UTC).astimezone(zone)`: the
-        value is LABELLED UTC first, then moved. Calling `.astimezone(zone)`
-        straight on a naive value is the tempting one-liner and it is wrong --
-        Python reads a naive value in the PROCESS's zone, so that bug is
-        invisible on a UTC machine (CI, most containers) and wrong on every host
-        configured to a real location.
-
-        An already-aware value is moved without relabelling, so its instant
-        survives.
+        The conversion itself, and why a naive value must be labelled UTC before
+        it is moved, lives in `dudamel.config.to_zone`, shared with the
+        dashboard's pages. An already-aware value keeps its instant.
         """
-        zone = self.timezone
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=UTC)
-        return value.astimezone(zone)
+        return to_zone(value, self.timezone)
 
     def today(self) -> date:
         """The current date in the framework's zone.
