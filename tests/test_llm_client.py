@@ -3,7 +3,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import InterfaceError, OperationalError
 
 from dudamel.config import BudgetConfig
 from dudamel.db import Database
@@ -113,6 +113,24 @@ async def test_usage_insert_operational_error_does_not_fail_completion(
     assert c.message.text == "hi"  # the completed call still succeeds
     assert any("llm_calls" in r.message for r in caplog.records)
     assert any(r.levelname == "WARNING" for r in caplog.records)
+
+
+async def test_usage_insert_interface_error_does_not_fail_completion(
+    db: Database, caplog, monkeypatch
+) -> None:
+    """A write racing engine disposal at shutdown surfaces as InterfaceError,
+    not OperationalError; the scheduler's sibling recorder catches both."""
+    client = make_client(db, [fake_text("hi")])
+
+    def _raising_factory(*args: object, **kwargs: object) -> None:
+        raise InterfaceError("insert into llm_calls", {}, Exception("connection is closed"))
+
+    monkeypatch.setattr(db, "_factory", _raising_factory)
+
+    c = await client.complete([Message(role="user", text="x")])
+
+    assert c.message.text == "hi"
+    assert any("llm_calls" in r.message for r in caplog.records)
 
 
 # --- the spend cap resets on the framework's day, not UTC's -----------------
