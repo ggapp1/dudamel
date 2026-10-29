@@ -42,7 +42,6 @@ widget payload inert.
 
 from __future__ import annotations
 
-from datetime import UTC
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -52,7 +51,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from dudamel.config import Settings
+from dudamel.config import Settings, to_zone
 from dudamel.runtime import Runtime
 from dudamel.web.api import resolve_cookie_secure
 from dudamel.web.auth import SessionStore, session_cookie_name
@@ -78,11 +77,7 @@ def _in_zone(
     """
     converted: list[dict[str, Any]] = []
     for row in rows:
-        moved = {
-            field: row[field].replace(tzinfo=UTC).astimezone(tz)
-            for field in fields
-            if row.get(field) is not None
-        }
+        moved = {field: to_zone(row[field], tz) for field in fields if row.get(field) is not None}
         converted.append({**row, **moved} if moved else row)
     return converted
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tomllib
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -270,6 +271,25 @@ def resolve_timezone(settings: Settings) -> ZoneInfo:
     if settings.timezone is not None:
         return ZoneInfo(settings.timezone)
     return get_localzone()
+
+
+def to_zone(value: datetime, zone: ZoneInfo) -> datetime:
+    """A stored timestamp, as an aware datetime in `zone`. The one place that
+    conversion is spelled.
+
+    Columns defaulted from `now()` are stored NAIVE UTC, so a naive value is
+    LABELLED UTC first (`replace(tzinfo=UTC)`), then moved. Calling
+    `.astimezone(zone)` straight on a naive value is the tempting one-liner and
+    it is wrong -- Python reads a naive value in the PROCESS's zone, so that bug
+    is invisible on a UTC machine (CI, most containers) and wrong on every host
+    configured to a real location.
+
+    An already-aware value is moved without relabelling, so its instant
+    survives.
+    """
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(zone)
 
 
 def timezone_source(settings: Settings) -> str:
