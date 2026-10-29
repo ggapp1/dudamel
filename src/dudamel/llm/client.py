@@ -7,7 +7,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import SQLAlchemyError
 
 from dudamel.config import BudgetConfig
 from dudamel.db import IN_DB_SCOPE, Database
@@ -83,10 +83,13 @@ class LLMClient:
                         conversation_id=conversation_id,
                     )
                 )
-        except OperationalError as e:
+        except SQLAlchemyError as e:
             # The model call already completed successfully; a DB hiccup
             # recording its usage (e.g. "database is locked") must not turn a
-            # good completion into a failure for the caller.
+            # good completion into a failure for the caller. Broad like the
+            # scheduler's job_runs recorder, not just OperationalError: a
+            # write that races engine disposal at shutdown raises
+            # InterfaceError, and the completion is no less good for it.
             logger.warning("failed to record llm_calls usage row for tier %s: %s", t.name, e)
         return completion
 
