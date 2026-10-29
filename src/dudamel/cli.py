@@ -168,14 +168,22 @@ def _write_deploy_templates(target: Path, project_name: str) -> None:
     with `{{PROJECT_DIR}}`/`{{PROJECT_NAME}}` filled in -- both need the
     project's own absolute path (a service manager doesn't run with the cwd
     a user typed `dudamel new` from), which `scaffold_template/`'s plain
-    `shutil.copytree` in `cmd_new` above has no way to supply."""
+    `shutil.copytree` in `cmd_new` above has no way to supply.
+
+    `{{UV_PATH}}` is the `uv` on PATH when the project is scaffolded: a systemd
+    --user manager's PATH lacks ~/.local/bin, so the unit cannot say bare `uv`.
+    Without one on PATH it falls back to systemd's `%h/.local/bin/uv`, uv's
+    usual install location; the unit's own header tells the operator to check
+    it on the host that will actually run it."""
     deploy_dir = target / "deploy"
     deploy_dir.mkdir(exist_ok=True)
     template_dir = Path(str(files("dudamel") / "deploy_templates"))
+    uv_path = shutil.which("uv") or "%h/.local/bin/uv"
     for name in _DEPLOY_TEMPLATE_NAMES:
         text = (template_dir / name).read_text()
         text = text.replace("{{PROJECT_DIR}}", str(target.resolve()))
         text = text.replace("{{PROJECT_NAME}}", project_name)
+        text = text.replace("{{UV_PATH}}", uv_path)
         (deploy_dir / name).write_text(text)
 
 

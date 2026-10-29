@@ -8,16 +8,29 @@
 # `loginctl enable-linger $USER` keeps this running after you log out /
 # without an active session (otherwise systemd stops all --user units at
 # logout). `journalctl --user -u dudamel -f` follows its logs.
+#
+# ExecStart names `uv` by absolute path: a --user manager's PATH is minimal and
+# normally lacks ~/.local/bin, where uv usually lives, so a bare `uv` fails
+# with status 203/EXEC on a headless host. `dudamel new` filled in the uv found
+# on the machine that scaffolded this project (or the %h/.local/bin/uv default,
+# %h being your home directory) -- CHECK it with `command -v uv` on the host
+# that will run the service, and edit the path if it differs.
 
 [Unit]
 Description=dudamel assistant ({{PROJECT_NAME}})
 After=network-online.target
 Wants=network-online.target
+# Restart=always alone never gives up, so a crash loop (bad config, a refused
+# migration) would flap forever and `systemctl --user status` would keep saying
+# "activating". Five starts inside five minutes ends in `failed` instead,
+# which is visible, and stops hammering whatever the process is failing against.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 WorkingDirectory={{PROJECT_DIR}}
-ExecStart=/usr/bin/env uv run dudamel run
+ExecStart={{UV_PATH}} run dudamel run
 Restart=always
 RestartSec=5
 

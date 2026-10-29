@@ -197,6 +197,36 @@ def test_new_writes_deploy_templates_with_project_path_substituted(tmp_path: Pat
     assert "dudamel run" in service
 
 
+def _exec_start(service: str) -> str:
+    return next(ln for ln in service.splitlines() if ln.startswith("ExecStart="))
+
+
+def test_systemd_unit_resolves_uv_by_absolute_path_and_bounds_crash_loops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A --user manager's PATH lacks ~/.local/bin, so `env uv` fails on a
+    headless host; and Restart=always with no start limit never reaches
+    `failed`, so a crash loop is invisible in `systemctl --user status`."""
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/opt/tools/bin/uv")
+    service = (scaffold(tmp_path) / "deploy" / "dudamel.service").read_text()
+    assert "{{" not in service
+    exec_start = _exec_start(service)
+    assert exec_start.split("=", 1)[1].split()[0] == "/opt/tools/bin/uv"
+    assert exec_start.endswith("run dudamel run")
+    assert "StartLimitIntervalSec=300" in service
+    assert "StartLimitBurst=5" in service
+    assert "RestartSec=5" in service
+
+
+def test_systemd_unit_falls_back_to_the_home_relative_uv_when_none_is_on_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+    service = (scaffold(tmp_path) / "deploy" / "dudamel.service").read_text()
+    assert "{{" not in service
+    assert _exec_start(service).startswith("ExecStart=%h/.local/bin/uv ")
+
+
 def test_new_refuses_nonempty_target_dir(tmp_path: Path) -> None:
     target = tmp_path / "occupied"
     target.mkdir()
