@@ -50,11 +50,16 @@ dependencies = [
     "apscheduler>=3.10.2,<4",
     "httpx>=0.27",
     "fastapi>=0.140.0",
-    "uvicorn>=0.51,<0.52",
+    # serve.py drives Server.startup()/shutdown()/lifespan directly (not
+    # Server.serve(), whose signal handling would clobber ours), so this leans
+    # on uvicorn internals that a pre-1.0 release is free to move. Capped below
+    # 1.0 rather than at one minor: the suite (tests/test_serve.py) is the
+    # guard, and passes on 0.51 and 0.54.
+    "uvicorn>=0.51,<1",
     "jinja2>=3.1.6",
-    # 21.0-21.3 make Application non-weak-referenceable, which the bot wrapper
-    # relies on; 21.4 restores it.
-    "python-telegram-bot>=21.4,<22",
+    # 21.4 is the floor this was built and tested against; the suite passes on
+    # 21.11 and 22.8, so 22 is allowed and the cap is the next major.
+    "python-telegram-bot>=21.4,<23",
     # mcp 2.x only: 2.0 renamed the client request context and moved five
     # model attributes from camelCase to snake_case, so 1.x and 2.x cannot be
     # supported by the same source without a shim. A dual-support claim is
