@@ -419,9 +419,11 @@ delete the database's `-wal` and `-shm` sidecar files if present.
 
 App migrations resolve from `project_dir` (a `dudamel.toml`/`Settings` key,
 default the current directory) — the same `migrations/` that `dudamel db
-migrate` writes — not from `data_dir` (where the SQLite database and other
-runtime state live). Keep them the same unless you deliberately split them:
-migrations placed under `data_dir` are ignored.
+migrate` writes — not from `data_dir`. `data_dir` holds only the
+single-instance lockfile (`.dudamel.lock`); the SQLite database is wherever
+`database_url` points (by default `dudamel.db` in the directory you run
+from). Keep `data_dir` and `project_dir` the same unless you deliberately
+split them: migrations placed under `data_dir` are ignored.
 
 ## Security
 
@@ -465,7 +467,8 @@ migrations placed under `data_dir` are ignored.
   writes, the same as any other mutating tool, and mark whatever reads that
   content back `external=True`.
 - **Token budgets**: `[llm.budget] daily_tokens` in `dudamel.toml` sets a
-  hard per-day ceiling per tier, enforced before each call — a runaway
+  hard per-day ceiling on tokens spent across ALL tiers combined (it is one
+  global budget, not one per tier), enforced before each call — a runaway
   loop or a misbehaving job can't spend past it.
 - **Persona**: `[router] persona` in `dudamel.toml` customizes the assistant's
   system prompt identity line (the "You are..." part). The installed apps
