@@ -258,6 +258,70 @@ def test_new_creates_env_with_restricted_permissions(tmp_path: Path) -> None:
     assert mode == 0o600, f"Expected .env to have 0o600 permissions, got {oct(mode)}"
 
 
+def _spy_on_os_open(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, int]]:
+    """Record (path, mode) for every `os.open` that creates a file in the CLI."""
+    created: list[tuple[str, int]] = []
+    real_open = cli.os.open
+
+    def spy(path: object, flags: int, mode: int = 0o777, **kw: object) -> int:
+        if flags & cli.os.O_CREAT:
+            created.append((str(path), mode))
+        return real_open(path, flags, mode, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cli.os, "open", spy)
+    return created
+
+
+def test_new_creates_env_private_from_the_first_instant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """chmod-after-write leaves a window at the umask default; the file must be
+    CREATED 0o600. With umask 0 the old write-then-chmod still ends at 0o600,
+    so the creation mode itself is what is asserted."""
+    previous = cli.os.umask(0)
+    try:
+        created = _spy_on_os_open(monkeypatch)
+        target = scaffold(tmp_path)
+    finally:
+        cli.os.umask(previous)
+    env_creations = [mode for path, mode in created if ".env" in Path(path).name]
+    assert env_creations == [0o600]
+    assert (target / ".env").stat().st_mode & 0o777 == 0o600
+    assert not list(target.glob(".*.tmp"))
+
+
+def test_token_rotate_tightens_an_env_file_that_was_wider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = scaffold(tmp_path)
+    env_path = target / ".env"
+    env_path.chmod(0o644)
+    monkeypatch.chdir(target)
+    created = _spy_on_os_open(monkeypatch)
+
+    assert cli.main(["token", "rotate"]) == 0
+
+    assert [mode for _, mode in created] == [0o600]
+    assert env_path.stat().st_mode & 0o777 == 0o600
+    assert not list(target.glob(".*.tmp"))
+
+
+def test_token_rotate_writes_through_a_symlinked_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = scaffold(tmp_path)
+    real = tmp_path / "secrets.env"
+    (target / ".env").replace(real)
+    (target / ".env").symlink_to(real)
+    monkeypatch.chdir(target)
+
+    assert cli.main(["token", "rotate"]) == 0
+
+    assert (target / ".env").is_symlink()
+    assert real.read_text().startswith("DUDAMEL_WEB_TOKEN=")
+    assert real.stat().st_mode & 0o777 == 0o600
+
+
 # --- project module discovery / import ---------------------------------------
 
 
