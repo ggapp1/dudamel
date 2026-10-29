@@ -38,6 +38,22 @@ async def test_search_matches_title_and_body_case_insensitively(notes_app):
     assert "unrelated" not in await search_notes("eggs")
 
 
+async def test_search_case_folding_is_ascii_only_and_the_tool_says_so(notes_app):
+    """SQLite's lower()/LIKE fold ASCII only, and the model reads the docstring,
+    so the description must not promise more than the query delivers."""
+    from dudamel.apps.notes import add_note, search_notes
+
+    await add_note("école", "cours de français")
+
+    assert "école" in await search_notes("école")  # exact case matches
+    assert "école" in await search_notes("éCOLE")  # the ASCII letters still fold
+    assert "No notes" in await search_notes("ÉCOLE")  # the accented one does not
+
+    description = search_notes.__doc__ or ""
+    assert "ASCII" in description
+    assert "Plain substring matching, case-insensitive" not in description
+
+
 async def test_search_says_so_when_nothing_matches(notes_app):
     from dudamel.apps.notes import search_notes
 

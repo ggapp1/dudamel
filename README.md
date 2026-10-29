@@ -673,8 +673,10 @@ match no widget.
 
 ### Searching notes
 
-`search_notes` is plain case-insensitive substring matching over a note's title
-and body. There is no ranking and no stemming, and a multi-word query matches
+`search_notes` is plain substring matching over a note's title and body. Case
+is ignored for ASCII letters only: SQLite's `lower()` and `LIKE` fold nothing
+else, so `école` does not find `École`. (Folding in Python instead would mean
+loading every note, since the query has no row limit.) There is no ranking and no stemming, and a multi-word query matches
 the whole phrase rather than the individual words. For one person's notes this
 is enough; if it stops being enough, that is a signal for a real index rather
 than a bigger `LIKE`.
