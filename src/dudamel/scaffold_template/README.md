@@ -28,7 +28,8 @@ you change an app's models.
 
 The dashboard comes up at `http://127.0.0.1:8787` (see `dudamel.toml`).
 Log in with the token in `.env` (`DUDAMEL_WEB_TOKEN`) — rotate it any time
-with `uv run dudamel token rotate`.
+with `uv run dudamel token rotate`. Rotating only rewrites `.env`: a running
+instance keeps accepting the old token until you restart it.
 
 ## Diagnosing problems
 

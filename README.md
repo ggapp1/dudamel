@@ -72,7 +72,11 @@ state, and web/Telegram token configuration.
 
 The dashboard comes up at `http://127.0.0.1:8787`. Log in with the token
 `dudamel new` generated in `.env` (`DUDAMEL_WEB_TOKEN`); rotate it any time
-with `uv run dudamel token rotate`, which rewrites only that one line.
+with `uv run dudamel token rotate`, which rewrites only that one line. It
+does not revoke the old token: a running instance read its token at startup
+and keeps accepting the old one until it is restarted (`systemctl --user
+restart dudamel.service`, or stop and re-run `dudamel run`), so restart
+right after rotating a token you believe has leaked.
 
 ### The whole example app
 

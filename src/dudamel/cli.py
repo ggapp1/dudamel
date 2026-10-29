@@ -951,6 +951,18 @@ def cmd_token_rotate(args: argparse.Namespace) -> int:
     _rewrite_env_var(env_path, settings.web.token_env, secrets.token_urlsafe(32))
     os.chmod(env_path, 0o600)
     print(f"rotated {settings.web.token_env} in {env_path}")
+    # Not revoked yet: the web auth compares against the environment captured
+    # when the process started, and this command only rewrites the file. Said
+    # plainly because "rotated" reads as "the old token is dead", which is the
+    # reason people rotate.
+    print(
+        "A running dudamel instance keeps accepting the OLD token until it is restarted.\n"
+        "Restart it to revoke the old token: `systemctl --user restart dudamel.service` "
+        "(Linux unit),\n"
+        "`launchctl unload` then `launchctl load ~/Library/LaunchAgents/dudamel.plist` "
+        "(macOS),\n"
+        "or stop and re-run `dudamel run`."
+    )
     return 0
 
 

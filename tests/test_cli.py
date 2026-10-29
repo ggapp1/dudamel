@@ -1096,6 +1096,24 @@ def test_token_rotate_changes_only_that_line(
     assert len(new_token) > 20
 
 
+def test_token_rotate_says_the_running_instance_keeps_the_old_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Rotation rewrites `.env`; the web auth reads the environment captured at
+    startup. Until the process restarts the OLD token still logs in, so a
+    rotation done because the token leaked has not revoked anything yet. The
+    command must say so rather than print a success line that reads as done."""
+    target = scaffold(tmp_path)
+    (target / ".env").write_text("DUDAMEL_WEB_TOKEN=old\n")
+    monkeypatch.chdir(target)
+
+    assert cli.main(["token", "rotate"]) == 0
+
+    out = capsys.readouterr().out
+    assert "keeps accepting the OLD token until it is restarted" in out
+    assert "systemctl --user restart dudamel.service" in out
+
+
 def test_token_rotate_appends_when_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     target = scaffold(tmp_path)
     (target / ".env").write_text("FOO=bar\n")
