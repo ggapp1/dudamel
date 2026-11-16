@@ -83,13 +83,23 @@ async def poll_job_runs(db: Database, job_id: str, *, timeout: float = 5.0) -> l
     deadline = time.monotonic() + timeout
     while True:
         async with db.session() as s:
+            # A `running` row exists from the instant a run starts, so it is
+            # not an outcome yet -- wait for a finished one.
             rows = list(
-                (await s.execute(select(JobRun).where(JobRun.job_id == job_id))).scalars().all()
+                (
+                    await s.execute(
+                        select(JobRun).where(JobRun.job_id == job_id, JobRun.status != "running")
+                    )
+                )
+                .scalars()
+                .all()
             )
         if rows:
             return rows
         if time.monotonic() >= deadline:
-            raise AssertionError(f"expected a job_runs row for {job_id!r} within {timeout}s")
+            raise AssertionError(
+                f"expected a finished job_runs row for {job_id!r} within {timeout}s"
+            )
         await asyncio.sleep(0.02)
 
 
