@@ -408,6 +408,52 @@ def test_run_debug_flag_configures_debug_level_logging(
     assert captured["level"] == logging.DEBUG
 
 
+@pytest.fixture
+def _restore_http_loggers():
+    """`dudamel run` sets levels on the httpx/httpcore loggers, which are
+    process-global; put them back so the rest of the suite is unaffected."""
+    saved = {name: logging.getLogger(name).level for name in ("httpx", "httpcore")}
+    yield
+    for name, level in saved.items():
+        logging.getLogger(name).setLevel(level)
+
+
+@pytest.mark.parametrize("argv", [["run"], ["run", "--debug"]])
+def test_run_does_not_log_request_urls(
+    argv: list[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    _restore_http_loggers,
+) -> None:
+    """httpx logs every request's full URL at INFO, and a URL can be a
+    credential: python-telegram-bot puts the bot token in the path of every
+    Bot API call, and a private calendar link is its own secret. Under the
+    logging `run` installs -- with or without --debug -- no such line may
+    reach a handler.
+
+    Captured at DEBUG on the root logger: at caplog's default level an INFO
+    record is never collected, so the assertion below would pass with the
+    leak live."""
+    import httpx
+
+    target = scaffold(tmp_path)
+    monkeypatch.chdir(target)
+    monkeypatch.setattr(cli.logging, "basicConfig", lambda **kw: None)
+    caplog.set_level(logging.DEBUG)
+    secret = "123456:SECRET-BOT-TOKEN"
+
+    async def fake_serve(orchestrator, settings, **kwargs):
+        transport = httpx.MockTransport(lambda request: httpx.Response(200))
+        async with httpx.AsyncClient(transport=transport) as client:
+            await client.post(f"https://api.telegram.org/bot{secret}/getUpdates")
+
+    monkeypatch.setattr(cli, "serve", fake_serve)
+    assert cli.main(argv) == 0
+    leaked = [r.getMessage() for r in caplog.records if secret in r.getMessage()]
+    assert leaked == []
+
+
 def test_run_wires_orchestrator_and_settings_into_serve(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
