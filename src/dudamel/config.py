@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
@@ -160,6 +161,49 @@ class HomeConfig(BaseModel):
     section: list[HomeSection] = []
 
 
+class _AppsJsonLeaves(PydanticBaseSettingsSource):
+    """Wrap an env-style source so each `[apps.*]` leaf it supplies is
+    JSON-decoded when it parses, and kept as the raw string when it does not.
+
+    `apps` is `dict[str, dict[str, Any]]`, so pydantic-settings is the only
+    thing that can turn `DUDAMEL_APPS__PAPERS__CATEGORIES='["cs.AI"]'` into a
+    list. Up to 2.15 it did; from 2.16 an `Any` leaf arrives as the raw string,
+    and a list- or dict-typed app setting then fails validation. Decoding here
+    pins the 2.14 behaviour regardless of the installed version. Only the env
+    and .env sources are wrapped: a quoted string in dudamel.toml is a string.
+    """
+
+    def __init__(self, inner: PydanticBaseSettingsSource) -> None:
+        super().__init__(inner.settings_cls)
+        self._inner = inner
+
+    def get_field_value(self, field: Any, field_name: str) -> tuple[Any, str, bool]:
+        return self._inner.get_field_value(field, field_name)
+
+    def __call__(self) -> dict[str, Any]:
+        data = self._inner()
+        apps = data.get("apps")
+        if isinstance(apps, dict):
+            data["apps"] = {
+                name: (
+                    {k: _json_or_raw(v) for k, v in block.items()}
+                    if isinstance(block, dict)
+                    else block
+                )
+                for name, block in apps.items()
+            }
+        return data
+
+
+def _json_or_raw(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="DUDAMEL_",
@@ -241,7 +285,12 @@ class Settings(BaseSettings):
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         # env > .env file > toml-as-init-kwargs > field defaults
-        return (env_settings, dotenv_settings, init_settings, file_secret_settings)
+        return (
+            _AppsJsonLeaves(env_settings),
+            _AppsJsonLeaves(dotenv_settings),
+            init_settings,
+            file_secret_settings,
+        )
 
     @classmethod
     def load(cls, project_dir: Path) -> Settings:

@@ -148,6 +148,36 @@ def test_app_setting_overridable_from_env(tmp_path: Path, monkeypatch) -> None:
     assert settings.apps["weather"]["enabled"] is True
 
 
+def test_app_setting_env_values_are_json_decoded(tmp_path: Path, monkeypatch) -> None:
+    # A list or table setting can only come from the environment as JSON. The
+    # decode must not depend on the installed pydantic-settings: 2.16 stopped
+    # doing it for an `Any` leaf, which the float test above caught only as a
+    # type mismatch.
+    (tmp_path / "dudamel.toml").write_text("[apps.papers]\ncategories = []\n")
+    monkeypatch.setenv("DUDAMEL_APPS__PAPERS__CATEGORIES", '["cs.AI", "cs.LG"]')
+    monkeypatch.setenv("DUDAMEL_APPS__PAPERS__LIMITS", '{"daily": 5}')
+    monkeypatch.setenv("DUDAMEL_APPS__PAPERS__LABEL", "Reading list")
+    apps = Settings.load(tmp_path).apps
+    assert apps["papers"]["categories"] == ["cs.AI", "cs.LG"]
+    assert apps["papers"]["limits"] == {"daily": 5}
+    # not JSON: kept verbatim rather than rejected
+    assert apps["papers"]["label"] == "Reading list"
+
+
+def test_app_setting_dotenv_values_are_json_decoded(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("DUDAMEL_APPS__PAPERS__CATEGORIES", raising=False)
+    (tmp_path / "dudamel.toml").write_text("[apps.papers]\ncategories = []\n")
+    (tmp_path / ".env").write_text("DUDAMEL_APPS__PAPERS__CATEGORIES='[\"cs.AI\"]'\n")
+    assert Settings.load(tmp_path).apps["papers"]["categories"] == ["cs.AI"]
+
+
+def test_app_setting_toml_string_is_not_json_decoded(tmp_path: Path) -> None:
+    # Only env-style sources are decoded: a quoted TOML value is a string.
+    (tmp_path / "dudamel.toml").write_text('[apps.papers]\nlabel = "52.52"\nlist = "[1]"\n')
+    apps = Settings.load(tmp_path).apps
+    assert apps["papers"] == {"label": "52.52", "list": "[1]"}
+
+
 def test_nested_env_delimiter_does_not_break_existing_sections(tmp_path: Path, monkeypatch) -> None:
     """Regression for adding env_nested_delimiter to a shared Settings.
 
