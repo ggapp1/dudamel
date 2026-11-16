@@ -243,6 +243,30 @@ _LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 _LOG_DATEFMT = "%H:%M:%S"
 
 
+# Third-party loggers that print secrets at the levels `run` configures, each
+# held at the lowest level that no longer does. Applied even under --debug:
+# request tracing is not worth printing a credential for.
+#
+# - httpx logs every request's full URL at INFO. python-telegram-bot puts the
+#   bot token in the path of every Bot API call, so the token reached the
+#   terminal or journal on every poll. httpcore is the transport underneath.
+# - httpx2/httpcore2 are the same pair as shipped inside the MCP SDK, logging
+#   under their own names -- an MCP server URL can carry a token in its query
+#   string or userinfo.
+# - telegram.Bot logs the Bot API base URL, token included, at DEBUG when the
+#   bot is constructed.
+# - mcp.client.streamable_http logs the server-issued session id at INFO, and a
+#   session id is a bearer credential for that session.
+QUIET_LOGGERS: dict[str, int] = {
+    "httpx": logging.WARNING,
+    "httpcore": logging.WARNING,
+    "httpx2": logging.WARNING,
+    "httpcore2": logging.WARNING,
+    "telegram.Bot": logging.INFO,
+    "mcp.client.streamable_http": logging.WARNING,
+}
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     # A real `dudamel run` invocation is a fresh interpreter with nothing
     # else configuring logging, so INFO-and-up (DEBUG with --debug) reaching
@@ -255,14 +279,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         format=_LOG_FORMAT,
         datefmt=_LOG_DATEFMT,
     )
-    # httpx logs every request's full URL at INFO, and a URL can be a
-    # credential: python-telegram-bot puts the bot token in the path of every
-    # Bot API call, so at the level above the token reached the terminal or
-    # journal on every poll. Held at WARNING even under --debug -- request
-    # tracing is not worth printing a secret for. httpcore is the transport
-    # underneath and is held for the same reason.
-    for name in ("httpx", "httpcore"):
-        logging.getLogger(name).setLevel(logging.WARNING)
+    for name, level in QUIET_LOGGERS.items():
+        logging.getLogger(name).setLevel(level)
     project_dir = Path.cwd()
     _load_dotenv_into_environ(project_dir)
     settings = Settings.load(project_dir)
