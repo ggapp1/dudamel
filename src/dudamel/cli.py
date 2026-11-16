@@ -255,6 +255,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         format=_LOG_FORMAT,
         datefmt=_LOG_DATEFMT,
     )
+    # httpx logs every request's full URL at INFO, and a URL can be a
+    # credential: python-telegram-bot puts the bot token in the path of every
+    # Bot API call, so at the level above the token reached the terminal or
+    # journal on every poll. Held at WARNING even under --debug -- request
+    # tracing is not worth printing a secret for. httpcore is the transport
+    # underneath and is held for the same reason.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
     project_dir = Path.cwd()
     _load_dotenv_into_environ(project_dir)
     settings = Settings.load(project_dir)
