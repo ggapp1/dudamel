@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import logging
 import os
 from datetime import datetime
 from typing import Any
@@ -25,6 +26,19 @@ import pytest
 
 import dudamel.app
 from dudamel.db import Database
+
+
+@pytest.fixture(autouse=True)
+def _restore_quiet_loggers():
+    """`dudamel run` sets levels on a few third-party loggers, and logger levels
+    are process-global. Every test that drives `run` would otherwise leave them
+    changed for the rest of the session."""
+    from dudamel.cli import QUIET_LOGGERS
+
+    saved = {name: logging.getLogger(name).level for name in QUIET_LOGGERS}
+    yield
+    for name, level in saved.items():
+        logging.getLogger(name).setLevel(level)
 
 
 @pytest.fixture(autouse=True)
